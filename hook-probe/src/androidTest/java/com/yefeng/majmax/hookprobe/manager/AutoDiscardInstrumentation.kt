@@ -43,9 +43,9 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.invalidate("new session"); check(gate.poll(null) == null && AutoDiscardState.mutable.value.enabled)
                 gate.observe(live().put("sourceGeneration",4)); check(gate.poll(null) != null)
             }
-            test("manual operation pauses") { gate, _ ->
+            test("manual-like feedback keeps unattended mode armed") { gate, _ ->
                 gate.observe(live()); gate.toggle()
-                gate.poll(ack("", "manual")); check(gate.poll(null) == null && !AutoDiscardState.mutable.value.enabled)
+                gate.poll(ack("", "manual")); check(gate.poll(null) == null && AutoDiscardState.mutable.value.enabled)
             }
             test("manual input while disabled does not alter paused state") { gate, _ ->
                 gate.observe(live())
@@ -83,12 +83,13 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.poll(ack(id,"accepted")); val next=JSONObject(checkNotNull(gate.poll(null)))
                 check(next.getString("id") != id && next.getInt("revision") == 2)
             }
-            test("unmatched uplink pauses") { gate, _ ->
+            test("unmatched uplink revokes only the stale command") { gate, _ ->
                 gate.observe(live()); gate.toggle()
                 gate.observe(live().put("input",JSONObject("""
                     {"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"5m","moqie":false}}
                 """)))
-                check(gate.poll(null) == null && !AutoDiscardState.mutable.value.enabled)
+                check(gate.poll(null) == null && AutoDiscardState.mutable.value.enabled)
+                gate.observe(live(2)); check(gate.isEnabled())
             }
             fun actionCase(kind: String, type: Int, tile: String = "", consumed: List<String> = emptyList(),
                            combo: List<String> = emptyList(), hand: List<String> = listOf("5mr"), target: Int = 3,
@@ -162,12 +163,12 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val state=live(); state.getJSONObject("autoContext").put("riichi",true)
                 check(AutoDiscardController.prepareAction(state,state.getJSONArray("recommendations").getJSONObject(0))==null)
             }
-            test("queued actions wait for their full random delay") { _, _ ->
-                for (delay in listOf(2_000L,5_000L)) {
+            test("queued actions wait for their full configured delay") { _, _ ->
+                for (delay in listOf(0L,2_000L,5_000L)) {
                     var time=0L
                     val gate=AutoDiscardController({}, {time}, {delay})
-                    gate.observe(live()); gate.toggle(); check(gate.poll(null)==null)
-                    time=delay-1; check(gate.poll(null)==null)
+                    gate.observe(live()); gate.toggle(); check(gate.poll(null)==null || delay==0L)
+                    time=delay-1; check(gate.poll(null)==null || delay==0L)
                     time=delay; check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs")==delay)
                 }
             }
@@ -191,13 +192,14 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.observe(live()); gate.toggle(); gate.pause("manual")
                 time=5_000; check(gate.poll(null)==null)
             }
-            test("production random delay always stays within two to five seconds") { _, _ ->
-                repeat(30) {
+            test("production default delay draws within one to three seconds") { _, _ ->
+                repeat(20) {
                     var time=0L
                     val gate=AutoDiscardController({}, {time})
                     gate.observe(live()); gate.toggle(); check(gate.poll(null)==null)
-                    time=5_000
-                    check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs") in 2_000L..5_000L)
+                    time=999; check(gate.poll(null)==null)
+                    time=3_000
+                    check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs") in 1_000L..3_000L)
                 }
             }
             test("round settlement resumes automatically with a new round") { gate, _ ->
