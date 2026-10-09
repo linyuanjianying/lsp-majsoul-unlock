@@ -20,6 +20,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
@@ -34,6 +35,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -51,6 +54,9 @@ internal fun AiScreen(padding: PaddingValues) {
     var fourModel by remember { mutableStateOf(OnnxModelStore.info(context, 4)) }
     var threeModel by remember { mutableStateOf(OnnxModelStore.info(context, 3)) }
     var modelMessage by remember { mutableStateOf("仅接受符合 Akagi 策略协议的 ONNX 文件；PyTorch/Mortal 权重包不能只改后缀导入。模型仅保存在本机；和牌率、向听与放铳风险仍由 Akagi 分析计算。") }
+    val delayWindow = remember { AiOverlayService.readDelayRange(context) }
+    var delayMin by remember { mutableStateOf(delayWindow.first / 1000f) }
+    var delayMax by remember { mutableStateOf(delayWindow.last / 1000f) }
     val scope = rememberCoroutineScope()
     val status by AiStatus.state.collectAsStateWithLifecycle()
     val autoStatus by AutoDiscardState.state.collectAsStateWithLifecycle()
@@ -108,7 +114,27 @@ internal fun AiScreen(padding: PaddingValues) {
                         onCheckedChange = { AiOverlayService.toggleAuto() })
                 }
                 Text(autoStatus.message)
-                Text("首次默认关闭；开启状态会保存。按 AI 首选操作，结算后继续下一局；断线或游戏退出后尝试恢复，取得完整牌局后继续。所有操作随机等待 2–5 秒。手动出牌或停止助手会关闭此模式。",
+                Text("出牌延迟 ${"%.1f".format(delayMin)} – ${"%.1f".format(delayMax)} 秒${if (delayMin == delayMax) "（固定）" else "（随机）"}",
+                    style = MaterialTheme.typography.titleSmall)
+                Text("最小延迟 ${"%.1f".format(delayMin)} 秒", style = MaterialTheme.typography.bodySmall)
+                Slider(value = delayMin,
+                    onValueChange = { delayMin = (minOf(it, delayMax) * 10).roundToInt() / 10f },
+                    onValueChangeFinished = {
+                        AiOverlayService.writeDelayRange(context,
+                            (delayMin * 1000).roundToLong(), (delayMax * 1000).roundToLong())
+                    },
+                    valueRange = 0f..5f, steps = 49)
+                Text("最大延迟 ${"%.1f".format(delayMax)} 秒", style = MaterialTheme.typography.bodySmall)
+                Slider(value = delayMax,
+                    onValueChange = { delayMax = (maxOf(it, delayMin) * 10).roundToInt() / 10f },
+                    onValueChangeFinished = {
+                        AiOverlayService.writeDelayRange(context,
+                            (delayMin * 1000).roundToLong(), (delayMax * 1000).roundToLong())
+                    },
+                    valueRange = 0f..5f, steps = 49)
+                Text("实际延迟在最小与最大之间随机，两端相同即为固定延迟；范围 0–5 秒、0.1 秒步进，默认 1.0–3.0 秒，下一手生效。",
+                    style = MaterialTheme.typography.bodySmall)
+                Text("首次默认关闭；开启状态会保存。按 AI 首选操作，结算后继续下一局；断线或游戏退出后尝试恢复，取得完整牌局后继续。所有操作在设定的最小–最大区间内随机延迟。手动出牌或停止助手会关闭此模式。",
                     style = MaterialTheme.typography.bodySmall)
                 Text("关闭模式后可正常退出游戏；收纳后点击“停”浮标会先关闭无人值守模式。整场结束后不会自动创建新对局。", style = MaterialTheme.typography.bodySmall)
             }

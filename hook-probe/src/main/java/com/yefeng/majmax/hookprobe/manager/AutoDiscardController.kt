@@ -15,7 +15,7 @@ object AutoDiscardState {
 /** One pending command, one attempt per decision window; never retries an input. */
 internal class AutoDiscardController(private val log: (String) -> Unit,
     private val now: () -> Long = SystemClock::elapsedRealtime,
-    private val delayMs: () -> Long = { java.util.concurrent.ThreadLocalRandom.current().nextLong(2_000, 5_001) },
+    private val delayMs: () -> Long = { java.util.concurrent.ThreadLocalRandom.current().nextLong(DEFAULT_MIN_DELAY_MS, DEFAULT_MAX_DELAY_MS + 1) },
     initialEnabled: Boolean = false, private val modeChanged: (Boolean) -> Unit = {}) {
     private var enabled = initialEnabled
     private var latest: JSONObject? = null
@@ -77,7 +77,10 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             if (payload != null && (payload.optBoolean("auto_operation") || payload.optLong("timeuse") >= 1_000_000)) {
                 suspend("游戏已自动处理超时窗口，等待下一次同步")
             } else if (command == null || payload == null || !matchesInput(command, input.optString("method"), payload)) {
-                pause("检测到手动操作，无人值守模式已关闭")
+                // An unmatched uplink can be a stale command, a reordered frame, or a game-side
+                // automatic action. Do not mistake it for a user's manual input: revoke only the
+                // pending decision and keep unattended mode armed for the next complete sync.
+                suspend("收到不匹配的游戏操作，撤销当前指令并等待重新同步")
             } else {
                 wireConfirmed = true
                 log("UPLINK_CONFIRMED id=${command.optString("id")}")
@@ -135,7 +138,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             put("gameTile", action.optString("tile")); put("tsumogiri", action.optBoolean("moqie"))
         }
         log("QUEUED kind=${action.optString("kind")} delayMs=$delay id=${pending!!.optString("id")}")
-        AutoDiscardState.mutable.value = AutoDiscardStatus(true, "随机等待 ${"%.1f".format(delay / 1000.0)} 秒 · 可随时关闭")
+        AutoDiscardState.mutable.value = AutoDiscardStatus(true, "等待 ${"%.1f".format(delay / 1000.0)} 秒后执行 · 可随时关闭")
     }
 
     @Synchronized fun poll(acknowledgements: String?): String? {
@@ -149,7 +152,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                     "resync" -> { log("RESYNC_REQUESTED"); continue }
                 }
                 if (ack.optString("state") == "manual") {
-                    if (enabled) pause("检测到手动操作，无人值守模式已关闭")
+                    if (enabled) suspend("游戏反馈为手动操作，撤销当前指令并等待重新同步")
                     continue
                 }
                 if (ack.optString("id") != pending?.optString("id")) continue
@@ -185,6 +188,10 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     }
 
     companion object {
+        /** Default unattended random delay window; user-adjustable 0..5000 ms, persisted by AiOverlayService. */
+        const val DEFAULT_MIN_DELAY_MS = 1_000L
+        const val DEFAULT_MAX_DELAY_MS = 3_000L
+
         /** Select an exact server combination, including red fives; no fallback action. */
         fun prepareAction(result: JSONObject, first: JSONObject): JSONObject? {
             val kind = first.optString("kind")

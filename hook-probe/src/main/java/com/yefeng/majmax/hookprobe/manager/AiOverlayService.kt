@@ -46,10 +46,42 @@ class AiOverlayService : Service() {
         private const val STOP = "local-ai.STOP"
         private const val MODE_PREFS = "unattended"
         private const val MODE_ENABLED = "enabled"
+        private const val MODE_DELAY_MS = "delayMs" // legacy fixed value from earlier builds
+        private const val MODE_DELAY_MIN_MS = "delayMinMs"
+        private const val MODE_DELAY_MAX_MS = "delayMaxMs"
         private val ENDPOINT_URI = Uri.parse("content://com.yefeng.majmax.hookprobe.ai/capture")
         @Volatile private var advertisedEndpoint: CaptureEndpoint? = null
         @Volatile private var instance: AiOverlayService? = null
         internal fun autoPoll(acks: String?): String? = instance?.pollAuto(acks)
+
+        /** Persisted random delay window in ms; the earlier fixed value migrates to a fixed window. */
+        fun readDelayRange(context: Context): LongRange {
+            val prefs = context.getSharedPreferences(MODE_PREFS, MODE_PRIVATE)
+            val legacy = if (prefs.contains(MODE_DELAY_MS) && !prefs.contains(MODE_DELAY_MIN_MS))
+                prefs.getLong(MODE_DELAY_MS, -1L) else -1L
+            val min = if (legacy >= 0) legacy else prefs.getLong(MODE_DELAY_MIN_MS, AutoDiscardController.DEFAULT_MIN_DELAY_MS)
+            val max = if (legacy >= 0) legacy else prefs.getLong(MODE_DELAY_MAX_MS, AutoDiscardController.DEFAULT_MAX_DELAY_MS)
+            val low = min.coerceIn(0L, 5_000L)
+            val high = max.coerceIn(0L, 5_000L)
+            return minOf(low, high)..maxOf(low, high)
+        }
+
+        fun writeDelayRange(context: Context, minMs: Long, maxMs: Long) {
+            val low = minMs.coerceIn(0L, 5_000L)
+            val high = maxMs.coerceIn(low, 5_000L)
+            context.getSharedPreferences(MODE_PREFS, MODE_PRIVATE).edit()
+                .remove(MODE_DELAY_MS)
+                .putLong(MODE_DELAY_MIN_MS, low)
+                .putLong(MODE_DELAY_MAX_MS, high)
+                .apply()
+        }
+
+        /** Uniform draw inside the persisted window; equal bounds behave as a fixed delay. */
+        fun nextDelayMs(context: Context): Long {
+            val window = readDelayRange(context)
+            return if (window.last <= window.first) window.first
+            else java.util.concurrent.ThreadLocalRandom.current().nextLong(window.first, window.last + 1)
+        }
         fun toggleAuto() { instance?.auto?.toggle() }
 
         internal fun currentEndpoint(): CaptureEndpoint? = advertisedEndpoint?.let {
@@ -74,7 +106,7 @@ class AiOverlayService : Service() {
         val parts = message.split(' ', limit = 2)
         DiagnosticsStore.appendAssistant(this, "INFO", "assistant.autoplay", parts[0].removeSuffix(":"),
             JSONObject().put("reason", parts.getOrNull(1) ?: ""))
-    }, initialEnabled = getSharedPreferences(MODE_PREFS, MODE_PRIVATE).getBoolean(MODE_ENABLED, false),
+    }, delayMs = { nextDelayMs(this) }, initialEnabled = getSharedPreferences(MODE_PREFS, MODE_PRIVATE).getBoolean(MODE_ENABLED, false),
         modeChanged = { enabled ->
             getSharedPreferences(MODE_PREFS, MODE_PRIVATE).edit().putBoolean(MODE_ENABLED, enabled).commit()
         }) }
