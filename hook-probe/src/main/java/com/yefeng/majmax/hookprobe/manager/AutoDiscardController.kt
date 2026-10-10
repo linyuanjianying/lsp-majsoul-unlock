@@ -121,11 +121,14 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
         if (result.optJSONArray("legalOperations")?.length() == 0) return
         val key = "${result.optLong("sourceGeneration")}:${result.optString("connection")}:${result.optLong("revision")}"
         if (key == attempted || result.optLong("sourceSequence") <= 0) return
-        attempted = key
         val action = prepareAction(result, first) ?: run {
+            // Do not mark this key attempted: the mismatch may be transient (the engine may
+            // revise its recommendation on the next render), and blocking retries would leave
+            // a whole decision window with no reaction.
             suspend("AI 动作与合法操作未能匹配，等待新的操作窗口")
             return
         }
+        attempted = key
         wireConfirmed = false; submitted = false; accepted = false
         pendingAt = now()
         val delay = delayMs()

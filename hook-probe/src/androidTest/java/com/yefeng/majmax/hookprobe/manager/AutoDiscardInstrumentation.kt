@@ -73,6 +73,17 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.observe(live()); check(gate.poll(null) == null)
                 gate.observe(live(2)); check(gate.poll(null) != null)
             }
+            test("failed preparation does not block retry in the same window") { _, _ ->
+                // The server combination does not match the AI's consumed tiles yet: preparation
+                // fails. A later render in the same decision window (same revision) with aligned
+                // data must still queue instead of being swallowed by the attempted key.
+                var time=0L
+                val gate=AutoDiscardController({}, {time}, {0L})
+                gate.observe(actionCase("pon",3,"5m",listOf("5m","5m"),listOf("5m|6m"),listOf("5m","5m","9p")))
+                gate.toggle(); check(gate.poll(null) == null)
+                gate.observe(actionCase("pon",3,"5m",listOf("5m","5m"),listOf("5m|5m"),listOf("5m","5m","9p")))
+                check(JSONObject(checkNotNull(gate.poll(null))).getJSONObject("action").getInt("type") == 3)
+            }
             test("sent input requires server acceptance before next decision") { gate, _ ->
                 gate.observe(live()); gate.toggle(); val id=JSONObject(gate.poll(null)!!).getString("id")
                 gate.poll(ack(id,"submitted"))

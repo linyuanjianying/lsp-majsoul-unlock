@@ -34,6 +34,13 @@ struct Assistant {
     step: u64,
     operations: Value,
     operation_seat: Option<u64>,
+    /// Cache of the last inference, keyed by revision. Heartbeats and other
+    /// event-less frames must not re-run the engine: the decision cannot change
+    /// without new events, and re-running inference on every frame lets the
+    /// capture sequence outrun the proof renewal, stalling claims.
+    cached_revision: u64,
+    cached_recommendations: Vec<Value>,
+    cached_custom_fallback: bool,
 }
 
 fn waiting(message: &str) -> Value {
@@ -47,6 +54,9 @@ impl Assistant {
             engine: None, round_ready: false, input_pending: false, revision: 0, step: 0,
             operations: json!([]),
             operation_seat: None,
+            cached_revision: u64::MAX,
+            cached_recommendations: Vec::new(),
+            cached_custom_fallback: false,
         }
     }
 
@@ -185,7 +195,13 @@ impl Assistant {
         let mut recommendations = Vec::new();
         let mut custom_fallback = false;
         if can_act {
-            if let Some(engine) = self.engine.as_mut() {
+            if self.cached_revision == self.revision {
+                // No new game events since the last inference: the decision cannot
+                // have changed. Reuse it so event-less frames (heartbeats, other
+                // seats' responses) stay cheap and the transport proof keeps up.
+                recommendations.clone_from(&self.cached_recommendations);
+                custom_fallback = self.cached_custom_fallback;
+            } else if let Some(engine) = self.engine.as_mut() {
                 if let Some(decision) = engine.decide()? {
                     custom_fallback = decision.custom_fallback;
                     // Use action (not candidates[0]) for a riichi: only action
@@ -195,6 +211,9 @@ impl Assistant {
                         recommendations.push(action_json(action, *probability));
                     }
                 }
+                self.cached_revision = self.revision;
+                self.cached_recommendations.clone_from(&recommendations);
+                self.cached_custom_fallback = custom_fallback;
             }
         }
         let own = &snap.players[seat as usize];
@@ -365,6 +384,20 @@ mod tests {
         for key in ["revision", "step", "hand", "legalOperations", "recommendations"] {
             assert_eq!(before[key], after[key], "changed {key}");
         }
+    }
+
+    #[test]
+    fn event_less_frames_reuse_cached_inference() {
+        let mut host = Assistant::new();
+        authenticate(&mut host, 4);
+        let first = live_round(&mut host, 4);
+        assert!(!first["recommendations"].as_array().unwrap().is_empty());
+        assert_eq!(host.cached_revision, host.revision);
+        // A heartbeat-like frame carries no game events: the revision is unchanged,
+        // so render must reuse the cached decision instead of re-running inference.
+        let second = rpc(&mut host, ".lq.FastTest.checkNetworkDelay", json!({}), json!({})).unwrap();
+        assert_eq!(second["recommendations"], first["recommendations"]);
+        assert_eq!(second["revision"], first["revision"]);
     }
 
     fn proto(name: &str, value: Value) -> Vec<u8> {
