@@ -125,7 +125,11 @@ jobs:
             CERTS="$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK")"
             ACTUAL_SHA256="$(awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}' <<< "$CERTS" | tr -d '[:space:]:' | tr 'A-F' 'a-f')"
             echo "$APK signing certificate SHA-256: $ACTUAL_SHA256"
-            test "$ACTUAL_SHA256" = '375638284d8b7d9889ab3c0ed7afd0d597d2c648144813bb4936f37daa665c0f'
+            if [ -n "${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}" ]; then
+              test "$ACTUAL_SHA256" = '375638284d8b7d9889ab3c0ed7afd0d597d2c648144813bb4936f37daa665c0f'
+            else
+              echo "Skipping signature pin check (ephemeral debug key, fork build)."
+            fi
           done
 
       - name: Upload APK artifacts
