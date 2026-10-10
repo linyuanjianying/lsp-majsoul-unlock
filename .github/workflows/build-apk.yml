@@ -93,8 +93,16 @@ jobs:
         env:
           ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
         run: |
-          test -n "$ANDROID_DEBUG_KEYSTORE_BASE64"
-          printf '%s' "$ANDROID_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/ci-debug.keystore"
+          if [ -n "$ANDROID_DEBUG_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/ci-debug.keystore"
+          else
+            # Forks do not inherit the signing secret: generate an ephemeral debug key
+            # so the build still succeeds (APK just won't share the official signature).
+            echo "Signing secret not configured; generating an ephemeral debug keystore."
+            keytool -genkeypair -keystore "$RUNNER_TEMP/ci-debug.keystore" -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10950 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
           chmod 600 "$RUNNER_TEMP/ci-debug.keystore"
           keytool -list -keystore "$RUNNER_TEMP/ci-debug.keystore" -storepass android -alias androiddebugkey >/dev/null 2>&1
 
