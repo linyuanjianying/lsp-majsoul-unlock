@@ -16,6 +16,11 @@ mod android {
 
     const MAX_FRAME: usize = 1024 * 1024;
     const TOKEN_SIZE: usize = 32;
+    /// How far the capture sequence may run ahead of the command's validated
+    /// sequence before the proof is considered stale. Covers the poll-vs-tick
+    /// cadence gap during busy windows without letting a wedged manager act
+    /// on an ancient decision.
+    const MAX_SEQUENCE_SKEW: u64 = 64;
     static CONNECTED: AtomicBool = AtomicBool::new(false);
     static GENERATION: AtomicU64 = AtomicU64::new(1);
     static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
@@ -191,10 +196,30 @@ mod android {
     }
 
     /// Revalidate immediately before using the game's normal Lua input path.
+    ///
+    /// Allows the capture to run ahead of the validated sequence by a bounded
+    /// amount. The game polls the command on a slower cadence than the Lua tick,
+    /// so during busy windows (e.g. other seats responding to a claim) fresh
+    /// frames routinely land between the poll and the tick; requiring an exact
+    /// match would stall the action forever. Actual staleness is still guarded:
+    /// the manager empties the command when revision/step lapse, the Lua
+    /// re-checks step/hand before acting, and the 6s command age timeout bounds
+    /// how stale a decision can get.
     pub fn is_current(generation: u64, connection: u64, sequence: u64) -> bool {
-        CONNECTED.load(Ordering::SeqCst) && GENERATION.load(Ordering::SeqCst) == generation &&
-            SEQUENCES.get().and_then(|map| map.try_lock().ok())
-                .is_some_and(|map| map.get(&connection).copied() == Some(sequence))
+        if !CONNECTED.load(Ordering::SeqCst) {
+            return false;
+        }
+        if GENERATION.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        let current = SEQUENCES
+            .get()
+            .and_then(|map| map.try_lock().ok())
+            .and_then(|map| map.get(&connection).copied());
+        match current {
+            Some(cur) => cur >= sequence && cur - sequence <= MAX_SEQUENCE_SKEW,
+            None => false,
+        }
     }
 }
 
