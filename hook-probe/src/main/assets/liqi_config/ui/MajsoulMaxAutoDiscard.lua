@@ -161,7 +161,7 @@ local function execute(command)
     for _, op in ipairs(d.oplist or {}) do
         if op.type == action.type then operation = op end
     end
-    if kind ~= 'pass' and not operation then return end
+    if kind ~= 'pass' and not operation then waiting(id, 'no_server_operation'); return end
     if kind == 'discard' or kind == 'riichi' then
         if not r._can_discard or type(r._DoDiscardTile) ~= 'function' or type(r._setChoosePai) ~= 'function' then return end
         -- A winning window must be handled by the explicit AI recommendation.
@@ -223,7 +223,7 @@ local function execute(command)
             if type(r._resetMouseState) == 'function' then r:_resetMouseState() end
         end
     elseif kind == 'chi' or kind == 'pon' or kind == 'kan' then
-        if not ready(claim) then return end
+        if not ready(claim) then waiting(id, 'claim_ui_not_ready'); return end
         if not d.lastqipai or d.lastqipai:ToString() ~= action.tile or d.lastqipai_seat ~= action.target + 1 then
             mark(id); ack(id, 'target_mismatch'); return
         end
@@ -233,12 +233,12 @@ local function execute(command)
             mark(id); ack(id, 'illegal_combination'); return
         end
         if kind == 'kan' then
-            if index ~= 0 or not button(claim, 'btn_gang', 'Btn_Gang') then return end
+            if index ~= 0 or not button(claim, 'btn_gang', 'Btn_Gang') then waiting(id, 'gang_button_not_ready'); return end
             run = function() claim.container_btns:Btn_Gang() end
         else
             local values = claim.data and claim.data[kind == 'chi' and 'chi' or 'peng']
-            if not values or values[index+1] ~= action.combination then return end
-            if type(claim.OnClickDetail) ~= 'function' then return end
+            if not values or values[index+1] ~= action.combination then waiting(id, 'claim_data_mismatch'); return end
+            if type(claim.OnClickDetail) ~= 'function' then waiting(id, 'no_onclick_detail'); return end
             run = function() claim.choosed_op = action.type; claim:OnClickDetail(index, 1) end
         end
     elseif kind == 'ankan' or kind == 'kakan' then
