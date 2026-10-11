@@ -200,9 +200,20 @@ end)
 test('open kan uses claim window',function(s)
     operation(s,'kan',5,'3m|3m|3m'); __majmax_auto_tick(); assert(s.sent[1].type==5)
 end)
-test('stale target seat cannot claim',function(s)
-    operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.lastqipai_seat=2
-    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='target_mismatch')
+test('claim ignores unstable UI seat when tile and server operation match',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    DesktopMgr.Inst.lastqipai_seat=2
+    __majmax_auto_tick(); assert(s.sent[1].type==3)
+    local saw=false
+    for _,row in ipairs(s.acks) do
+        saw=saw or (row.state=='probe' and row.reason=='claim_target_seat_ignored')
+    end
+    assert(saw)
+end)
+test('different discarded tile still cannot claim',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    DesktopMgr.Inst.lastqipai.ToString=function() return '4m' end
+    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='target_tile_mismatch')
 end)
 test('changed combination never substitutes red for normal five',function(s)
     operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.oplist[1].combination={'5m|5m'}

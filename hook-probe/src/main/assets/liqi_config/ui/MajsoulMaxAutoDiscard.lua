@@ -265,16 +265,23 @@ local function execute(command)
             return
         end
         if claimKind then claimProbe(id, 'ui_ready') end
-        local targetOk, targetMatches = pcall(function()
-            if not d.lastqipai or type(d.lastqipai.ToString) ~= 'function' then return false end
-            return d.lastqipai:ToString() == action.tile and d.lastqipai_seat == action.target + 1
+        local targetOk, tileMatches, seatValue = pcall(function()
+            if not d.lastqipai or type(d.lastqipai.ToString) ~= 'function' then return false, nil end
+            return d.lastqipai:ToString() == action.tile, d.lastqipai_seat
         end)
         if not targetOk then
             if claimKind then claimWaiting(id, 'target_read_exception') end
             return
         end
-        if not targetMatches then mark(id); ack(id, 'target_mismatch'); return end
-        if claimKind then claimProbe(id, 'target_verified') end
+        -- DesktopMgr.lastqipai_seat is not stable across game builds (absolute seat,
+        -- relative direction, and stale actor values have all existed). The exact
+        -- discarded tile plus the current server operation/combination are the
+        -- authoritative proof for a claim; the request itself contains no target.
+        if not tileMatches then mark(id); ack(id, 'target_tile_mismatch'); return end
+        if claimKind then
+            claimProbe(id, seatValue == action.target + 1 and 'target_verified'
+                or 'target_seat_ignored')
+        end
         local index = action.index
         local combinationOk, combinationMatches = pcall(function()
             return type(index) == 'number' and index >= 0 and index % 1 == 0

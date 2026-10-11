@@ -261,7 +261,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                             "hand_mismatch", "invalid_hand", "unknown_hand" -> "手牌校验未通过"
                             "illegal_tile" -> "目标牌当前不可操作"
                             "illegal_combination" -> "鸣牌或立直组合已变化"
-                            "target_mismatch" -> "目标牌或座位已变化"
+                            "target_mismatch", "target_tile_mismatch" -> "目标牌已变化"
                             "win_available" -> "可以和牌，请手动确认"
                             "special_selection" -> "正在选择特殊操作"
                             "failed" -> "服务器未确认操作"
