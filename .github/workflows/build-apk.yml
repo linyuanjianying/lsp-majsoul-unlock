@@ -104,7 +104,7 @@ jobs:
           chmod 600 "$RUNNER_TEMP/ci-debug.keystore"
           keytool -list -keystore "$RUNNER_TEMP/ci-debug.keystore" -storepass android -alias androiddebugkey >/dev/null 2>&1
 
-      - name: Build ARM64 and universal APKs
+      - name: Build ARM64, ARMv7 and universal APKs
         env:
           ANDROID_DEBUG_KEYSTORE_PATH: ${{ runner.temp }}/ci-debug.keystore
         run: ./gradlew -p hook-probe --no-daemon -PupdateOwner=linyuanjianying -PupdateRepo=lsp-majsoul-unlock -PupdateChannel=stable -PbuildSha="${GITHUB_SHA:0:7}" assembleDebug
@@ -113,12 +113,13 @@ jobs:
         shell: bash
         run: |
           python3 tools/verify_native_apk.py hook-probe/build/outputs/apk/arm64/debug/MajsoulHookProbe-arm64-debug.apk --abis arm64-v8a
+          python3 tools/verify_native_apk.py hook-probe/build/outputs/apk/armv7/debug/MajsoulHookProbe-armv7-debug.apk --abis armeabi-v7a
           python3 tools/verify_native_apk.py hook-probe/build/outputs/apk/universal/debug/MajsoulHookProbe-universal-debug.apk --abis arm64-v8a armeabi-v7a x86 x86_64
 
       - name: Verify APK signature and alignment
         shell: bash
         run: |
-          for APK in hook-probe/build/outputs/apk/{arm64,universal}/debug/*.apk; do
+          for APK in hook-probe/build/outputs/apk/{armv7,arm64,universal}/debug/*.apk; do
             "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 4 "$APK"
             CERTS="$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK")"
             ACTUAL_SHA256="$(awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}' <<< "$CERTS" | tr -d '[:space:]:' | tr 'A-F' 'a-f')"
@@ -133,8 +134,9 @@ jobs:
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: MajsoulHookProbe-arm64-and-universal
+          name: MajsoulHookProbe-armv7-arm64-and-universal
           path: |
+            hook-probe/build/outputs/apk/armv7/debug/*.apk
             hook-probe/build/outputs/apk/arm64/debug/*.apk
             hook-probe/build/outputs/apk/universal/debug/*.apk
           if-no-files-found: error
@@ -153,8 +155,10 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$VERSION_NAME"
           RELEASE_APK="MajsoulMax-Hook-${VERSION_NAME}-universal.apk"
           ARM64_APK="MajsoulMax-Hook-${VERSION_NAME}-arm64-v8a.apk"
+          ARMV7_APK="MajsoulMax-Hook-${VERSION_NAME}-armeabi-v7a.apk"
           cp "$APK" "$RELEASE_APK"
           cp hook-probe/build/outputs/apk/arm64/debug/MajsoulHookProbe-arm64-debug.apk "$ARM64_APK"
+          cp hook-probe/build/outputs/apk/armv7/debug/MajsoulHookProbe-armv7-debug.apk "$ARMV7_APK"
           cat > hook-update.json <<EOF
           {
             "schemaVersion": 1,
@@ -168,6 +172,7 @@ jobs:
             "assetName": "${RELEASE_APK}",
             "variants": [
               {"assetName": "${ARM64_APK}", "abis": ["arm64-v8a"]},
+              {"assetName": "${ARMV7_APK}", "abis": ["armeabi-v7a"]},
               {"assetName": "${RELEASE_APK}", "abis": ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"]}
             ]
           }
@@ -182,5 +187,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             hook-update.json
+            MajsoulMax-Hook-*-armeabi-v7a.apk
             MajsoulMax-Hook-*-arm64-v8a.apk
             MajsoulMax-Hook-*-universal.apk

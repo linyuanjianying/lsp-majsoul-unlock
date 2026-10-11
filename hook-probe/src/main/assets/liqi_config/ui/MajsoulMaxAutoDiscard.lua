@@ -368,7 +368,7 @@ local function execute(command)
     A.executing = nil
     A.claimExecuting = nil
     if not ok then ack(id, claimKind and 'claim_run_exception' or 'game_exception')
-    elseif claimKind then ack(id, 'claim_invoked') end
+    elseif claimKind then claimProbe(id, 'invoked') end
 end
 function __majmax_auto_tick()
     local ok = pcall(function()

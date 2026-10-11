@@ -14,6 +14,7 @@ val buildSha = providers.gradleProperty("buildSha")
     .orElse("local build").get()
 val distributionAbis = mapOf(
     "arm64" to listOf("arm64-v8a"),
+    "armv7" to listOf("armeabi-v7a"),
     "universal" to listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64"),
 )
 val stageUpstreamAssets by tasks.registering(Copy::class) {
@@ -52,8 +53,8 @@ android {
         applicationId = "com.yefeng.majmax.hookprobe"
         minSdk = 29
         targetSdk = 35
-        versionCode = 22
-        versionName = "0.9.0"
+        versionCode = 23
+        versionName = "0.9.1"
         testInstrumentationRunner = "com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation"
         buildConfigField("String", "UPDATE_OWNER", "\"${updateOwner.replace("\"", "\\\"")}\"")
         buildConfigField("String", "UPDATE_REPO", "\"${updateRepo.replace("\"", "\\\"")}\"")
@@ -128,7 +129,7 @@ distributionAbis.forEach { (distribution, abis) ->
                 .filterNot { root.resolve(it).isFile }
             check(missing.isEmpty()) {
                 "Missing native libraries: ${missing.joinToString()}. " +
-                    "Run build-native.ps1 -NdkPath <NDK> -Abis ${if (distribution == "universal") "all" else "arm64-v8a"}"
+                    "Run build-native.ps1 -NdkPath <NDK> -Abis ${if (distribution == "universal") "all" else abis.joinToString(",")}"
             }
         }
     }

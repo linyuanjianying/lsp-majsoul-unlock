@@ -181,7 +181,7 @@ test('claim called but not submitted is distinguishable',function(s)
     operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
     UI_ChiPengHu.Inst.OnClickDetail=function(self) self.detailOpened=true end
     __majmax_auto_tick(); assert(#s.sent==0 and UI_ChiPengHu.Inst.detailOpened)
-    assert(s.acks[#s.acks].state=='claim_invoked')
+    assert(s.acks[#s.acks].state=='probe' and s.acks[#s.acks].reason=='claim_invoked')
     local probes={}
     for _,row in ipairs(s.acks) do if row.state=='probe' then probes[row.reason]=true end end
     for _,stage in ipairs({'claim_ui_ready','claim_target_verified','claim_operation_combination_verified',
