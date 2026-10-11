@@ -142,16 +142,45 @@ test('pon uses the selected server combination',function(s)
     operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
     __majmax_auto_tick(); assert(s.sent[1].type==3)
 end)
+local function claimReason(s)
+    for i=#s.acks,1,-1 do
+        local row=s.acks[i]
+        if row.state == 'waiting' and row.reason and row.reason:match('^claim_') then return row.reason end
+    end
+end
+test('claim UI not ready reports bounded diagnostic',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.transform.gameObject.activeInHierarchy=false
+    __majmax_auto_tick(); assert(#s.sent==0 and claimReason(s)=='claim_ui_not_ready')
+end)
+test('claim UI missing data reports bounded diagnostic',function(s)
+    operation(s,'chi',2,'0m|4m')
+    __majmax_auto_tick(); assert(#s.sent==0 and claimReason(s)=='claim_ui_data_missing')
+end)
+test('claim UI mismatched combination reports bounded diagnostic',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|5m'}
+    __majmax_auto_tick(); assert(#s.sent==0 and claimReason(s)=='claim_ui_combination_mismatch')
+end)
+test('claim UI missing detail method reports bounded diagnostic',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    UI_ChiPengHu.Inst.OnClickDetail=nil
+    __majmax_auto_tick(); assert(#s.sent==0 and claimReason(s)=='claim_detail_unavailable')
+end)
+test('claim called but not submitted is distinguishable',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    UI_ChiPengHu.Inst.OnClickDetail=function(self) self.detailOpened=true end
+    __majmax_auto_tick(); assert(#s.sent==0 and UI_ChiPengHu.Inst.detailOpened)
+    assert(s.acks[#s.acks].state=='claim_invoked')
+end)
 test('open kan uses claim window',function(s)
     operation(s,'kan',5,'3m|3m|3m'); __majmax_auto_tick(); assert(s.sent[1].type==5)
 end)
 test('stale target seat cannot claim',function(s)
     operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.lastqipai_seat=2
-    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[1].state=='target_mismatch')
+    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='target_mismatch')
 end)
 test('changed combination never substitutes red for normal five',function(s)
     operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.oplist[1].combination={'5m|5m'}
-    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[1].state=='illegal_combination')
+    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='illegal_combination')
 end)
 test('ankan offsets past kakan entries',function(s)
     operation(s,'ankan',4,'5m|5m|5m|0m')

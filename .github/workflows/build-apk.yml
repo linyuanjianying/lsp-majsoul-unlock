@@ -101,7 +101,7 @@ jobs:
       - name: Build ARM64 and universal APKs
         env:
           ANDROID_DEBUG_KEYSTORE_PATH: ${{ runner.temp }}/ci-debug.keystore
-        run: ./gradlew -p hook-probe --no-daemon -PupdateOwner=YeFeng233 -PupdateRepo=lsp-majsoul-unlock -PupdateChannel=stable -PbuildSha="${GITHUB_SHA:0:7}" assembleDebug
+        run: ./gradlew -p hook-probe --no-daemon -PupdateOwner=linyuanjianying -PupdateRepo=lsp-majsoul-unlock -PupdateChannel=stable -PbuildSha="${GITHUB_SHA:0:7}" assembleDebug
 
       - name: Verify native ABI completeness, dependencies and alignment
         shell: bash
