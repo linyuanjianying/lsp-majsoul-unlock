@@ -182,6 +182,20 @@ test('claim called but not submitted is distinguishable',function(s)
     UI_ChiPengHu.Inst.OnClickDetail=function(self) self.detailOpened=true end
     __majmax_auto_tick(); assert(#s.sent==0 and UI_ChiPengHu.Inst.detailOpened)
     assert(s.acks[#s.acks].state=='claim_invoked')
+    local probes={}
+    for _,row in ipairs(s.acks) do if row.state=='probe' then probes[row.reason]=true end end
+    for _,stage in ipairs({'claim_ui_ready','claim_target_verified','claim_operation_combination_verified',
+            'claim_ui_data_present','claim_ui_combination_verified','claim_detail_available',
+            'claim_commit_ready','claim_capture_verified','claim_run_begin','claim_assign_operation_begin',
+            'claim_assign_operation_done','claim_detail_call_begin','claim_detail_call_returned'}) do
+        assert(probes[stage], stage)
+    end
+end)
+test('claim call exception is reported without exception text',function(s)
+    operation(s,'chi',2,'0m|4m'); UI_ChiPengHu.Inst.data.chi={'0m|4m'}
+    UI_ChiPengHu.Inst.OnClickDetail=function() error('sensitive bridge error') end
+    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='claim_run_exception')
+    assert(not tostring(s.acks[#s.acks].reason):find('sensitive'))
 end)
 test('open kan uses claim window',function(s)
     operation(s,'kan',5,'3m|3m|3m'); __majmax_auto_tick(); assert(s.sent[1].type==5)

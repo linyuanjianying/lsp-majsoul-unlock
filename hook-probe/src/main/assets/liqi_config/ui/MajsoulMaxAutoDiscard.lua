@@ -21,6 +21,9 @@ end
 local function claimWaiting(id, reason)
     waiting(id, 'claim_' .. reason)
 end
+local function claimProbe(id, stage)
+    ack(id, 'probe', 'claim_' .. stage)
+end
 local function tile(value)
     local honors = { E='1z', S='2z', W='3z', N='4z', P='5z', F='6z', C='7z' }
     if honors[value] then return honors[value] end
@@ -46,8 +49,10 @@ local function install()
             local id = A.executing
             local external = request and (request.auto_operation or (tonumber(request.timeuse) or 0) >= 1000000)
             ack(id, id and 'submitted' or (external and 'external' or 'manual'))
+            if id and A.claimExecuting == id then ack(id, 'probe', 'claim_network_intercepted') end
             local wrapped = function(error, response, ...)
                 if id then
+                    if A.claimExecuting == id then ack(id, 'probe', 'claim_network_callback') end
                     local code = response and response.error and response.error.code
                     ack(id, (not error and response and (not code or code == 0)) and 'accepted' or 'failed')
                 end
@@ -259,24 +264,55 @@ local function execute(command)
             if claimKind then claimWaiting(id, 'ui_not_ready') end
             return
         end
-        if claimKind then waiting(id, 'claim_ui_ready') end
-        if not d.lastqipai or d.lastqipai:ToString() ~= action.tile or d.lastqipai_seat ~= action.target + 1 then
-            mark(id); ack(id, 'target_mismatch'); return
+        if claimKind then claimProbe(id, 'ui_ready') end
+        local targetOk, targetMatches = pcall(function()
+            if not d.lastqipai or type(d.lastqipai.ToString) ~= 'function' then return false end
+            return d.lastqipai:ToString() == action.tile and d.lastqipai_seat == action.target + 1
+        end)
+        if not targetOk then
+            if claimKind then claimWaiting(id, 'target_read_exception') end
+            return
         end
+        if not targetMatches then mark(id); ack(id, 'target_mismatch'); return end
+        if claimKind then claimProbe(id, 'target_verified') end
         local index = action.index
-        if type(index) ~= 'number' or index < 0 or index % 1 ~= 0
-                or (operation.combination or {})[index+1] ~= action.combination then
-            mark(id); ack(id, 'illegal_combination'); return
+        local combinationOk, combinationMatches = pcall(function()
+            return type(index) == 'number' and index >= 0 and index % 1 == 0
+                and operation.combination and operation.combination[index+1] == action.combination
+        end)
+        if not combinationOk then
+            if claimKind then claimWaiting(id, 'operation_combination_exception') end
+            return
         end
+        if not combinationMatches then mark(id); ack(id, 'illegal_combination'); return end
+        if claimKind then claimProbe(id, 'operation_combination_verified') end
         if kind == 'kan' then
             if index ~= 0 or not button(claim, 'btn_gang', 'Btn_Gang') then return end
             run = function() claim.container_btns:Btn_Gang() end
         else
-            local values = claim.data and claim.data[kind == 'chi' and 'chi' or 'peng']
+            local dataOk, values = pcall(function()
+                local data = claim.data
+                return data and data[kind == 'chi' and 'chi' or 'peng']
+            end)
+            if not dataOk then claimWaiting(id, 'ui_data_exception'); return end
             if not values then claimWaiting(id, 'ui_data_missing'); return end
-            if values[index+1] ~= action.combination then claimWaiting(id, 'ui_combination_mismatch'); return end
-            if type(claim.OnClickDetail) ~= 'function' then claimWaiting(id, 'detail_unavailable'); return end
-            run = function() claim.choosed_op = action.type; claim:OnClickDetail(index, 1) end
+            claimProbe(id, 'ui_data_present')
+            local valueOk, valueMatches = pcall(function() return values[index+1] == action.combination end)
+            if not valueOk then claimWaiting(id, 'ui_combination_exception'); return end
+            if not valueMatches then claimWaiting(id, 'ui_combination_mismatch'); return end
+            claimProbe(id, 'ui_combination_verified')
+            local detailOk, detail = pcall(function() return claim.OnClickDetail end)
+            if not detailOk then claimWaiting(id, 'detail_read_exception'); return end
+            if type(detail) ~= 'function' then claimWaiting(id, 'detail_unavailable'); return end
+            claimProbe(id, 'detail_available')
+            run = function()
+                claimProbe(id, 'assign_operation_begin')
+                claim.choosed_op = action.type
+                claimProbe(id, 'assign_operation_done')
+                claimProbe(id, 'detail_call_begin')
+                detail(claim, index, 1)
+                claimProbe(id, 'detail_call_returned')
+            end
         end
     elseif kind == 'ankan' or kind == 'kakan' then
         if not ready(own) or type(own.OnClickDetail) ~= 'function' then return end
@@ -313,17 +349,20 @@ local function execute(command)
         run = function() claim.container_btns:Btn_Cancel() end
     end
     if not run then mark(id); ack(id, 'unknown_action'); return end
-    if claimKind then waiting(id, 'claim_ready') end
+    if claimKind then claimProbe(id, 'commit_ready') end
     -- Recheck after all game-side checks and immediately before committing.
     if __majmax_auto_current() ~= 'yes' then
         if claimKind then claimWaiting(id, 'capture_proof') else waiting(id, 'capture_proof') end
         return
     end
+    if claimKind then claimProbe(id, 'capture_verified') end
     mark(id)
     A.executing = id
+    if claimKind then A.claimExecuting = id; claimProbe(id, 'run_begin') end
     local ok = pcall(run)
     A.executing = nil
-    if not ok then ack(id, 'game_exception')
+    A.claimExecuting = nil
+    if not ok then ack(id, claimKind and 'claim_run_exception' or 'game_exception')
     elseif claimKind then ack(id, 'claim_invoked') end
 end
 function __majmax_auto_tick()

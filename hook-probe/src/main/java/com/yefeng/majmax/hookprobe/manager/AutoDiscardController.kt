@@ -240,6 +240,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                 if (ack.optString("id") != pending?.optString("id")) continue
                 when (ack.optString("state")) {
                     "waiting" -> { log("GAME_WAITING ${ack.optString("reason")}") }
+                    "probe" -> { log("CLAIM_PROBE ${ack.optString("reason")}") }
                     "submitted" -> {
                         submitted = true
                         pollDueAt = now() + POLL_INTERVAL_MS
@@ -264,6 +265,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                             "win_available" -> "可以和牌，请手动确认"
                             "special_selection" -> "正在选择特殊操作"
                             "failed" -> "服务器未确认操作"
+                            "claim_run_exception" -> "吃碰界面调用发生异常"
                             else -> "游戏操作状态异常"
                         }
                         suspend("$reason，等待新的完整牌局状态")
