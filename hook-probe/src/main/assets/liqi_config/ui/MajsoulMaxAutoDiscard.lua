@@ -207,8 +207,17 @@ local function execute(command)
         mark(id); ack(id, 'hand_mismatch'); return
     end
     if claimKind then waiting(id, 'claim_hand_verified') end
-    local own = UI_LiqiZimo and UI_LiqiZimo.Inst
-    local claim = UI_ChiPengHu and UI_ChiPengHu.Inst
+    local own, claim
+    if claimKind then
+        -- Unity property access may throw before the ordinary readiness check can report.
+        -- Fixed stage codes only: do not transmit exception strings or game objects.
+        local ok
+        ok, claim = pcall(function() return UI_ChiPengHu and UI_ChiPengHu.Inst end)
+        if not ok then claimWaiting(id, 'ui_instance_exception'); return end
+    else
+        own = UI_LiqiZimo and UI_LiqiZimo.Inst
+        claim = UI_ChiPengHu and UI_ChiPengHu.Inst
+    end
     local function ready(ui)
         return ui and ui.transform and ui.transform.gameObject.activeInHierarchy and not ui.on_do_operation
             and ui.container_btns and ui.container_btns.transform.gameObject.activeInHierarchy
@@ -241,10 +250,16 @@ local function execute(command)
             if type(r._resetMouseState) == 'function' then r:_resetMouseState() end
         end
     elseif kind == 'chi' or kind == 'pon' or kind == 'kan' then
-        if not ready(claim) then
-            if kind ~= 'kan' then claimWaiting(id, 'ui_not_ready') end
+        local uiReady, isReady = pcall(ready, claim)
+        if not uiReady then
+            if claimKind then claimWaiting(id, 'ui_readiness_exception') end
             return
         end
+        if not isReady then
+            if claimKind then claimWaiting(id, 'ui_not_ready') end
+            return
+        end
+        if claimKind then waiting(id, 'claim_ui_ready') end
         if not d.lastqipai or d.lastqipai:ToString() ~= action.tile or d.lastqipai_seat ~= action.target + 1 then
             mark(id); ack(id, 'target_mismatch'); return
         end
