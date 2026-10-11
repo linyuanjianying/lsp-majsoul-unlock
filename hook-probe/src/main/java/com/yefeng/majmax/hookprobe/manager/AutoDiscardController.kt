@@ -28,10 +28,17 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     private var wireConfirmed = false
     private var submitted = false
     private var accepted = false
+    private var sameTurnRetries = 0
+    /** Armed right after our input is sent: poll the game every second and repeat the
+     *  discard while the refreshed state still says it is our turn. Survives reconnect. */
+    private var pollArmed = false
+    private var pollDueAt = 0L
+    private var pollWait = ""
 
     @Synchronized fun pause(reason: String) {
         if (enabled || pending != null) log("PAUSED: $reason")
         enabled = false; pending = null
+        stopPolling()
         modeChanged(false)
         AutoDiscardState.mutable.value = AutoDiscardStatus(false, reason)
     }
@@ -55,6 +62,16 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
         suspend(reason)
     }
 
+    @Synchronized private fun stopPolling() {
+        pollArmed = false; pollDueAt = 0L; sameTurnRetries = 0; pollWait = ""
+    }
+
+    /** Keep polling, but do not repeat an unchanged wait reason in the diagnostics log. */
+    @Synchronized private fun pollWait(reason: String) {
+        pollDueAt = now() + POLL_INTERVAL_MS
+        if (pollWait != reason) { pollWait = reason; log("TURN_POLL_WAIT $reason") }
+    }
+
     @Synchronized fun toggle() {
         if (enabled) { pause("已手动关闭无人值守模式"); return }
         val state = latest
@@ -76,15 +93,29 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             val command = pending
             if (payload != null && (payload.optBoolean("auto_operation") || payload.optLong("timeuse") >= 1_000_000)) {
                 suspend("游戏已自动处理超时窗口，等待下一次同步")
-            } else if (command == null || payload == null || !matchesInput(command, input.optString("method"), payload)) {
-                // An unmatched uplink can be a stale command, a reordered frame, or a game-side
-                // automatic action. Do not mistake it for a user's manual input: revoke only the
-                // pending decision and keep unattended mode armed for the next complete sync.
-                suspend("收到不匹配的游戏操作，撤销当前指令并等待重新同步")
-            } else {
+            } else if (command != null && payload != null
+                && matchesInput(command, input.optString("method"), payload)) {
+                // Our own request was captured on the wire. Confirm it even when the
+                // Lua ack arrived first, otherwise the command would never be released.
                 wireConfirmed = true
                 log("UPLINK_CONFIRMED id=${command.optString("id")}")
                 AutoDiscardState.mutable.value = AutoDiscardStatus(true, "已确认游戏发送操作 · 等待下一回合")
+            } else if (wireConfirmed || accepted) {
+                // The server has already accepted our command. A following claim or
+                // response frame belongs to the same transition and must not revoke
+                // the mode before the next synchronized decision arrives.
+                log("IGNORED_TRANSITION_UPLINK id=${command?.optString("id") ?: ""}")
+            } else if (command == null) {
+                // A claim window can produce several inputOperation/inputChiPengGang
+                // frames while the server advances the turn. With nothing pending
+                // those are ordinary game traffic; keep the live snapshot instead of
+                // stranding unattended mode until the next full authGame sync.
+                log("IGNORED_UNMATCHED_UPLINK no_pending")
+            } else {
+                // Only an unmatched frame while a command is genuinely awaiting
+                // submission is suspicious. Revoke that command, but keep the mode
+                // armed for recovery.
+                suspend("收到不匹配的游戏操作，撤销当前指令并等待重新同步")
             }
             return
         }
@@ -122,13 +153,20 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
         val key = "${result.optLong("sourceGeneration")}:${result.optString("connection")}:${result.optLong("revision")}"
         if (key == attempted || result.optLong("sourceSequence") <= 0) return
         attempted = key
+        // A brand-new decision window gets its own fresh polling budget.
+        sameTurnRetries = 0; pollWait = ""
         val action = prepareAction(result, first) ?: run {
             suspend("AI 动作与合法操作未能匹配，等待新的操作窗口")
             return
         }
+        enqueue(result, action, delayMs())
+    }
+
+    /** Queue one command; a repeat inside the polling window uses no random delay. */
+    private fun enqueue(result: JSONObject, action: JSONObject, delay: Long) {
+        pending = null
         wireConfirmed = false; submitted = false; accepted = false
         pendingAt = now()
-        val delay = delayMs()
         notBefore = pendingAt + delay
         pending = JSONObject(result.toString()).apply {
             remove("analysis"); remove("recommendations"); remove("input")
@@ -137,8 +175,51 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             put("delayMs", delay)
             put("gameTile", action.optString("tile")); put("tsumogiri", action.optBoolean("moqie"))
         }
+        // Expect the input to hit the wire at notBefore; poll one second later even if the
+        // Lua acknowledgement is lost, and refresh the deadline when it does arrive.
+        pollArmed = true; pollDueAt = notBefore + POLL_INTERVAL_MS
         log("QUEUED kind=${action.optString("kind")} delayMs=$delay id=${pending!!.optString("id")}")
         AutoDiscardState.mutable.value = AutoDiscardStatus(true, "等待 ${"%.1f".format(delay / 1000.0)} 秒后执行 · 可随时关闭")
+    }
+
+    /** Repeat the last decision with no delay once the poll finds it is still our turn. */
+    private fun pollRetry() {
+        // A command that has not reached its own delay window is still pending; never
+        // replace it. Once it was published (or confirmed) only the confirmation is
+        // missing, so a lost Lua acknowledgement must not disable the poll.
+        if (pending != null && !(submitted || wireConfirmed || accepted || now() >= notBefore)) return
+        // Always poll the freshest frame: after a reconnect an older copy would carry a
+        // stale capture generation and the game side would refuse it.
+        val state = latest
+        if (state == null || state.optString("status") != "live" || state.optBoolean("modelFallback")) {
+            pollWait("等待完整牌局同步")
+            return
+        }
+        if (!state.optBoolean("canAct") || state.optBoolean("inputPending")) {
+            stopPolling()
+            log("TURN_POLL_STOPPED not_our_turn")
+            return
+        }
+        if (sameTurnRetries >= MAX_SAME_TURN_RETRIES) {
+            stopPolling()
+            log("TURN_POLL_STOPPED retries_exhausted")
+            return
+        }
+        val first = state.optJSONArray("recommendations")?.optJSONObject(0) ?: run {
+            stopPolling(); log("TURN_POLL_STOPPED no_recommendation"); return
+        }
+        if (state.optJSONArray("legalOperations")?.length() == 0) {
+            stopPolling(); log("TURN_POLL_STOPPED no_legal_operation"); return
+        }
+        val action = prepareAction(state, first) ?: run {
+            stopPolling(); log("TURN_POLL_STOPPED action_unavailable"); return
+        }
+        sameTurnRetries++
+        pollWait = ""
+        log("TURN_POLL_RETRY attempt=$sameTurnRetries")
+        enqueue(state, action, 0L)
+        AutoDiscardState.mutable.value =
+            AutoDiscardStatus(true, "轮询确认仍是我方回合 · 立即重新出牌（第 $sameTurnRetries 次）")
     }
 
     @Synchronized fun poll(acknowledgements: String?): String? {
@@ -147,19 +228,30 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             for (index in 0 until rows.length()) {
                 val ack = rows.getJSONObject(index)
                 when (ack.optString("state")) {
-                    "external" -> { if (enabled) suspend("游戏自动操作已完成，等待下一次同步"); continue }
+                    "external" -> { stopPolling(); if (enabled) suspend("游戏自动操作已完成，等待下一次同步"); continue }
                     "continued" -> { log("ROUND_CONTINUED"); continue }
                     "resync" -> { log("RESYNC_REQUESTED"); continue }
                 }
                 if (ack.optString("state") == "manual") {
+                    stopPolling()
                     if (enabled) suspend("游戏反馈为手动操作，撤销当前指令并等待重新同步")
                     continue
                 }
                 if (ack.optString("id") != pending?.optString("id")) continue
                 when (ack.optString("state")) {
                     "waiting" -> { log("GAME_WAITING ${ack.optString("reason")}") }
-                    "submitted" -> { submitted = true; log("GAME_SUBMITTED id=${ack.optString("id")}") }
-                    "accepted" -> { accepted = true; log("SERVER_ACCEPTED id=${ack.optString("id")}") }
+                    "submitted" -> {
+                        submitted = true
+                        pollDueAt = now() + POLL_INTERVAL_MS
+                        log("GAME_SUBMITTED id=${ack.optString("id")}")
+                    }
+                    "accepted" -> {
+                        accepted = true
+                        pollDueAt = now() + POLL_INTERVAL_MS
+                        log("SERVER_ACCEPTED id=${ack.optString("id")}")
+                        AutoDiscardState.mutable.value =
+                            AutoDiscardStatus(true, "已出牌 · 1 秒后轮询确认是否仍是自己回合")
+                    }
                     else -> {
                         log("GAME_REJECTED ${ack.optString("state")} ${ack.optString("reason")}")
                         val reason = when (ack.optString("state")) {
@@ -179,11 +271,19 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                 }
             }
         }.onFailure { suspend("操作反馈格式异常，等待重新同步") }
-        if (enabled && wireConfirmed && accepted && latest?.optLong("revision") != pending?.optLong("revision")) {
+        // Once the server accepted our input and the snapshot moved on, the decision
+        // window is finished; a missing uplink frame (reconnect, capture gap) must not
+        // keep the stale command alive.
+        if (enabled && accepted && pending != null && latest?.optLong("revision") != pending?.optLong("revision")) {
             pending = null
             latest?.let(::offer)
         }
         if (pending != null && now() - pendingAt > 12_000) suspend("操作确认超时，等待游戏重新同步")
+        // One second after our input was sent, verify the turn is really over. A claim or
+        // kan window can reconnect the game and strand the decision, so a still-live
+        // "our turn" state repeats the discard immediately instead of waiting for a frame
+        // that never arrives.
+        if (enabled && pollArmed && now() >= pollDueAt) pollRetry()
         return if (enabled && !submitted && !wireConfirmed && now() >= notBefore) pending?.toString() else null
     }
 
@@ -191,6 +291,8 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
         /** Default unattended random delay window; user-adjustable 0..5000 ms, persisted by AiOverlayService. */
         const val DEFAULT_MIN_DELAY_MS = 1_000L
         const val DEFAULT_MAX_DELAY_MS = 3_000L
+        const val POLL_INTERVAL_MS = 1_000L
+        const val MAX_SAME_TURN_RETRIES = 3
 
         /** Select an exact server combination, including red fives; no fallback action. */
         fun prepareAction(result: JSONObject, first: JSONObject): JSONObject? {

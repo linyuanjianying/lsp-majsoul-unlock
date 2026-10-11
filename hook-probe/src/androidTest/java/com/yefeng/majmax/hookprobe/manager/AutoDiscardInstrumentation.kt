@@ -208,6 +208,56 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 check(gate.isEnabled() && gate.poll(null)==null)
                 gate.observe(live(2)); check(gate.poll(null)!=null)
             }
+            test("turn poll repeats the discard one second later without delay") { _, _ ->
+                var time=0L
+                val gate=AutoDiscardController({}, {time}, {1_000L})
+                gate.observe(live()); gate.toggle()
+                time=1_000; val first=JSONObject(checkNotNull(gate.poll(null)))
+                gate.observe(live()); gate.poll(ack(first.getString("id"),"submitted"))
+                check(gate.poll(ack(first.getString("id"),"accepted"))==null)
+                time=2_000; val second=JSONObject(checkNotNull(gate.poll(null)))
+                check(second.getString("id")!=first.getString("id") && second.getLong("delayMs")==0L)
+            }
+            test("turn poll stops once it is no longer our turn") { _, _ ->
+                var time=0L
+                val gate=AutoDiscardController({}, {time}, {1_000L})
+                gate.observe(live()); gate.toggle()
+                time=1_000; val first=JSONObject(checkNotNull(gate.poll(null)))
+                gate.poll(ack(first.getString("id"),"submitted")); gate.poll(ack(first.getString("id"),"accepted"))
+                gate.observe(live().put("canAct",false).put("revision",2))
+                time=2_000; check(gate.poll(null)==null)
+                gate.observe(live().put("canAct",true).put("revision",3))
+                check(gate.poll(null)==null)
+                time=3_000; check(JSONObject(checkNotNull(gate.poll(null))).getInt("revision")==3)
+            }
+            test("turn poll still retries when the acknowledgement is lost") { _, _ ->
+                var time=0L
+                val gate=AutoDiscardController({}, {time}, {0L})
+                gate.observe(live()); gate.toggle()
+                val first=JSONObject(checkNotNull(gate.poll(null)))
+                time=1_000
+                gate.observe(live().put("sourceSequence",9))
+                val second=JSONObject(checkNotNull(gate.poll(null)))
+                check(second.getString("id")!=first.getString("id") && second.getLong("delayMs")==0L)
+            }
+            test("turn poll is bounded on a stalled same-turn state") { _, _ ->
+                var time=0L
+                val gate=AutoDiscardController({}, {time}, {0L})
+                gate.observe(live()); gate.toggle()
+                var last=JSONObject(checkNotNull(gate.poll(null)))
+                var retries=0
+                for (step in 1..10) {
+                    time += 1_000
+                    gate.observe(live().put("sourceSequence", 8 + step))
+                    gate.poll(ack(last.getString("id"),"submitted"))
+                    gate.poll(ack(last.getString("id"),"accepted"))
+                    time += 1_000
+                    val next=gate.poll(null) ?: break
+                    last=JSONObject(next); retries++
+                    check(last.getLong("delayMs")==0L)
+                }
+                check(retries==3 && AutoDiscardState.mutable.value.enabled)
+            }
             test("external timeout does not disable unattended mode") { gate, _ ->
                 gate.observe(live()); gate.toggle(); gate.poll(ack("","external"))
                 check(gate.isEnabled() && gate.poll(null)==null)

@@ -115,7 +115,7 @@ local function continuation(command)
             and type(net._connectSuccess) == 'function' and t >= (A.nextResync or 0) then
         A.resyncDue = A.resyncDue or (t + math.random(2000,5000)/1000)
         if t >= A.resyncDue then
-            A.resyncDue = nil; A.nextResync = t + 30; A.resyncing = true
+            A.resyncDue = nil; A.nextResync = t + 3; A.resyncing = true
             local ok = pcall(net._connectSuccess, net)
             if not ok then A.resyncing = nil end
             ack('', ok and 'resync' or 'resync_failed')

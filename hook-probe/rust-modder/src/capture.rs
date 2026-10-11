@@ -45,7 +45,7 @@ mod android {
         if SENDER.get().is_some() {
             return;
         }
-        let (tx, rx) = mpsc::sync_channel::<Frame>(32);
+        let (tx, rx) = mpsc::sync_channel::<Frame>(128);
         if SENDER.set(Mutex::new(tx)).is_err() {
             return;
         }
