@@ -210,10 +210,25 @@ test('claim ignores unstable UI seat when tile and server operation match',funct
     end
     assert(saw)
 end)
-test('different discarded tile still cannot claim',function(s)
+test('stale UI discard tile is diagnostic only when server claim matches',function(s)
     operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
     DesktopMgr.Inst.lastqipai.ToString=function() return '4m' end
-    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='target_tile_mismatch')
+    __majmax_auto_tick(); assert(s.sent[1].type==3)
+    local saw=false
+    for _,row in ipairs(s.acks) do
+        saw=saw or (row.state=='probe' and row.reason=='claim_target_tile_ignored')
+    end
+    assert(saw)
+end)
+test('missing UI discard state is diagnostic only when server claim matches',function(s)
+    operation(s,'chi',2,'0m|4m'); UI_ChiPengHu.Inst.data.chi={'0m|4m'}
+    DesktopMgr.Inst.lastqipai=nil
+    __majmax_auto_tick(); assert(s.sent[1].type==2)
+    local saw=false
+    for _,row in ipairs(s.acks) do
+        saw=saw or (row.state=='probe' and row.reason=='claim_target_unavailable_ignored')
+    end
+    assert(saw)
 end)
 test('changed combination never substitutes red for normal five',function(s)
     operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.oplist[1].combination={'5m|5m'}
