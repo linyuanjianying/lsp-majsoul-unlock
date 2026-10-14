@@ -239,3 +239,22 @@ The 3p encoder still goes through `EncInput`/`encode_mortal_planes`, which fills
 roughly 22 of 775 channels. The model loads and returns finite logits, but from
 an almost entirely zero input, so its advice is not meaningful yet.
 
+### Sanma model files seen so far
+
+Two checkpoints of the same architecture, both verified to load
+(`775 / 256 conv / 52 blocks / 44 actions`, version 5, head `(45, 1024)`):
+
+| file | size | note |
+|---|---|---|
+| `mortal.pth` | 261 MiB | CUDA-saved, includes training state (`optimizer`, `config`, `lr`) |
+| `three.onnx` | 87.2 MiB | **not ONNX** - a PyTorch zip with internal name `mortal_3p_v4_262k_min` |
+
+Two operational consequences:
+
+* `three.onnx` starts with `PK\x03\x04`, i.e. it is a `.pth` renamed. The app
+  already handles this: `OnnxModelStore.import` sniffs the first four bytes via
+  `isZipArchive` and forces `treatAsPth`, so the extension does not matter.
+* `OnnxModelStore.MAX_BYTES` is 128 MiB. `three.onnx` (87.2 MiB) imports;
+  `mortal.pth` (261 MiB) is rejected outright with "模型文件超过 128 MiB 限制".
+  Use the smaller file, or strip the training state from the larger one.
+
