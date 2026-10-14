@@ -83,7 +83,7 @@ pub struct SeatFeat {
 
 /// Everything the encoder needs, already resolved to relative seat order
 /// (index 0 = deciding player). Built by adapters in [`crate::adapt`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EncInput {
     pub num_players: u8,
     /// Deciding player's concealed hand (raw tile ids).
