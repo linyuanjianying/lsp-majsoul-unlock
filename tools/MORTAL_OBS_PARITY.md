@@ -92,8 +92,14 @@ Derived from upstream and verified to sum to exactly 1012:
 
 `obs_shape` differs per version — `{1: 938, 2: 942, 3: 934, 4: 1012}`. The
 version is not the same as the entry convolution's `in_channels`: v3 is **934**
-and v2 is **942**, while v1 is 938. Do not infer the version from a hard-coded
-table that maps 948 / 938 / 450 — those are not libriichi's numbers.
+and v2 is **942**, while v1 is 938. An earlier revision of `mortal.rs` mapped
+`948 / 938 / 450` onto v1..v3, which matches no upstream release.
+
+3-player sanma is a **separate fork**: `Mateces/mortal-sanma` defines
+`obs_shape(5) = (780, 34)` and `ACTION_SPACE = 44`, while the widely deployed
+`libriichi3p` interface (Akagi / MahjongCopilot) uses `obs_shape = 775` with the
+same 44 actions. The crate currently uses 775, matching the shipped sanma
+ecosystem; treat 775 vs 780 as unresolved if a sanma model ever misbehaves.
 
 The `IntegerEncoder` behaves differently per version:
 
@@ -101,9 +107,28 @@ The `IntegerEncoder` behaves differently per version:
 * v2 / v3: `one_hot` (`cap + 1`), `rescale` (1), and optional RBF (`intervals - 1`).
 * v4: `one_hot` (`cap + 1`) and `rescale` (1) only — **no RBF expansion**.
 
+### Network topology notes
+
+From `mortal/model.py` (authoritative for the weight layout):
+
+* The activation is **`nn.Mish`** for v2..=v4, and `nn.ReLU` for v1. SiLU is
+  never used.
+* `pre_actv = True` for v2..=v4, so `ResBlock.res_unit` is
+  `[BN, actv, Conv, BN, actv, Conv]` and there is **no trailing activation**
+  after the residual add. v1 uses `[Conv, BN, actv, Conv, BN]` plus a trailing
+  activation.
+* `ChannelAttention` pools **both** `mean(-1)` and `amax(-1)` through the same
+  MLP and sums them before the sigmoid; using the mean alone is a bug.
+* BatchNorm `eps` is `1e-5` by default and `1e-3` for v3 and v4.
+* The trunk tail is `Conv1d(conv_channels, 32, k=3, padding=1)` →
+  activation → `Flatten` → `Linear(32*34, 1024)`.
+* The v4 head is a single `Linear(1024, 1 + ACTION_SPACE)`; the advantage mean
+  is taken over the **legal** actions only (`masked_fill(~mask, 0).sum() /
+  mask.sum()`), not over the whole action space.
+
 ## Current gap
 
-`encode_mortal_planes` in `src/mortal.rs` writes **24 of 1012** channels; the
+`encode_mortal_planes` in `src/mortal.rs` writes **23 of 1012** channels; the
 rest stay zero. It is built from `EncInput`, which cannot express most of the
 layout above — there is no representation for kawa detail, kawa/fuuro/ankan
 overviews, `tiles_seen`, `doras_owned` / `doras_unseen`, the second score plane,
@@ -113,3 +138,24 @@ The parity test reports this and stays green; set `MORTAL_OBS_PARITY_STRICT=1` t
 make it fail, and use that as the gate once the encoder is ported. Closing the
 gap requires extending `EncInput` (or feeding the encoder from the game state
 directly) — see `src/adapt.rs`.
+
+### Fixed so far
+
+* The 4P version map (`{1: 938, 2: 942, 3: 934, 4: 1012}`) — was
+  `948 / 938 / 450`.
+* The activation: `nn.Mish` for v2..=v4, `nn.ReLU` for v1 — was SiLU.
+* Pre-activation ResBlocks (`[BN, actv, Conv, BN, actv, Conv]`, no trailing
+  activation) for v2..=v4, with the BN+activation carried by the folded conv.
+* `ChannelAttention` now pools mean **and** max, matching upstream.
+* BatchNorm `eps`: 1e-3 for v3/v4, 1e-5 otherwise.
+* `encode_tile_set` advances 7 channels with real count + aka rows, instead of
+  2 invented "indicator / derived dora" planes.
+
+### Still open
+
+* The remaining ~989 channels (the encoder's `EncInput` is the blocker).
+* The v4 DQN advantage mean must be taken over **legal** actions only;
+  `rank_by_mortal_logits` currently softmaxes the legal logits directly, which
+  is not the same function.
+* Action indexing (`mortal_action_index_4p`, the aka fallback) is still
+  unverified against real play.

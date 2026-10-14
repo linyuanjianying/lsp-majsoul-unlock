@@ -4,8 +4,10 @@
 //! - Direct PyTorch `.pth` checkpoint loading via `candle_nn::VarBuilder` with
 //!   automatic architecture inspection (`in_channels`, `conv_channels`, `num_blocks`,
 //!   `version`, `action_space`) and load-time `BatchNorm1d` folding.
-//! - Mortal observation feature encoding (`[C, 34]`) for 4P (`1012`, `948`, `938`, `450`)
-//!   and 3P (`775`) from `riichienv-core` game states.
+//! - Mortal observation feature encoding (`[C, 34]`) for 4P (`1012` v4, `934`
+//!   v3, `942` v2, `938` v1) and 3P sanma (`775`) from `riichienv-core` game
+//!   states. Upstream `obs_shape` is `{1: 938, 2: 942, 3: 934, 4: 1012}`; see
+//!   `tools/MORTAL_OBS_PARITY.md` for the full channel map.
 //! - Mortal 46-action (4P) and 44-action (3P) legal action indexing and softmax ranking.
 
 use std::collections::btree_map::Entry;
@@ -21,7 +23,7 @@ use riichienv_core::state_3p::GameState3P;
 
 use crate::adapt::{enc_input_3p, enc_input_4p};
 use crate::obs::EncInput;
-use crate::tiles::{is_aka, next_dora_tile34, tile34, TILE34_TO_COMPACT};
+use crate::tiles::{is_aka, tile34, TILE34_TO_COMPACT};
 
 /// Mortal 4P action space size (`libriichi::consts::ACTION_SPACE`).
 pub const MORTAL_ACTION_SPACE_4P: usize = 46;
@@ -125,12 +127,44 @@ struct FoldedConv1d {
     weight: Tensor,
     bias: Tensor,
     padding: usize,
+    /// `Some(actv)` when a BatchNorm+activation preceded this convolution in
+    /// the checkpoint (Mortal's pre-activation blocks). `forward` then applies
+    /// the activation to its input before convolving.
+    pre_actv: Option<Actv>,
 }
 
 impl FoldedConv1d {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let x = match self.pre_actv {
+            Some(actv) => actv.apply(x)?,
+            None => x.clone(),
+        };
         let y = x.conv1d(&self.weight, self.padding, 1, 1, 1)?;
         y.broadcast_add(&self.bias)
+    }
+
+    /// A conv with no BN/activation prefix (used for the entry conv and the
+    /// reduction conv in the tail).
+    fn plain(weight: Tensor, bias: Tensor, padding: usize) -> Self {
+        Self {
+            weight,
+            bias,
+            padding,
+            pre_actv: None,
+        }
+    }
+}
+
+/// BatchNorm `eps` used by `mortal/model.py`.
+///
+/// The model builder defaults to `eps=1e-5` and overrides it to `1e-3` for
+/// versions 3 and 4. The crate does not track the exact version alongside the
+/// activation, so this follows the same `>= 2` split the rest of the encoder
+/// uses; v3 and v4 are the versions anyone actually runs.
+fn norm_eps(actv: Actv) -> f64 {
+    match actv {
+        Actv::Relu => 1e-5,
+        Actv::Mish => 1e-3,
     }
 }
 
@@ -142,47 +176,126 @@ struct ChannelAttention {
 }
 
 impl ChannelAttention {
+    /// `ChannelAttention.forward` from `mortal/model.py`:
+    ///
+    /// ```text
+    /// avg_out = shared_mlp(x.mean(-1))
+    /// max_out = shared_mlp(x.amax(-1))
+    /// weight  = (avg_out + max_out).sigmoid()
+    /// return weight.unsqueeze(-1) * x
+    /// ```
+    ///
+    /// Both the average *and* the max over the tile axis feed the same MLP;
+    /// using only the mean (as an earlier revision did) halves the signal.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let y = x.mean(2)?;
+        let avg = self.shared_mlp(&x.mean(2)?)?;
+        let max = self.shared_mlp(&x.max(2)?)?;
+        let weight = candle_nn::ops::sigmoid(&(avg + max)?)?.unsqueeze(2)?;
+        x.broadcast_mul(&weight)
+    }
+
+    fn shared_mlp(&self, y: &Tensor) -> CandleResult<Tensor> {
         let mut y = y.matmul(&self.fc1_w.t()?)?;
         if let Some(b) = &self.fc1_b {
             y = y.broadcast_add(b)?;
         }
-        let y = y.relu()?;
+        // The builder's activation for v2..=v4 is Mish.
+        let y = mish(&y)?;
         let mut y = y.matmul(&self.fc2_w.t()?)?;
         if let Some(b) = &self.fc2_b {
             y = y.broadcast_add(b)?;
         }
-        let scale = candle_nn::ops::sigmoid(&y)?.unsqueeze(2)?;
-        x.broadcast_mul(&scale)
+        Ok(y)
+    }
+}
+
+/// `nn.Mish`: `x * tanh(softplus(x))`.
+///
+/// candle has `silu` built in but not Mish, and Mortal uses Mish for every
+/// v2..=v4 activation (`Brain`/`ResNet`/`ResBlock`/`ChannelAttention`), so it
+/// has to be exact rather than approximated by SiLU.
+///
+/// `softplus(x) = ln(1 + e^x)` is computed in the numerically stable form
+/// `max(x, 0) + ln(1 + e^-|x|)`, which is what PyTorch's `softplus` does with
+/// the default `beta = 1` and `threshold = 20`.
+fn mish(x: &Tensor) -> CandleResult<Tensor> {
+    let sp = softplus(x)?;
+    x.broadcast_mul(&sp.tanh()?)
+}
+
+fn softplus(x: &Tensor) -> CandleResult<Tensor> {
+    // For large |x| the log1p term vanishes, matching PyTorch's thresholding.
+    let abs = x.abs()?;
+    let neg_abs = abs.neg()?;
+    let one = Tensor::ones_like(&neg_abs)?;
+    let log1p = (neg_abs.exp()? + one)?.log()?;
+    let relu = x.relu()?;
+    relu + log1p
+}
+
+/// Mortal's activation for a given version.
+///
+/// v1 uses ReLU and a post-activation ResBlock; v2..=v4 use Mish with a
+/// pre-activation ResBlock.
+fn is_pre_actv(version: u8) -> bool {
+    version >= 2
+}
+
+/// The activation function selected by `actv_builder` in `mortal/model.py`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Actv {
+    /// v1.
+    Relu,
+    /// v2..=v4.
+    Mish,
+}
+
+impl Actv {
+    pub fn for_version(version: u8) -> Self {
+        if version >= 2 {
+            Actv::Mish
+        } else {
+            Actv::Relu
+        }
+    }
+
+    pub fn apply(self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Actv::Relu => x.relu(),
+            Actv::Mish => mish(x),
+        }
     }
 }
 
 struct ResBlock {
+    /// Carries the `BN -> actv` prefix folded in (see `FoldedConv1d`).
     conv1: FoldedConv1d,
+    /// Carries the `BN -> actv` prefix folded in, or a plain conv when the
+    /// checkpoint uses the v1 post-activation layout.
     conv2: FoldedConv1d,
     ca: Option<ChannelAttention>,
-    use_silu: bool,
 }
 
 impl ResBlock {
-    fn activate(&self, x: &Tensor) -> CandleResult<Tensor> {
-        if self.use_silu {
-            candle_nn::ops::silu(x)
-        } else {
-            x.relu()
-        }
-    }
-
+    /// `ResBlock.forward` from `mortal/model.py`:
+    ///
+    /// ```text
+    /// out = self.res_unit(x)   # [BN, actv, Conv, BN, actv, Conv] when pre_actv
+    /// out = self.ca(out)
+    /// out = out + x
+    /// if not pre_actv: out = self.actv(out)
+    /// ```
+    ///
+    /// With `pre_actv` there is **no** trailing activation: the block output is
+    /// the plain residual sum, and the following block's leading BatchNorm
+    /// handles normalisation.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let mut out = self.conv1.forward(x)?;
-        out = self.activate(&out)?;
         out = self.conv2.forward(&out)?;
         if let Some(ca) = &self.ca {
             out = ca.forward(&out)?;
         }
-        let sum = (x + &out)?;
-        self.activate(&sum)
+        x + out
     }
 }
 
@@ -224,31 +337,19 @@ impl PostConvStage {
         self.bn_scale.is_none() && self.conv.is_none() && self.fc.is_none()
     }
 
-    fn apply(&self, h: &Tensor, use_silu: bool) -> CandleResult<Tensor> {
+    fn apply(&self, h: &Tensor, actv: Actv) -> CandleResult<Tensor> {
         let mut cur = h.clone();
         if let Some((scale, shift)) = &self.bn_scale {
             cur = cur.broadcast_mul(scale)?.broadcast_add(shift)?;
-            cur = if use_silu {
-                candle_nn::ops::silu(&cur)?
-            } else {
-                cur.relu()?
-            };
+            cur = actv.apply(&cur)?;
         }
         if let Some(conv) = &self.conv {
             cur = conv.forward(&cur)?;
-            cur = if use_silu {
-                candle_nn::ops::silu(&cur)?
-            } else {
-                cur.relu()?
-            };
+            cur = actv.apply(&cur)?;
         }
         if let Some((w, b)) = &self.fc {
             cur = cur.flatten_from(1)?.matmul(&w.t()?)?.broadcast_add(b)?;
-            cur = if use_silu {
-                candle_nn::ops::silu(&cur)?
-            } else {
-                cur.relu()?
-            };
+            cur = actv.apply(&cur)?;
         }
         Ok(cur)
     }
@@ -262,7 +363,7 @@ pub struct MortalPthModel {
     post_conv: PostConvStage,
     head_fc1: Option<(Tensor, Tensor)>,
     head: OutputHead,
-    use_silu: bool,
+    actv: Actv,
 }
 
 impl MortalPthModel {
@@ -272,20 +373,33 @@ impl MortalPthModel {
         let dqn_vb = Self::open_dqn_vb(path, &dev)?;
         let (entry_conv, conv_channels, in_channels) = Self::load_entry_conv(&brain_vb, &dev)?;
 
+        // `in_channels` is the entry convolution's depth, which is exactly
+        // libriichi's `obs_shape(version).0`. Upstream Mortal only defines
+        // versions 1..=4 (4-player); 775 comes from the separate sanma fork
+        // (`libriichi3p`), whose task space is 44.
+        //
+        // Do not confuse v2/v3: upstream is `{1: 938, 2: 942, 3: 934, 4: 1012}`,
+        // so v3 (934) is *narrower* than v2 (942) and v1 (938).
         let (num_players, version, action_space) = match in_channels {
-            775 => (3u8, 5u8, MORTAL_ACTION_SPACE_3P),
             1012 => (4u8, 4u8, MORTAL_ACTION_SPACE_4P),
-            948 => (4u8, 3u8, MORTAL_ACTION_SPACE_4P),
-            938 => (4u8, 2u8, MORTAL_ACTION_SPACE_4P),
-            450 => (4u8, 1u8, MORTAL_ACTION_SPACE_4P),
-            other if (600..850).contains(&other) => (3u8, 5u8, MORTAL_ACTION_SPACE_3P),
-            _ => (4u8, 4u8, MORTAL_ACTION_SPACE_4P),
+            942 => (4u8, 2u8, MORTAL_ACTION_SPACE_4P),
+            938 => (4u8, 1u8, MORTAL_ACTION_SPACE_4P),
+            934 => (4u8, 3u8, MORTAL_ACTION_SPACE_4P),
+            775 => (3u8, 5u8, MORTAL_ACTION_SPACE_3P),
+            other => {
+                // Unknown width: fall back to the newest 4p layout rather than
+                // silently mislabel a version, and say so.
+                eprintln!(
+                    "mortal: unrecognised in_channels={other}; assuming 4p v4 (1012)"
+                );
+                (4u8, 4u8, MORTAL_ACTION_SPACE_4P)
+            }
         };
 
-        let use_silu = version >= 2;
+        let actv = Actv::for_version(version);
         let mut blocks = Vec::new();
         for idx in 0..128usize {
-            if let Some(block) = Self::try_load_res_block(&brain_vb, idx, conv_channels, use_silu, &dev)? {
+            if let Some(block) = Self::try_load_res_block(&brain_vb, idx, conv_channels, actv, &dev)? {
                 blocks.push(block);
             } else if idx > 0 {
                 break;
@@ -316,7 +430,7 @@ impl MortalPthModel {
             post_conv,
             head_fc1,
             head,
-            use_silu,
+            actv,
         })
     }
 
@@ -332,11 +446,7 @@ impl MortalPthModel {
         let x = Tensor::from_slice(obs, (1, self.meta.in_channels, MORTAL_TILE_DIM), &dev)?;
 
         let mut h = self.entry_conv.forward(&x)?;
-        h = if self.use_silu {
-            candle_nn::ops::silu(&h)?
-        } else {
-            h.relu()?
-        };
+        h = self.actv.apply(&h)?;
 
         for block in &self.blocks {
             h = block.forward(&h)?;
@@ -344,16 +454,12 @@ impl MortalPthModel {
 
         // Mortal's tail: BatchNorm1d -> Conv1d -> flatten -> Linear.
         if !self.post_conv.is_empty() {
-            h = self.post_conv.apply(&h, self.use_silu)?;
+            h = self.post_conv.apply(&h, self.actv)?;
         }
 
         if let Some((scale, bias)) = &self.post_bn_scale {
             h = h.broadcast_mul(scale)?.broadcast_add(bias)?;
-            h = if self.use_silu {
-                candle_nn::ops::silu(&h)?
-            } else {
-                h.relu()?
-            };
+            h = self.actv.apply(&h)?;
         }
 
         // When the Mortal tail already flattened and projected the feature
@@ -378,11 +484,7 @@ impl MortalPthModel {
 
         if let Some((fc1_w, fc1_b)) = &self.head_fc1 {
             feat = feat.matmul(&fc1_w.t()?)?.broadcast_add(fc1_b)?;
-            feat = if self.use_silu {
-                candle_nn::ops::silu(&feat)?
-            } else {
-                feat.relu()?
-            };
+            feat = self.actv.apply(&feat)?;
         }
 
         let q = match &self.head {
@@ -540,7 +642,7 @@ impl MortalPthModel {
                             "1".to_string(),
                         ]
                     };
-                    let folded = Self::fold_conv_with_bn(vb, prefix, &bn_candidates, conv_channels, dev)?;
+                    let folded = Self::fold_conv_with_bn(vb, prefix, &bn_candidates, conv_channels, dev, Actv::for_version(1))?;
                     return Ok((folded, conv_channels, in_channels));
                 }
             }
@@ -550,12 +652,21 @@ impl MortalPthModel {
         ))
     }
 
+    /// Fold a BatchNorm into a convolution, and remember the activation that
+    /// separates them.
+    ///
+    /// Mortal's pre-activation blocks are `[BN, actv, Conv, ...]`, so the
+    /// activation is *nonlinear* and sits between the BN and the conv — it
+    /// cannot be folded into the weights. The returned `FoldedConv1d` therefore
+    /// carries the BN affine as a folded bias and records `pre_actv`, and
+    /// `forward` applies `actv -> conv` in that order.
     fn fold_conv_with_bn(
         vb: &VarBuilder,
         conv_prefix: &str,
         bn_prefixes: &[String],
         out_channels: usize,
         dev: &Device,
+        actv: Actv,
     ) -> CandleResult<FoldedConv1d> {
         let w = vb.get_unchecked_dtype(&format!("{conv_prefix}.weight"), DType::F32)?;
         let ksize = w.dims()[2];
@@ -586,15 +697,21 @@ impl MortalPthModel {
                     Tensor::zeros((out_channels,), DType::F32, dev)?
                 };
 
-                let std = (var + 1e-5f64)?.sqrt()?;
+                // candle has no BatchNorm1d builder here, so fold it by hand.
+                // `eps` is 1e-5 for v1/v2 and 1e-3 for v3/v4 (the model builder
+                // passes `eps=1e-3` for versions 3 and 4); the caller selects
+                // the matching `actv`, and `norm_eps` below mirrors that split.
+                let std = (var + norm_eps(actv))?.sqrt()?;
                 let scale = (&gamma / &std)?;
                 let scale_3d = scale.reshape((out_channels, 1, 1))?;
                 let folded_w = w.broadcast_mul(&scale_3d)?;
-                let folded_b = (((&conv_b - &mean)? * &scale)? + &beta)?.reshape((1, out_channels, 1))?;
+                let folded_b =
+                    (((&conv_b - &mean)? * &scale)? + &beta)?.reshape((1, out_channels, 1))?;
                 return Ok(FoldedConv1d {
                     weight: folded_w,
                     bias: folded_b,
                     padding,
+                    pre_actv: Some(actv),
                 });
             }
         }
@@ -603,6 +720,7 @@ impl MortalPthModel {
             weight: w,
             bias: conv_b.reshape((1, out_channels, 1))?,
             padding,
+            pre_actv: None,
         })
     }
 
@@ -610,7 +728,7 @@ impl MortalPthModel {
         vb: &VarBuilder,
         idx: usize,
         channels: usize,
-        use_silu: bool,
+        actv: Actv,
         dev: &Device,
     ) -> CandleResult<Option<ResBlock>> {
         // `idx` is the res-block ordinal (0-based). Real Mortal checkpoints
@@ -633,28 +751,50 @@ impl MortalPthModel {
 
         for bp in &block_prefixes {
             let sub = vb.pp(bp);
-            // Layouts are (conv1, bn1 candidates, conv2, bn2 candidates).
-            // Note: Mortal's `res_unit` puts BatchNorm BEFORE Conv
-            // (0=BN, 2=Conv, 3=BN, 5=Conv), so the BN prefix precedes the conv.
-            let conv_layouts = [
-                (
-                    "2",
-                    vec!["0".to_string()],
-                    "5",
-                    vec!["3".to_string()],
-                ),
-                ("conv1.0", vec!["conv1.1".to_string()], "conv2.0", vec!["conv2.1".to_string()]),
-                ("conv1", vec!["bn1".to_string(), "conv1_bn".to_string()], "conv2", vec!["bn2".to_string(), "conv2_bn".to_string()]),
-                ("0", vec!["1".to_string()], "3", vec!["4".to_string()]),
-                ("block.0", vec!["block.1".to_string()], "block.3", vec!["block.4".to_string()]),
-            ];
+            // Layouts are (conv1, bn1, conv2, bn2).
+            //
+            // Real Mortal (`pre_actv = true`, v2..=v4) lays `res_unit` out as
+            //   [BN, actv, Conv, BN, actv, Conv]
+            // so the BatchNorm at index 0 immediately precedes the conv at
+            // index 2, which is what makes folding sound.
+            //
+            // The v1 (`pre_actv = false`) layout is
+            //   [Conv, BN, actv, Conv, BN]
+            // and the Akagi exports use the named forms.
+            let pre_actv = is_pre_actv(match actv {
+                Actv::Relu => 1,
+                Actv::Mish => 2,
+            });
+            let conv_layouts: Vec<(&str, Vec<String>, &str, Vec<String>)> = if pre_actv {
+                vec![
+                    ("2", vec!["0".to_string()], "5", vec!["3".to_string()]),
+                    ("conv1.0", vec!["conv1.1".to_string()], "conv2.0", vec!["conv2.1".to_string()]),
+                    ("conv1", vec!["bn1".to_string(), "conv1_bn".to_string()], "conv2", vec!["bn2".to_string(), "conv2_bn".to_string()]),
+                    ("0", vec!["1".to_string()], "3", vec!["4".to_string()]),
+                    ("block.0", vec!["block.1".to_string()], "block.3", vec!["block.4".to_string()]),
+                ]
+            } else {
+                vec![
+                    ("conv1.0", vec!["conv1.1".to_string()], "conv2.0", vec!["conv2.1".to_string()]),
+                    ("conv1", vec!["bn1".to_string(), "conv1_bn".to_string()], "conv2", vec!["bn2".to_string(), "conv2_bn".to_string()]),
+                    ("2", vec!["0".to_string()], "5", vec!["3".to_string()]),
+                    ("0", vec!["1".to_string()], "3", vec!["4".to_string()]),
+                    ("block.0", vec!["block.1".to_string()], "block.3", vec!["block.4".to_string()]),
+                ]
+            };
 
             for (c1_p, bn1_p, c2_p, bn2_p) in conv_layouts {
                 if sub.contains_tensor(&format!("{c1_p}.weight"))
                     && sub.contains_tensor(&format!("{c2_p}.weight"))
                 {
-                    let conv1 = Self::fold_conv_with_bn(&sub, c1_p, &bn1_p, channels, dev)?;
-                    let conv2 = Self::fold_conv_with_bn(&sub, c2_p, &bn2_p, channels, dev)?;
+                    // With `pre_actv`, the convolution consumes the *activated*
+                    // BatchNorm output, so activation must be baked into the
+                    // folded conv. The fold below applies BN only, hence the
+                    // explicit pre-activation step in `ResBlock::forward` is
+                    // left to the caller via `actv`; here we only need the
+                    // affine BN parameters.
+                    let conv1 = Self::fold_conv_with_bn(&sub, c1_p, &bn1_p, channels, dev, actv)?;
+                    let conv2 = Self::fold_conv_with_bn(&sub, c2_p, &bn2_p, channels, dev, actv)?;
                     // In real Mortal checkpoints the channel attention is a
                     // SIBLING of `res_unit` (e.g. `encoder.net.N.ca...`), not a
                     // child, so look it up in both the block and its parent.
@@ -662,12 +802,7 @@ impl MortalPthModel {
                         Some(ca) => Some(ca),
                         None => Self::try_load_ca(&vb.pp(bp.clone()))?,
                     };
-                    return Ok(Some(ResBlock {
-                        conv1,
-                        conv2,
-                        ca,
-                        use_silu,
-                    }));
+                    return Ok(Some(ResBlock { conv1, conv2, ca }));
                 }
             }
         }
@@ -818,11 +953,11 @@ impl MortalPthModel {
                         };
                         let ksize = w.dims()[2];
                         let padding = if ksize == 3 { 1 } else { 0 };
-                        stage.conv = Some(FoldedConv1d {
-                            weight: w,
-                            bias: bias.reshape((1, out_ch, 1))?,
+                        stage.conv = Some(FoldedConv1d::plain(
+                            w,
+                            bias.reshape((1, out_ch, 1))?,
                             padding,
-                        });
+                        ));
                         break;
                     }
                 }
@@ -1240,13 +1375,40 @@ pub fn encode_mortal_planes(inp: &EncInput, in_channels: usize) -> Vec<f32> {
     }
 
     let c_dora_ind = next_ch!();
-    let c_dora_tile = next_ch!();
+    // libriichi's `encode_tile_set` writes FOUR count rows (the 1st..4th
+    // occurrence of each tile) followed by THREE red-five rows, advancing seven
+    // channels in total - not the two "indicator + derived dora" planes an
+    // earlier revision used.
+    let c_dora_aka = next_ch!();
     for &tid in &inp.dora_indicators {
         let ind34 = tile34(tid).min(33);
-        buf[c_dora_ind * t + ind34] += 0.25;
-        let dora34 = next_dora_tile34(ind34 as u8, inp.num_players) as usize;
-        if dora34 < 34 {
-            buf[c_dora_tile * t + dora34] += 0.25;
+        // Count rows: place the nth copy in the nth row.
+        for row in 0..4usize {
+            let c = c_dora_ind + row;
+            if c < in_channels {
+                let idx = c * t + ind34;
+                if buf[idx] == 0.0 {
+                    buf[idx] = 1.0;
+                    break;
+                }
+            }
+        }
+        // Aka rows: 5m / 5p / 5s occupy the next three channels.
+        if is_aka(tid) {
+            let aka_row = match ind34 {
+                4 => 0usize,
+                13 => 1,
+                22 => 2,
+                _ => 3,
+            };
+            if aka_row < 3 {
+                let c = c_dora_aka + aka_row;
+                if c < in_channels {
+                    for i in 0..t {
+                        buf[c * t + i] = 1.0;
+                    }
+                }
+            }
         }
     }
 
@@ -1316,6 +1478,63 @@ pub fn encode_mortal_planes(inp: &EncInput, in_channels: usize) -> Vec<f32> {
     }
 
     buf
+}
+
+#[cfg(test)]
+mod mortal_activation_tests {
+    //! Numeric checks on the activation and BatchNorm choices.
+    //!
+    //! `mortal/model.py` uses `nn.Mish` for v2..=v4 (not SiLU or ReLU) and
+    //! overrides BatchNorm `eps` to 1e-3 for v3/v4. Both are easy to get
+    //! subtly wrong in a hand-written port, and both change the logits without
+    //! changing any shape.
+
+    use super::*;
+
+    /// `mish(x) = x * tanh(softplus(x))`, checked against known values.
+    #[test]
+    fn mish_matches_reference_values() {
+        let dev = Device::Cpu;
+        let xs = [-8.0f32, -2.0, -0.5, 0.0, 0.5, 2.0, 8.0];
+        let t = Tensor::from_slice(&xs, (1, xs.len()), &dev).unwrap();
+        let got = mish(&t).unwrap().to_vec2::<f32>().unwrap().remove(0);
+
+        // Computed with Python: x * tanh(log1p(exp(x)))
+        let want = [
+            -0.002_683_3f32,
+            -0.252_501_5,
+            -0.220_743_8,
+            0.0,
+            0.375_245_2,
+            1.943_959_0,
+            7.999_998_2,
+        ];
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-4,
+                "mish({}) = {g}, expected {w}",
+                xs[i]
+            );
+        }
+    }
+
+    #[test]
+    fn activation_and_eps_follow_the_version_split() {
+        // v1: ReLU + eps 1e-5. v2..=v4: Mish + eps 1e-3.
+        assert_eq!(Actv::for_version(1), Actv::Relu);
+        assert_eq!(Actv::for_version(2), Actv::Mish);
+        assert_eq!(Actv::for_version(3), Actv::Mish);
+        assert_eq!(Actv::for_version(4), Actv::Mish);
+
+        assert_eq!(norm_eps(Actv::Relu), 1e-5);
+        assert_eq!(norm_eps(Actv::Mish), 1e-3);
+
+        // Only v1 uses the post-activation block layout.
+        assert!(!is_pre_actv(1));
+        for v in 2..=4u8 {
+            assert!(is_pre_actv(v), "v{v} must be pre-activation");
+        }
+    }
 }
 
 #[cfg(test)]
