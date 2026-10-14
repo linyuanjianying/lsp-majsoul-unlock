@@ -21,10 +21,76 @@ use crate::state_features::MortalSeatView;
 
 /// Mortal's tile axis width.
 pub const TILES: usize = 34;
-/// `obs_shape(4).0`.
+/// `obs_shape(4).0` for the 4-player build.
 pub const CHANNELS_V4: usize = 1012;
+/// `obs_shape(4).0` for the 3-player build (`libriichi3p`'s own version 4).
+pub const CHANNELS_SANMA: usize = 775;
 /// `MAX_NUM_TURNS` in libriichi, used for the SP-table planes.
 pub const MAX_NUM_TURNS: usize = 17;
+
+/// Feature-geometry differences between the 4-player build and `libriichi3p`.
+///
+/// Everything else about the two layouts is identical, so the encoder body is
+/// shared and these are the only knobs. The 3-player values were read off
+/// ground-truth buffers produced by the real `libriichi3p` binary - see
+/// `tools/sanma/README.md`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layout {
+    pub channels: usize,
+    pub num_players: usize,
+    /// `rank` one-hot width. 4p: 4. 3p: 3.
+    pub rank_channels: usize,
+    /// `kyoku` one-hot width. 4p: 4. 3p: 3.
+    pub kyoku_channels: usize,
+    /// Score-plane divisors, applied in order.
+    pub score_div: [f32; 2],
+    /// `doras_owned` planes. Both builds emit 4, even in 3p.
+    pub doras_owned_channels: usize,
+    /// `riichi_declared[1..]` width. 4p: 3. 3p: 2 (one per other seat).
+    pub riichi_declared_channels: usize,
+    /// `riichi_accepted[1..]` width. 4p: 3. 3p: 2.
+    pub riichi_accepted_channels: usize,
+    /// Chi (4p) or nukidora (3p) block width. 4p: 3. 3p: 1.
+    pub call_block_channels: usize,
+    /// `tiles_left` divisor; both builds use 69.
+    pub tiles_left_div: f32,
+    /// Divisor for `doras_unseen`; both use 23.
+    pub doras_unseen_div: f32,
+}
+
+impl Layout {
+    /// The 4-player layout, verified bit-exact against Equim-chan/Mortal.
+    pub const V4: Layout = Layout {
+        channels: CHANNELS_V4,
+        num_players: 4,
+        rank_channels: 4,
+        kyoku_channels: 4,
+        score_div: [100_000.0, 30_000.0],
+        doras_owned_channels: 4,
+        riichi_declared_channels: 3,
+        riichi_accepted_channels: 3,
+        call_block_channels: 3,
+        tiles_left_div: 69.0,
+        doras_unseen_div: 23.0,
+    };
+
+    /// The 3-player layout as emitted by `libriichi3p` (`obs_shape(4) = 775`).
+    pub const SANMA: Layout = Layout {
+        channels: CHANNELS_SANMA,
+        num_players: 3,
+        rank_channels: 3,
+        kyoku_channels: 3,
+        // Measured: a 25000 score plane reads 0.2381 and 0.625, i.e.
+        // 25000/105000 and 25000/40000.
+        score_div: [105_000.0, 40_000.0],
+        doras_owned_channels: 4,
+        riichi_declared_channels: 2,
+        riichi_accepted_channels: 2,
+        call_block_channels: 1,
+        tiles_left_div: 69.0,
+        doras_unseen_div: 23.0,
+    };
+}
 
 const SELF_KAWA_ITEM_CHANNELS: usize = 4;
 const KAWA_ITEM_CHANNELS: usize = 8;
@@ -43,16 +109,23 @@ struct Plane {
 }
 
 impl Plane {
-    fn new() -> Self {
+    /// Number of channels this plane holds.
+    fn channels(&self) -> usize {
+        self.buf.len() / TILES
+    }
+}
+
+impl Plane {
+    fn new(channels: usize) -> Self {
         Self {
-            buf: vec![0.0; CHANNELS_V4 * TILES],
+            buf: vec![0.0; channels * TILES],
             idx: 0,
         }
     }
 
     #[inline]
     fn assign(&mut self, ch: usize, tile: usize, v: f32) {
-        if ch < CHANNELS_V4 && tile < TILES {
+        if ch < self.channels() && tile < TILES {
             self.buf[ch * TILES + tile] = v;
         }
     }
@@ -60,7 +133,7 @@ impl Plane {
     /// `fill(row, v)`: set every tile column in one channel.
     #[inline]
     fn fill(&mut self, ch: usize, v: f32) {
-        if ch < CHANNELS_V4 {
+        if ch < self.channels() {
             let base = ch * TILES;
             for i in 0..TILES {
                 self.buf[base + i] = v;
@@ -71,7 +144,7 @@ impl Plane {
     /// `assign_rows(idx, tile, n, v)`: column `tile` across n consecutive rows.
     #[inline]
     fn assign_rows(&mut self, base: usize, tile: usize, n: usize, v: f32) {
-        for ch in base..(base + n).min(CHANNELS_V4) {
+        for ch in base..(base + n).min(self.channels()) {
             self.assign(ch, tile, v);
         }
     }
@@ -116,28 +189,44 @@ fn encode_self_kawa(p: &mut Plane, item: Option<&KawaItem>) {
     p.advance(SELF_KAWA_ITEM_CHANNELS);
 }
 
-/// `encode_kawa`: 8 channels for the other seats.
+/// `encode_kawa`: 8 channels for the other seats' discards.
+///
+/// Layout taken verbatim from `libriichi`'s `encode_kawa` (identical in the
+/// 4-player and sanma sources):
+///
+/// ```text
+///   +0  chi/pon consumed tile, lower
+///   +1  chi/pon consumed tile, higher
+///   +2  kan tiles
+///   +3  the discarded tile
+///   +4  aka (broadcast)
+///   +5  is_dora (broadcast)
+///   +6  is_tedashi (broadcast)
+///   +7  is_riichi (broadcast)
+/// ```
+///
+/// Note there is no tsumogiri channel: `is_tedashi` carries that information,
+/// and the last channel is riichi.
 fn encode_kawa(p: &mut Plane, item: Option<&KawaItem>) {
     if let Some(k) = item {
         if let Some((a, b)) = k.chi_pon {
-            // One-hot, highest consumed tile then lowest.
-            p.assign(p.idx, a.max(b), 1.0);
-            p.assign(p.idx + 1, a.min(b), 1.0);
+            p.assign(p.idx, a.min(b), 1.0);
+            p.assign(p.idx + 1, a.max(b), 1.0);
         }
-        p.assign(p.idx + 2, k.tile, 1.0);
+        for kan in k.kan.iter().flatten() {
+            p.assign(p.idx + 2, deaka(*kan), 1.0);
+        }
+        p.assign(p.idx + 3, k.tile, 1.0);
         if k.is_aka {
-            p.fill(p.idx + 3, 1.0);
-        }
-        if k.is_dora {
             p.fill(p.idx + 4, 1.0);
         }
-        if k.is_riichi {
+        if k.is_dora {
             p.fill(p.idx + 5, 1.0);
         }
         if k.is_tedashi {
             p.fill(p.idx + 6, 1.0);
         }
-        if k.is_tsumogiri {
+        if k.is_riichi {
             p.fill(p.idx + 7, 1.0);
         }
     }
@@ -192,7 +281,13 @@ fn aka_slot(tile: u8) -> usize {
 /// Built from a [`GameState`] by [`MortalSeatView::from_state`], which keeps
 /// the rotation logic in one place and testable.
 pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
-    let mut p = Plane::new();
+    encode_mortal_obs_with(view, Layout::V4)
+}
+
+/// Encode using an explicit [`Layout`].
+pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32> {
+    let np = layout.num_players;
+    let mut p = Plane::new(layout.channels);
 
     let tehai = &view.tehai;
 
@@ -213,18 +308,18 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     p.advance(3);
 
     // -- score, two planes per player -----------------------------------
-    for &score in view.scores.iter() {
-        p.fill(p.idx, (score.clamp(0, 100_000) as f32) / 100_000.0);
+    for &score in view.scores.iter().take(np) {
+        p.fill(p.idx, (score.clamp(0, 100_000) as f32) / layout.score_div[0]);
         p.advance(1);
-        p.fill(p.idx, (score.clamp(0, 30_000) as f32) / 30_000.0);
+        p.fill(p.idx, (score.clamp(0, 30_000) as f32) / layout.score_div[1]);
         p.advance(1);
     }
 
     // -- rank / kyoku one-hot --------------------------------------------
-    p.fill(p.idx + view.rank.min(3), 1.0);
-    p.advance(4);
-    p.fill(p.idx + (view.kyoku as usize).min(3), 1.0);
-    p.advance(4);
+    p.fill(p.idx + view.rank.min(layout.rank_channels - 1), 1.0);
+    p.advance(layout.rank_channels);
+    p.fill(p.idx + (view.kyoku as usize).min(layout.kyoku_channels - 1), 1.0);
+    p.advance(layout.kyoku_channels);
 
     // -- honba / kyotaku (v4: rescale only) -------------------------------
     p.fill(p.idx, view.honba.min(HONBA_CAP as u8) as f32 / HONBA_CAP as f32);
@@ -269,7 +364,7 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     p.advance(1);
 
     // -- other seats' kawa -------------------------------------------------
-    for seat_kawa in view.kawa.iter().skip(1) {
+    for seat_kawa in view.kawa.iter().skip(1).take(np - 1) {
         for item in seat_kawa.iter().take(6) {
             encode_kawa(&mut p, item.as_ref());
         }
@@ -296,11 +391,11 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     }
 
     // -- tiles left ---------------------------------------------------------
-    p.fill(p.idx, view.tiles_left as f32 / 69.0);
+    p.fill(p.idx, view.tiles_left as f32 / layout.tiles_left_div);
     p.advance(1);
 
     // -- doras owned (v4: rescale /12) --------------------------------------
-    for &count in view.doras_owned.iter() {
+    for &count in view.doras_owned.iter().take(layout.doras_owned_channels) {
         p.fill(p.idx, count.min(12) as f32 / 12.0);
         p.advance(1);
     }
@@ -308,16 +403,16 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     // -- doras unseen (v4: rescale /23) -------------------------------------
     let unseen = view.dora_indicators.len().saturating_mul(4) + 3;
     let unseen = unseen.saturating_sub(view.doras_seen as usize);
-    p.fill(p.idx, unseen.min(23) as f32 / 23.0);
+    p.fill(p.idx, unseen.min(23) as f32 / layout.doras_unseen_div);
     p.advance(1);
 
     // -- kawa overview -------------------------------------------------------
-    for overview in view.kawa_overview.iter() {
+    for overview in view.kawa_overview.iter().take(np) {
         encode_tile_set(&mut p, overview);
     }
 
     // -- fuuro overview: 4 sets x 5 channels per player ----------------------
-    for fuuro in view.fuuro_overview.iter() {
+    for fuuro in view.fuuro_overview.iter().take(np) {
         for meld in fuuro.iter().take(4) {
             for &raw in &meld.tiles {
                 let tid = deaka(raw);
@@ -335,7 +430,7 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     }
 
     // -- ankan overview -------------------------------------------------------
-    for kan in view.ankan_overview.iter() {
+    for kan in view.ankan_overview.iter().take(np) {
         for &raw in kan {
             p.assign(p.idx, deaka(raw), 1.0);
         }
@@ -349,7 +444,7 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     p.advance(1);
 
     // -- other seats' last tedashi (tile / aka / dora) --------------------------
-    for item in view.last_tedashis.iter().skip(1) {
+    for item in view.last_tedashis.iter().skip(1).take(np - 1) {
         if let Some(k) = item {
             p.assign(p.idx, k.tile, 1.0);
             if k.is_aka {
@@ -363,7 +458,7 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     }
 
     // -- other seats' riichi sutehai --------------------------------------------
-    for item in view.riichi_sutehais.iter().skip(1) {
+    for item in view.riichi_sutehais.iter().skip(1).take(np - 1) {
         if let Some(k) = item {
             p.assign(p.idx, k.tile, 1.0);
             if k.is_aka {
@@ -382,13 +477,13 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
             p.fill(p.idx + i, 1.0);
         }
     }
-    p.advance(3);
+    p.advance(layout.riichi_declared_channels);
     for (i, &b) in view.riichi_accepted.iter().skip(1).enumerate() {
         if b {
             p.fill(p.idx + i, 1.0);
         }
     }
-    p.advance(3);
+    p.advance(layout.riichi_accepted_channels);
 
     // -- self waits ---------------------------------------------------------------
     for (tile, &w) in view.waits.iter().enumerate() {
@@ -462,16 +557,23 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
         p.fill(p.idx, 1.0);
     }
     p.advance(1);
-    if view.can_chi_low {
+    // 4-player: chi low / mid / high. 3-player: a single nukidora channel.
+    // libriichi3p does not keep the two chi slots as padding, which is one of
+    // the differences that makes its width 775 rather than 780.
+    if layout.call_block_channels == 3 {
+        if view.can_chi_low {
+            p.fill(p.idx, 1.0);
+        }
+        if view.can_chi_mid {
+            p.fill(p.idx + 1, 1.0);
+        }
+        if view.can_chi_high {
+            p.fill(p.idx + 2, 1.0);
+        }
+    } else if view.can_nukidora {
         p.fill(p.idx, 1.0);
     }
-    if view.can_chi_mid {
-        p.fill(p.idx + 1, 1.0);
-    }
-    if view.can_chi_high {
-        p.fill(p.idx + 2, 1.0);
-    }
-    p.advance(3);
+    p.advance(layout.call_block_channels);
     if view.can_pon {
         p.fill(p.idx, 1.0);
     }
@@ -502,8 +604,8 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
     p.advance(1);
 
     // -- v4 single-player-table tail -------------------------------------------------------
-    p.fill(p.idx, (view.max_ev.clamp(0.0, 100_000.0)) / 100_000.0);
-    p.fill(p.idx + 1, (view.max_ev.clamp(0.0, 30_000.0)) / 30_000.0);
+    p.fill(p.idx, (view.max_ev.clamp(0.0, 100_000.0)) / layout.score_div[0]);
+    p.fill(p.idx + 1, (view.max_ev.clamp(0.0, 30_000.0)) / layout.score_div[1]);
     p.advance(2);
 
     if view.can_discard {
@@ -540,7 +642,7 @@ pub fn encode_mortal_obs(view: &MortalSeatView) -> Vec<f32> {
         encode_sp_table(&mut p, view, false);
     }
 
-    debug_assert_eq!(p.idx, CHANNELS_V4, "mortal obs channel cursor drift");
+    debug_assert_eq!(p.idx, layout.channels, "mortal obs channel cursor drift");
     p.buf
 }
 
@@ -627,7 +729,9 @@ pub fn build_kawa_with_dora(
         .iter()
         .enumerate()
         .map(|(i, &raw)| {
-            let tedashi = from_hand.get(i).copied().unwrap_or(true);
+            // Default to "not tedashi" when the caller has no per-discard
+            // information: riichienv's 3-player state never records it.
+            let tedashi = from_hand.get(i).copied().unwrap_or(false);
             Some(KawaItem {
                 tile: deaka(raw),
                 is_aka: is_aka_id(raw),
@@ -708,11 +812,111 @@ mod budget_tests {
         );
     }
 
+    /// The 3-player budget, with the section boundaries that were measured
+    /// directly off ground-truth `libriichi3p` buffers (`tools/sanma/README.md`).
+    ///
+    /// Two independent checks: the total must be `obs_shape(4) = 775` for that
+    /// build, and the anchors observed in the real data must land where the
+    /// encoder puts them.
+    #[test]
+    fn sanma_budget_and_anchors_match_libriichi3p() {
+        let l = Layout::SANMA;
+        let np = l.num_players;
+
+        let mut n = 0usize;
+        macro_rules! anchor {
+            ($name:expr, $want:expr) => {
+                assert_eq!(
+                    n, $want,
+                    "sanma anchor `{}` expected at {}, got {}",
+                    $name, $want, n
+                )
+            };
+        }
+
+        n += 4 + 3 + np * 2; // tehai, akas, scores
+        anchor!("rank", 13);
+        n += l.rank_channels;
+        anchor!("kyoku", 16);
+        n += l.kyoku_channels;
+        n += 1 + 1 + 2 + 1; // honba, kyotaku, winds, round progress
+        n += TILE_SET_CHANNELS;
+        anchor!("self kawa", 31);
+        n += 6 * SELF_KAWA_ITEM_CHANNELS + 18 * SELF_KAWA_ITEM_CHANNELS + 1;
+        anchor!("other kawas", 128);
+        n += (np - 1) * (6 * KAWA_ITEM_CHANNELS + 18 * KAWA_ITEM_CHANNELS + 3);
+        anchor!("tiles_left", 518);
+        n += 1;
+        anchor!("doras_owned", 519);
+        n += l.doras_owned_channels;
+        anchor!("doras_unseen", 523);
+        n += 1;
+        anchor!("kawa overview", 524);
+        n += np * TILE_SET_CHANNELS;
+        anchor!("fuuro overview", 545);
+        n += np * 4 * 5;
+        anchor!("ankan overview", 605);
+        n += np;
+        anchor!("tiles_seen", 608);
+        n += 1;
+        anchor!("last tedashis", 609);
+        n += (np - 1) * 3;
+        anchor!("riichi sutehais", 615);
+        n += (np - 1) * 3;
+        anchor!("riichi declared", 621);
+        n += l.riichi_declared_channels;
+        anchor!("riichi accepted", 623);
+        n += l.riichi_accepted_channels;
+        anchor!("waits", 625);
+        n += 1;
+        anchor!("furiten", 626);
+        n += 1;
+        anchor!("shanten", 627);
+        n += SHANTEN_CAP + 1;
+        anchor!("self riichi accepted", 634);
+        n += 1;
+        anchor!("at_kan_select", 635);
+        n += 1;
+        anchor!("call context", 636);
+        n += 3;
+        // can_discard(5) + can_riichi(1) + nukidora(1) + pon/daiminkan/
+        // ankan/kakan/agari/ryukyoku(6) = 13. The 4p layout spends 3 on chi
+        // instead of 1 on nukidora, and that 2-channel difference plus the
+        // rank/kyoku/riichi widths is what makes this 775 rather than 780.
+        anchor!("decision flags", 639);
+        n += 5 + 1 + l.call_block_channels + 6;
+        anchor!("encode_ev", 652);
+        n += 2;
+        anchor!("required tiles", 654);
+        n += 2 * TILES + 2;
+        anchor!("single-player table", 724);
+        n += 3 * MAX_NUM_TURNS;
+
+        assert_eq!(
+            n, l.channels,
+            "sanma budget is {n}, libriichi3p reports obs_shape(4).0 = {}",
+            l.channels
+        );
+    }
+
     /// The encoder must actually consume the budget, not just almost all of it.
     #[test]
     fn encoder_cursor_lands_on_the_budget() {
         let view = crate::state_features::MortalSeatView::default();
         let obs = encode_mortal_obs(&view);
         assert_eq!(obs.len(), expected_budget() * TILES);
+    }
+
+    /// The 3-player encoder must emit exactly 775 x 34 and stay in [0, 1].
+    #[test]
+    fn sanma_encoder_emits_the_full_buffer() {
+        let mut view = crate::state_features::MortalSeatView::default();
+        view.n_players = 3;
+        let obs = encode_mortal_obs_with(&view, Layout::SANMA);
+        assert_eq!(obs.len(), CHANNELS_SANMA * TILES);
+        assert!(
+            obs.iter().all(|v| (0.0..=1.0).contains(v)),
+            "sanma encoder produced values outside [0, 1]"
+        );
     }
 }

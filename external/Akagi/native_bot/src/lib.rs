@@ -37,6 +37,9 @@ pub mod mortal_obs;
 /// Self-relative seat features derived from a live game state.
 #[cfg(feature = "infer")]
 pub mod state_features;
+/// 3-player variants of the seat view.
+#[cfg(feature = "infer")]
+pub mod state_features_3p;
 
 /// Feature-plane and action-space geometry for a given player count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

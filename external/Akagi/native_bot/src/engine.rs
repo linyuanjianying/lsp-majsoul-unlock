@@ -136,7 +136,9 @@ impl Engine {
     fn with_model(model: Model, num_players: u8, seat: u8, rule: GameRule) -> Result<Self> {
         let backend = if num_players == 3 {
             Backend::Three {
-                state: Box::new(GameState3P::new(0, true, None, 0, rule)),
+                // Keep mjai logging on: it is the only place riichienv records the
+                // per-discard tsumogiri bit, which the observation encoder needs.
+                state: Box::new(GameState3P::new(0, false, None, 0, rule)),
                 model,
             }
         } else {
@@ -160,7 +162,7 @@ impl Engine {
                 *state = Box::new(GameState::new(0, true, None, 0, rule))
             }
             Backend::Three { state, .. } => {
-                *state = Box::new(GameState3P::new(0, true, None, 0, rule))
+                *state = Box::new(GameState3P::new(0, false, None, 0, rule))
             }
         }
     }

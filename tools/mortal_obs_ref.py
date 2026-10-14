@@ -273,23 +273,32 @@ def _encode_self_kawa(p: Plane, item: KawaItem | None) -> None:
 
 
 def _encode_kawa(p: Plane, item: KawaItem | None) -> None:
-    """`encode_kawa`: 8 channels for the other players' discards."""
+    """`encode_kawa`: 8 channels for the other players' discards.
+
+    Layout copied verbatim from `libriichi`'s `encode_kawa` (identical in the
+    4-player and sanma sources):
+
+        +0 chi/pon lower    +1 chi/pon higher    +2 kan tiles
+        +3 discarded tile   +4 aka   +5 dora   +6 tedashi   +7 riichi
+
+    There is no tsumogiri channel - `is_tedashi` covers that - and the last
+    channel is riichi, not tsumogiri.
+    """
     if item is not None:
         if item.chi_pon is not None:
             a, b = item.chi_pon
-            lo, hi = min(a, b), max(a, b)
-            p.assign(p.idx, hi, 1.0)        # highest consumed tile
-            p.assign(p.idx + 1, lo, 1.0)    # lowest consumed tile
-        p.assign(p.idx + 2, item.tile, 1.0)
+            p.assign(p.idx, min(a, b), 1.0)
+            p.assign(p.idx + 1, max(a, b), 1.0)
+        for kan in item.kan:
+            p.assign(p.idx + 2, _deaka(kan), 1.0)
+        p.assign(p.idx + 3, item.tile, 1.0)
         if item.is_aka:
-            p.fill(p.idx + 3, 1.0)
-        if item.is_dora:
             p.fill(p.idx + 4, 1.0)
-        if item.is_riichi:
+        if item.is_dora:
             p.fill(p.idx + 5, 1.0)
         if item.is_tedashi:
             p.fill(p.idx + 6, 1.0)
-        if item.is_tsumogiri:
+        if item.is_riichi:
             p.fill(p.idx + 7, 1.0)
     p.advance(KAWA_ITEM_CHANNELS)
 

@@ -1368,16 +1368,32 @@ pub fn encode_mortal_obs_4p(
     (encode_mortal_planes(&inp, in_channels), legal)
 }
 
+/// Encode a 3-player position into Mortal's observation, plus the legal actions.
+///
+/// Uses the `libriichi3p` layout (`obs_shape(4) = 775`) when `in_channels`
+/// is 775, which is what every sanma Mortal checkpoint expects. Other widths
+/// fall back to the legacy Akagi-style planes rather than feeding the model a
+/// buffer whose layout disagrees with its weights.
 pub fn encode_mortal_obs_3p(
     state: &mut GameState3P,
     seat: u8,
     in_channels: usize,
 ) -> (Vec<f32>, Vec<Action>) {
+    let obs = state.get_observation(seat);
+    let legal: Vec<Action> = obs.legal_actions_method().into_iter().map(|a| a.0).collect();
+
+    if in_channels == crate::mortal_obs::CHANNELS_SANMA {
+        let view = crate::state_features::MortalSeatView::from_state_3p(state, seat)
+            .with_legal_actions_3p(state, seat);
+        return (
+            crate::mortal_obs::encode_mortal_obs_with(&view, crate::mortal_obs::Layout::SANMA),
+            legal,
+        );
+    }
+
     let turn = state.turn_count;
     let kita: [u8; 3] = std::array::from_fn(|i| state.players[i].kita_tiles.len() as u8);
     let last_discard = state.last_discard.map(|(_pid, tile)| tile);
-    let obs = state.get_observation(seat);
-    let legal: Vec<Action> = obs.legal_actions_method().into_iter().map(|a| a.0).collect();
     let inp = enc_input_3p(&obs, turn, kita, last_discard);
     (encode_mortal_planes(&inp, in_channels), legal)
 }

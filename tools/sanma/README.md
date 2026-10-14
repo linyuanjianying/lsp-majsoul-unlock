@@ -118,6 +118,47 @@ on.
 
 ## Status
 
-Ground truth is captured. Porting the remaining sections and wiring the values
-into `src/mortal_obs.rs` is still to do; until then the 3p encoder remains the
-legacy `EncInput` path, which fills roughly 22 of 775 channels.
+The 3-player layout is implemented in `src/mortal_obs.rs` as `Layout::SANMA`
+and wired into `encode_mortal_obs_3p` for `in_channels == 775`.
+`tests/sanma_obs_parity.rs` replays the fixture's mjai lines into a
+`GameState3P`, encodes, and compares against the real binary's output.
+
+**Verified bit-exact: channels 0..523** (tehai through `doras_unseen`, including
+scores, rank, kyoku, winds, dora, both kawa blocks and the overviews).
+
+Remaining differences, all at channel 524 and later:
+
+| region | channels | why |
+|---|---|---|
+| kawa overview | 524..544 | a few tiles differ; the reference's per-seat overview is not exactly the discard list |
+| furiten | 628 | `at_furiten` is derived from `forbidden_discards`, which riichienv also uses for riichi restrictions |
+| keep/next shanten, tenpai discards | 640..642 | needs ukeire analysis per discard candidate |
+| `encode_ev` + required tiles + single-player table | 652..774 | **needs libriichi's sanma SP tables, which riichienv does not provide** |
+
+The last row is the same gap the 4-player path has: `riichienv-core` exposes
+`single_player_tables()` for 4 players only, and the sanma fork's variant is
+part of libriichi's `algo/sp` that would have to be ported. Until then the sanma
+observation is correct for everything except the decision-analysis tail.
+
+Also note: riichienv's 3-player `Dahai` handler does not populate
+`discard_from_hand` and never fills `Observation3P::tsumogiri_flags`, so the
+per-discard tsumogiri bit is reconstructed from the state's mjai log
+(the engine now runs the sanma state with logging enabled). When the log is
+unavailable discards are treated as tedashi-free.
+
+## A bug this caught in the 4-player path
+
+`encode_kawa` (the other seats' discards) was implemented with the wrong channel
+order in both `src/mortal_obs.rs` and `tools/mortal_obs_ref.py`:
+
+```
+wrong:  0/1 chi, 2 tile, 3 aka, 4 dora, 5 riichi, 6 tedashi, 7 tsumogiri
+correct:0/1 chi, 2 kan,  3 tile, 4 aka,  5 dora,  6 tedashi, 7 riichi
+```
+
+Because the Rust encoder and the Python reference carried the *same* mistake,
+the 4-player diff test passed - it was comparing two copies of one misreading.
+The real `libriichi3p` binary exposed it immediately. Both are now fixed and
+the 4-player diff still reports zero differences, this time against the actual
+source text from `Equim-chan/Mortal`.
+
