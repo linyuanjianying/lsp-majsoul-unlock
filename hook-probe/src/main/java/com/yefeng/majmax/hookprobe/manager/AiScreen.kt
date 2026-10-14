@@ -53,7 +53,7 @@ internal fun AiScreen(padding: PaddingValues) {
     var showLicense by remember { mutableStateOf(false) }
     var fourModel by remember { mutableStateOf(OnnxModelStore.info(context, 4)) }
     var threeModel by remember { mutableStateOf(OnnxModelStore.info(context, 3)) }
-    var modelMessage by remember { mutableStateOf("仅接受符合 Akagi 策略协议的 ONNX 文件；PyTorch/Mortal 权重包不能只改后缀导入。模型仅保存在本机；和牌率、向听与放铳风险仍由 Akagi 分析计算。") }
+    var modelMessage by remember { mutableStateOf("支持直接导入 Mortal 原生权重 (.pth / .pt) 或策略模型 (.onnx，含 Akagi 与 Mortal 协议)，支持四麻与三麻自动识别与切换。") }
     val delayWindow = remember { AiOverlayService.readDelayRange(context) }
     var delayMin by remember { mutableStateOf(delayWindow.first / 1000f) }
     var delayMax by remember { mutableStateOf(delayWindow.last / 1000f) }
@@ -69,7 +69,7 @@ internal fun AiScreen(padding: PaddingValues) {
                     fourModel = OnnxModelStore.info(context, 4)
                     threeModel = OnnxModelStore.info(context, 3)
                     runCatching { AiNative.configurePolicy(OnnxModelStore.enabledMask(context)) }
-                    modelMessage = "${imported.players} 人模型已校验并暂存；下一次完整牌局同步时生效。"
+                    modelMessage = "${imported.players} 人模型 (${imported.format}) 已校验并激活；下一次完整牌局同步时生效。"
                 }
                 .onFailure { error -> modelMessage = error.message?.take(160) ?: "模型导入失败，继续使用内置模型。" }
         }
@@ -212,7 +212,7 @@ internal fun AiScreen(padding: PaddingValues) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("如何理解这些指标", fontWeight = FontWeight.SemiBold)
                 Text("和牌率仅在听牌时显示；未听牌时显示向听数和进张。放铳风险指数包含打点权重，越低越好，并非实际放铳概率。分析只使用己方手牌与公开牌面。")
-                Text("使用 Akagi 的本地轻量模型，支持普通四麻和三麻。自检使用内置样例，窗口会明确标记“非当前牌局”。")
+                Text("内置 Akagi 本地轻量模型，同时支持直接导入四麻和三麻的 Mortal (.pth / .onnx) 及 Akagi (.onnx) 模型。自检使用内置样例，窗口会明确标记“非当前牌局”。")
                 TextButton(onClick = { showLicense = true }) { Text("Akagi 开源许可") }
             }
         }
@@ -241,12 +241,18 @@ private fun PolicyModelCard(
     onDelete: () -> Unit,
     onSelfTest: () -> Unit,
 ) {
+    val activeLabel = when {
+        !selectedCustom || model == null -> "内置 Akagi"
+        model.format == "mortal-pth" -> "自定义 Mortal (.pth)"
+        model.format == "mortal-onnx" -> "自定义 Mortal (.onnx)"
+        else -> "自定义 Akagi (.onnx)"
+    }
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(if (players == 4) "四麻模型" else "三麻模型", fontWeight = FontWeight.SemiBold)
-            Text("当前：${if (selectedCustom && model != null) "自定义 ONNX" else "内置 Akagi"}")
+            Text("当前：$activeLabel")
             if (model != null) {
-                Text("${model.name} · ${"%.1f".format(model.bytes / (1024f * 1024f))} MiB · SHA-256 ${model.sha256.take(12)}",
+                Text("${model.name} (${model.format}) · ${"%.1f".format(model.bytes / (1024f * 1024f))} MiB · SHA-256 ${model.sha256.take(12)}",
                     style = MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     TextButton(onClick = onCustom) { Text(if (selectedCustom) "已选自定义" else "使用自定义") }
@@ -257,7 +263,7 @@ private fun PolicyModelCard(
                     TextButton(onClick = onDelete) { Text("删除") }
                 }
             }
-            Button(onClick = onImport) { Text("导入 .onnx") }
+            Button(onClick = onImport) { Text("导入 .onnx / .pth") }
             Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }

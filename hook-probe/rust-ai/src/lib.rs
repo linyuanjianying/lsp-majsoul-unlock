@@ -7,10 +7,11 @@ use akagi_mobile_core::{
 };
 use native_bot::engine::{BotAction, Engine};
 use native_bot::model::{ExternalActivateFn, ExternalInferenceFn};
+use native_bot::mortal::{load_and_activate_pth, set_custom_onnx_contract};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    ffi::{c_char, CString},
+    ffi::{c_char, CStr, CString},
     panic::{catch_unwind, AssertUnwindSafe},
     slice,
     sync::{atomic::{AtomicU8, Ordering}, Mutex, OnceLock},
@@ -198,6 +199,11 @@ impl Assistant {
             }
         }
         let own = &snap.players[seat as usize];
+        let model_label = self
+            .engine
+            .as_ref()
+            .map(Engine::active_model_label)
+            .unwrap_or("Akagi 内置策略");
         Ok(json!({
             "status":"live", "message": if can_act { "轮到你操作" } else { "等待其他玩家" },
             "revision":self.revision, "step":self.step, "connection":self.active.map(|id| id.to_string()),
@@ -206,7 +212,7 @@ impl Assistant {
             "turn":snap.turn_count, "hand":own.tehai, "canAct":can_act,
             "analysis":analysis, "recommendations":recommendations,
             "elapsedMs":begin.elapsed().as_millis() as u64,
-            "model":if self.engine.as_ref().is_some_and(Engine::uses_external_policy) { "自定义 ONNX 策略" } else { "Akagi 内置策略" },
+            "model":model_label,
             "modelFallback":custom_fallback, "estimated":true,
             "legalOperations":if self.operation_seat == Some(seat as u64) { self.operations.clone() } else { json!([]) },
             "autoContext":{"wind":snap.bakaze,"kyoku":snap.kyoku,"honba":snap.honba,
@@ -294,6 +300,37 @@ pub extern "C" fn majmax_ai_register_policy_callbacks(infer: Option<ExternalInfe
 #[no_mangle]
 pub extern "C" fn majmax_ai_set_policy_mask(mask: u8) {
     POLICY_MASK.store(mask & 0b11, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn majmax_ai_load_mortal_pth(expected_players: u8, path: *const c_char) -> i32 {
+    if path.is_null() {
+        return -1;
+    }
+    let Ok(path_str) = CStr::from_ptr(path).to_str() else {
+        return -1;
+    };
+    match catch_unwind(AssertUnwindSafe(|| load_and_activate_pth(expected_players, path_str))) {
+        Ok(status) => status,
+        Err(_) => -6,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn majmax_ai_set_custom_contract(
+    players: u8,
+    kind: u8,
+    version: u8,
+    in_channels: u32,
+    action_space: u32,
+) {
+    set_custom_onnx_contract(
+        players,
+        kind,
+        version,
+        in_channels as usize,
+        action_space as usize,
+    );
 }
 
 /// Called only by the manager's background worker. Nothing here runs in the game process.
