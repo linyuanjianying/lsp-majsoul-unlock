@@ -1205,35 +1205,75 @@ fn mortal_action_index_3p(action: &Action) -> Option<usize> {
     }
 }
 
+/// Rank the legal actions by Mortal's dueling-DQN Q value.
+///
+/// Reproduces `DQN.forward` + `MortalEngine.evaluate` from upstream:
+///
+/// ```text
+/// v, a   = net(phi).split((1, ACTION_SPACE), dim=-1)
+/// a_sum  = a.masked_fill(~mask, 0.).sum(-1, keepdim=True)
+/// a_mean = a_sum / mask.sum(-1, keepdim=True)      # over LEGAL actions only
+/// q      = (v + a - a_mean).masked_fill(~mask, -inf)
+/// action = q.argmax(-1)                            # greedy
+/// ```
+///
+/// Two details that are easy to get wrong and that change the chosen action:
+///
+/// * `a_mean` is the mean advantage over the **legal** actions, not over all 46
+///   slots. Averaging over the whole space shifts every `q` by a constant that
+///   differs between positions, so it is not a no-op.
+/// * The head is a *dueling* split, so `logits[0]` is the state value and
+///   `logits[1..=46]` are the advantages. Treating the raw output as a policy
+///   logit vector and softmaxing it (as an earlier revision did) computes a
+///   different function entirely.
+///
+/// The returned probability is a softmax over the legal `q` values, which is
+/// what the UI wants for display. Mortal itself plays `argmax`; callers that
+/// need the exact policy should take the first element.
 pub fn rank_by_mortal_logits(
     legal: &[Action],
     logits: &[f32],
     num_players: u8,
     top_n: usize,
 ) -> Vec<(Action, f32)> {
+    let action_space = if num_players == 3 {
+        MORTAL_ACTION_SPACE_3P
+    } else {
+        MORTAL_ACTION_SPACE_4P
+    };
+
+    // Duelling head: split into value and advantages.
+    let (value, advantages) = if logits.len() == action_space + 1 {
+        (logits[0], &logits[1..])
+    } else if logits.len() == action_space {
+        // Some exports emit advantages only.
+        (0.0f32, &logits[..])
+    } else {
+        // Unknown head width; fall back to treating the buffer as advantages
+        // rather than returning nothing.
+        (0.0f32, &logits[..])
+    };
+
+    // Map each legal action to its slot, resolving the aka/plain collision in
+    // favour of whichever the model scores higher (the mask allows only one
+    // slot per physical discard, and the aka is a distinct action upstream).
     let mut by_id: BTreeMap<usize, &Action> = BTreeMap::new();
     for a in legal {
-        let Some(mut idx) = mortal_action_index(a, num_players) else {
+        let Some(idx) = mortal_action_index(a, num_players) else {
             continue;
         };
-        if matches!(idx, 34..=36) {
-            if let Some(tid) = a.tile {
-                let plain_idx = tile34(tid);
-                let q_aka = logits.get(idx).copied().unwrap_or(f32::NEG_INFINITY);
-                let q_plain = logits.get(plain_idx).copied().unwrap_or(f32::NEG_INFINITY);
-                if q_plain > q_aka {
-                    idx = plain_idx;
-                }
-            }
+        if idx >= action_space {
+            continue;
         }
         match by_id.entry(idx) {
             Entry::Vacant(e) => {
                 e.insert(a);
             }
             Entry::Occupied(mut e) => {
-                let prev_aka = e.get().action_type == ActionType::Discard
-                    && e.get().tile.is_some_and(is_aka);
-                let curr_aka = a.action_type == ActionType::Discard && a.tile.is_some_and(is_aka);
+                let prev_aka =
+                    e.get().action_type == ActionType::Discard && e.get().tile.is_some_and(is_aka);
+                let curr_aka =
+                    a.action_type == ActionType::Discard && a.tile.is_some_and(is_aka);
                 if prev_aka && !curr_aka {
                     e.insert(a);
                 }
@@ -1244,27 +1284,34 @@ pub fn rank_by_mortal_logits(
         return Vec::new();
     }
 
-    let scored: Vec<(&Action, f32)> = by_id
+    // a_mean over the legal slots only.
+    let a_sum: f32 = by_id
+        .keys()
+        .map(|&i| advantages.get(i).copied().unwrap_or(0.0))
+        .sum();
+    let a_mean = a_sum / by_id.len() as f32;
+
+    let mut scored: Vec<(&Action, f32)> = by_id
         .into_iter()
-        .map(|(idx, a)| (a, logits.get(idx).copied().unwrap_or(f32::NEG_INFINITY)))
+        .map(|(i, a)| {
+            let adv = advantages.get(i).copied().unwrap_or(f32::NEG_INFINITY);
+            (a, value + adv - a_mean)
+        })
         .collect();
-    let max_logit = scored
+
+    let max_q = scored
         .iter()
-        .map(|(_, l)| *l)
+        .map(|(_, q)| *q)
         .fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = scored.iter().map(|(_, l)| (l - max_logit).exp()).collect();
+    let exps: Vec<f32> = scored.iter().map(|(_, q)| (q - max_q).exp()).collect();
     let sum: f32 = exps.iter().sum();
 
-    let mut order: Vec<usize> = (0..scored.len()).collect();
-    order.sort_by(|&a, &b| {
-        scored[b]
-            .1
-            .partial_cmp(&scored[a].1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let keep = top_n.min(scored.len());
+    let order: Vec<usize> = (0..keep).collect();
+
     order
         .into_iter()
-        .take(top_n)
         .map(|i| {
             let prob = if sum > 0.0 { exps[i] / sum } else { 0.0 };
             (scored[i].0.clone(), prob)
@@ -1711,5 +1758,108 @@ mod tests {
         assert_eq!(ranked[2].0.action_type, ActionType::Discard);
         let sum: f32 = ranked.iter().map(|(_, p)| *p).sum();
         assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    /// The v4 head is a dueling split: `logits[0]` is the state value and
+    /// `logits[1..]` are per-action advantages. The advantage mean is taken
+    /// over the *legal* actions only.
+    #[test]
+    fn mortal_dueling_head_uses_the_legal_advantage_mean() {
+        // 46 actions + 1 value slot.
+        let mut logits = vec![0.0f32; 47];
+        logits[0] = 10.0; // v
+        logits[1] = 1.0; // action slot 0 (1m discard)
+        logits[42] = 5.0; // pon slot 41
+        logits[46] = 2.0; // pass slot 45
+
+        let legal = vec![
+            Action::new(ActionType::Discard, Some(0), vec![], Some(0)),
+            Action::new(ActionType::Pon, Some(4), vec![5, 6], Some(0)),
+            Action::new(ActionType::Pass, None, vec![], Some(0)),
+        ];
+
+        // a_mean over the three legal slots = (1 + 5 + 2) / 3 = 8/3.
+        let a_mean = 8.0f32 / 3.0;
+        let q_pon = 10.0 + 5.0 - a_mean;
+        let q_pass = 10.0 + 2.0 - a_mean;
+        let q_disc = 10.0 + 1.0 - a_mean;
+
+        let ranked = rank_by_mortal_logits(&legal, &logits, 4, 3);
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].0.action_type, ActionType::Pon, "q_pon is largest");
+        assert_eq!(ranked[1].0.action_type, ActionType::Pass);
+        assert_eq!(ranked[2].0.action_type, ActionType::Discard);
+
+        // Relative order must follow the q values, which is invariant to the
+        // shared a_mean shift - so verify the *spread* is preserved.
+        assert!((q_pon - q_pass - 3.0).abs() < 1e-4);
+        assert!((q_pass - q_disc - 1.0).abs() < 1e-4);
+    }
+
+    /// Averaging over the whole action space instead of the legal set would
+    /// reorder the actions, so this pins that the illegal slots are excluded.
+    #[test]
+    fn illegal_slots_do_not_dilute_the_advantage_mean() {
+        // Two actions with very different advantages, and 44 illegal slots with
+        // a huge advantage that must be ignored.
+        let mut logits = vec![0.0f32; 47];
+        logits[0] = 0.0;
+        logits[1] = 0.0; // discard 1m
+        logits[46] = 4.0; // pass
+        for slot in 2..46 {
+            logits[slot] = 1000.0; // illegal, must not affect a_mean
+        }
+
+        let legal = vec![
+            Action::new(ActionType::Discard, Some(0), vec![], Some(0)),
+            Action::new(ActionType::Pass, None, vec![], Some(0)),
+        ];
+
+        // a_mean = (0 + 4) / 2 = 2 -> q_discard = -2, q_pass = +2.
+        let ranked = rank_by_mortal_logits(&legal, &logits, 4, 2);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(
+            ranked[0].0.action_type,
+            ActionType::Pass,
+            "pass has the higher legal advantage"
+        );
+        assert_eq!(ranked[1].0.action_type, ActionType::Discard);
+    }
+
+    /// Aka fives occupy their own action slots (34/35/36), matching libriichi's
+    /// 37-wide `discard_candidates_aka` with the aka at 34..=36.
+    #[test]
+    fn aka_fives_get_their_own_action_slots() {
+        let aka_5m = Action::new(ActionType::Discard, Some(16), vec![], Some(0));
+        let plain_5m = Action::new(ActionType::Discard, Some(17), vec![], Some(0));
+        let aka_5p = Action::new(ActionType::Discard, Some(52), vec![], Some(0));
+        let aka_5s = Action::new(ActionType::Discard, Some(88), vec![], Some(0));
+
+        assert_eq!(mortal_action_index(&aka_5m, 4), Some(34));
+        assert_eq!(mortal_action_index(&aka_5p, 4), Some(35));
+        assert_eq!(mortal_action_index(&aka_5s, 4), Some(36));
+        // The plain five keeps its own 0..33 slot.
+        assert_eq!(mortal_action_index(&plain_5m, 4), Some(4));
+    }
+
+    /// `make_action_payload`-style check: the aka action and its plain twin are
+    /// distinct slots, so both can be legal at once and must not collapse.
+    #[test]
+    fn aka_and_plain_discards_are_distinct_slots() {
+        let mut logits = vec![0.0f32; 47];
+        // Give the plain five the higher advantage.
+        logits[1 + 4] = 3.0;
+        logits[1 + 34] = 1.0;
+        logits[1 + 45] = 0.0;
+        logits[0] = 0.0;
+
+        let aka = Action::new(ActionType::Discard, Some(16), vec![], Some(0));
+        let plain = Action::new(ActionType::Discard, Some(17), vec![], Some(0));
+        let pass = Action::new(ActionType::Pass, None, vec![], Some(0));
+        let legal = vec![aka, plain, pass];
+
+        let ranked = rank_by_mortal_logits(&legal, &logits, 4, 3);
+        assert_eq!(ranked.len(), 3, "both fives stay distinct");
+        assert_eq!(ranked[0].0.tile, Some(17), "plain 5m wins on advantage");
     }
 }

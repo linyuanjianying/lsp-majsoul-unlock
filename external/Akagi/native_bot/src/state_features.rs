@@ -149,6 +149,17 @@ fn rel(pid: u8, seat: u8) -> usize {
     ((pid + NUM_PLAYERS as u8 - seat) as usize) % NUM_PLAYERS
 }
 
+/// Shanten for a concealed-hand count vector plus `num_melds` called sets.
+///
+/// riichienv's `calc_shanten_from_counts` expects `tehai_len_div3` = number of
+/// melds, i.e. how many 3-tile groups are already fixed.
+fn calc_shanten(tehai: &[u8; TILES], num_melds: usize) -> u8 {
+    let shanten =
+        riichienv_core::shanten::calc_shanten_from_counts(tehai, num_melds as u8);
+    // The encoder one-hots up to 6; negative means a winning hand.
+    shanten.clamp(0, 6) as u8
+}
+
 impl MortalSeatView {
     /// Derive the view for `seat` from a live game state.
     ///
@@ -266,6 +277,11 @@ impl MortalSeatView {
         // win on, i.e. the furiten tiles.
         let me = &state.players[seat as usize];
         v.at_furiten = !me.forbidden_discards.is_empty();
+
+        // -- shanten -------------------------------------------------------
+        // The encoder one-hots `shanten` capped at 6, and the SP-table planes
+        // are only meaningful at low shanten.
+        v.shanten = calc_shanten(&v.tehai, me.melds.len());
 
         v
     }
