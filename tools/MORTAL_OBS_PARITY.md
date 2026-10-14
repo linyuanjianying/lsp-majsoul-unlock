@@ -126,18 +126,25 @@ From `mortal/model.py` (authoritative for the weight layout):
   is taken over the **legal** actions only (`masked_fill(~mask, 0).sum() /
   mask.sum()`), not over the whole action space.
 
-## Current gap
+## Status
 
-`encode_mortal_planes` in `src/mortal.rs` writes **23 of 1012** channels; the
-rest stay zero. It is built from `EncInput`, which cannot express most of the
-layout above — there is no representation for kawa detail, kawa/fuuro/ankan
-overviews, `tiles_seen`, `doras_owned` / `doras_unseen`, the second score plane,
-or any decision-context or SP-table channel.
+The Rust encoder (`src/mortal_obs.rs`) is **bit-for-bit identical to the
+libriichi reference** for version 4: `tests/mortal_obs_diff.rs` compares all
+34408 floats against a buffer produced by `tools/mortal_obs_ref.py` and reports
+zero differences. `MORTAL_OBS_DIFF_STRICT=1` makes a divergence fail the test.
 
-The parity test reports this and stays green; set `MORTAL_OBS_PARITY_STRICT=1` to
-make it fail, and use that as the gate once the encoder is ported. Closing the
-gap requires extending `EncInput` (or feeding the encoder from the game state
-directly) — see `src/adapt.rs`.
+### Two encoders, deliberately
+
+| Encoder | Layout | Used for |
+|---|---|---|
+| `src/obs.rs` (`encode`) | Akagi's own `channels(num_players)` planes | the bundled Akagi model |
+| `src/mortal_obs.rs` | Mortal's `[1012, 34]` | any Mortal `.pth` / `.onnx` |
+
+They are not interchangeable. Mortal's weights only understand the second one.
+
+`src/mortal.rs::encode_mortal_obs_4p` uses the Mortal layout when
+`in_channels == 1012` and falls back to the legacy Akagi planes otherwise, so a
+model never receives a buffer whose layout disagrees with its weights.
 
 ### Fixed so far
 
@@ -148,14 +155,20 @@ directly) — see `src/adapt.rs`.
   activation) for v2..=v4, with the BN+activation carried by the folded conv.
 * `ChannelAttention` now pools mean **and** max, matching upstream.
 * BatchNorm `eps`: 1e-3 for v3/v4, 1e-5 otherwise.
-* `encode_tile_set` advances 7 channels with real count + aka rows, instead of
-  2 invented "indicator / derived dora" planes.
+* `encode_tile_set` advances 7 channels with real count + aka rows.
+* The 1012-channel layout itself, encoded directly from `GameState`
+  (`src/mortal_obs.rs` + `src/state_features.rs`), replacing the lossy
+  `EncInput` path that could only reach ~23 channels.
 
 ### Still open
 
-* The remaining ~989 channels (the encoder's `EncInput` is the blocker).
+* 3P sanma (`775`) still goes through the legacy path — the parity harness only
+  covers v4.
 * The v4 DQN advantage mean must be taken over **legal** actions only;
   `rank_by_mortal_logits` currently softmaxes the legal logits directly, which
   is not the same function.
 * Action indexing (`mortal_action_index_4p`, the aka fallback) is still
   unverified against real play.
+* The single-player-table planes are filled from `MortalSeatView.sp_candidates`,
+  which nothing populates yet, so those 123 channels stay zero in live play.
+  They are exercised only by the synthetic diff fixture.

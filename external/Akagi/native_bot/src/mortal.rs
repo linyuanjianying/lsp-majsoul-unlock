@@ -1272,15 +1272,30 @@ pub fn rank_by_mortal_logits(
         .collect()
 }
 
+/// Encode a 4-player position into Mortal's observation, plus the legal actions.
+///
+/// Uses [`crate::mortal_obs::encode_mortal_obs`], the libriichi-parity encoder,
+/// which is verified bit-for-bit against the reference in
+/// `tests/mortal_obs_diff.rs`. `in_channels` selects the layout version: only
+/// the 1012-wide v4 layout is implemented, so any other width falls back to the
+/// legacy Akagi-style planes rather than silently feeding the model a buffer
+/// whose layout does not match its weights.
 pub fn encode_mortal_obs_4p(
     state: &mut GameState,
     seat: u8,
     in_channels: usize,
 ) -> (Vec<f32>, Vec<Action>) {
-    let turn = state.turn_count;
-    let last_discard = state.last_discard.map(|(_pid, tile)| tile);
     let obs = state.get_observation(seat);
     let legal = obs.legal_actions_method();
+
+    if in_channels == crate::mortal_obs::CHANNELS_V4 {
+        let view = crate::state_features::MortalSeatView::from_state(state, seat)
+            .with_legal_actions(state, seat);
+        return (crate::mortal_obs::encode_mortal_obs(&view), legal);
+    }
+
+    let turn = state.turn_count;
+    let last_discard = state.last_discard.map(|(_pid, tile)| tile);
     let inp = enc_input_4p(&obs, turn, last_discard);
     (encode_mortal_planes(&inp, in_channels), legal)
 }
