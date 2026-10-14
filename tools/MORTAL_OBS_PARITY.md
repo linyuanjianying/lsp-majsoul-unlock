@@ -172,3 +172,70 @@ model never receives a buffer whose layout disagrees with its weights.
 * The single-player-table planes are filled from `MortalSeatView.sp_candidates`,
   which nothing populates yet, so those 123 channels stay zero in live play.
   They are exercised only by the synthetic diff fixture.
+
+## 3-player (sanma)
+
+Sanma is a **separate fork** with its own layout. Findings, from
+`Mateces/mortal-sanma` history plus the sanma model itself:
+
+* `obs_shape(5) = (775, 34)`, `ACTION_SPACE = 44`.
+* A real sanma checkpoint (`mortal.pth`, 273 MB, CUDA-saved) has
+  `in_channels = 775`, 256 conv channels, **52** res blocks, and a dueling head
+  of `(45, 1024)` = 44 actions + 1 value. It also carries an `aux_net`
+  `(4, 1024)` auxiliary head that must not be mistaken for the policy head.
+
+Action slots (confirmed twice: the fork's `consts.rs` comment and the mask
+construction, and the commit that aligned it with Akagi's `libriichi3p`):
+
+```
+0..=33   discard, by tile index (sanma keeps the full 34-wide axis)
+34..=36  aka 5m / 5p / 5s
+37       riichi
+38       nukidora (kita)
+39       pon
+40       daiminkan / ankan / kakan
+41       agari (tsumo / ron)
+42       ryukyoku (kyuushu kyuuhai)
+43       pass
+```
+
+There is **no chi**. An earlier revision of `mortal_action_index_3p` had
+`38=pon, 39=kan, 40=kita`, i.e. nukidora and pon/kan swapped; and it gated
+discards through `TILE34_TO_COMPACT`, which is Akagi's *own* 27-wide sanma
+compaction (and drops 2m–8m) — so every manzu discard in the 2m–8m range
+returned `None`. Both are fixed.
+
+### The 775 layout is NOT derivable from the fork
+
+The fork's history is:
+
+| commit | `obs_shape(5)` | note |
+|---|---|---|
+| `e4e6a3a` | 769 | initial sanma conversion |
+| `ed9a186` | **775** | "align obs_shape(5)=775 and action layout with Akagi libriichi3p" |
+| `d6ca017` | 775 | GRP fixes |
+| `aa9420d` | 780 | "align sanma obs/oracle shapes with encoder output" |
+
+At `ed9a186` / `d6ca017` the constant said 775, but the encoder could not
+actually produce it: `let cap = match version { 1 | 4 => 10, 2 | 3 => 6, _ =>
+unreachable!() }` panics for version 5, the score section had no `4 | 5` arm, and
+`honba`/`kyotaku` used `.rescale(self.version == 4)`. The next commit changed
+the constant to 780 to match what the encoder *did* emit.
+
+So **775 is Akagi `libriichi3p`'s layout, not this fork's**, and the fork never
+shipped a 775-consistent encoder. Porting 775 with the same bit-exact
+verification used for v4 needs a reference from `libriichi3p` (source, or a
+build that can emit observations to diff against).
+
+### Sanma status in this crate
+
+| | 4-player | 3-player |
+|---|---|---|
+| checkpoint loads | yes, verified | yes, verified |
+| action indexing | verified | verified |
+| observation encoder | bit-exact vs libriichi | **not ported (~22/775)** |
+
+The 3p encoder still goes through `EncInput`/`encode_mortal_planes`, which fills
+roughly 22 of 775 channels. The model loads and returns finite logits, but from
+an almost entirely zero input, so its advice is not meaningful yet.
+

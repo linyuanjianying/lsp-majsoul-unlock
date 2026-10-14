@@ -23,7 +23,7 @@ use riichienv_core::state_3p::GameState3P;
 
 use crate::adapt::{enc_input_3p, enc_input_4p};
 use crate::obs::EncInput;
-use crate::tiles::{is_aka, tile34, TILE34_TO_COMPACT};
+use crate::tiles::{is_aka, tile34};
 
 /// Mortal 4P action space size (`libriichi::consts::ACTION_SPACE`).
 pub const MORTAL_ACTION_SPACE_4P: usize = 46;
@@ -733,14 +733,18 @@ impl MortalPthModel {
     ) -> CandleResult<Option<ResBlock>> {
         // `idx` is the res-block ordinal (0-based). Real Mortal checkpoints
         // place block N at `encoder.net.{N+1}` (the entry conv occupies
-        // `net.0`). Note that `open_brain_vb` normally already descended into
-        // the trunk, so the bare `{N}.res_unit` form is what actually resolves
-        // there; the fully-qualified forms cover the non-descended case.
+        // `net.0`). `open_brain_vb` normally already descended into the trunk,
+        // so the bare `{N}.res_unit` form is what resolves there; the
+        // fully-qualified forms cover the non-descended case.
+        //
+        // NOTE: there must be no `encoder.net.{idx}.res_unit` candidate here.
+        // That form is off by one for real checkpoints, so it never matches a
+        // new block - but it *does* match the previous block again, which
+        // appends a duplicate ResBlock and silently changes the forward pass.
         let block_prefixes = [
             format!("{}.res_unit", idx + 1),
             format!("encoder.net.{}.res_unit", idx + 1),
             format!("net.{}.res_unit", idx + 1),
-            format!("encoder.net.{idx}.res_unit"),
             // Akagi exports.
             format!("backbone.blocks.{idx}"),
             format!("blocks.{idx}"),
@@ -1182,22 +1186,34 @@ fn mortal_action_index_4p(action: &Action) -> Option<usize> {
     }
 }
 
+/// Action index for 3-player (sanma).
+///
+/// The layout is confirmed against the sanma fork's own documentation and mask
+/// construction (`libriichi/src/consts.rs` lists discard+aka, then riichi,
+/// nukidora, pon, kan, agari, ryukyoku, pass = 44, and `encode_obs` sets
+/// `mask[38] = nukidora`, `mask[39] = pon`, `mask[40] = kan`,
+/// `mask[41] = agari`, `mask[42] = ryukyoku`, `mask[43] = pass`).
+///
+/// Chi does not exist in sanma, so no slot maps to it.
 fn mortal_action_index_3p(action: &Action) -> Option<usize> {
     match action.action_type {
         ActionType::Discard => {
             let tid = action.tile?;
-            let t34 = tile34(tid);
-            TILE34_TO_COMPACT[t34]?;
             match tid {
-                52 => Some(35),
-                88 => Some(36),
-                _ => Some(t34.min(33)),
+                16 => Some(34), // 5mr
+                52 => Some(35), // 5pr
+                88 => Some(36), // 5sr
+                // Sanma keeps Mortal's full 34-wide tile axis, so a discard's
+                // slot is the tile's own index. Akagi's *own* 3p model uses a
+                // separate 27-wide compaction for manzu, which must not be
+                // applied to a Mortal sanma model.
+                _ => Some(tile34(tid).min(33)),
             }
         }
         ActionType::Riichi => Some(37),
-        ActionType::Pon => Some(38),
-        ActionType::Daiminkan | ActionType::Ankan | ActionType::Kakan => Some(39),
-        ActionType::Kita => Some(40),
+        ActionType::Kita => Some(38), // nukidora (抜きドラ)
+        ActionType::Pon => Some(39),
+        ActionType::Daiminkan | ActionType::Ankan | ActionType::Kakan => Some(40),
         ActionType::Tsumo | ActionType::Ron => Some(41),
         ActionType::KyushuKyuhai => Some(42),
         ActionType::Pass => Some(43),
@@ -1242,17 +1258,18 @@ pub fn rank_by_mortal_logits(
         MORTAL_ACTION_SPACE_4P
     };
 
-    // Duelling head: split into value and advantages.
-    let (value, advantages) = if logits.len() == action_space + 1 {
+    // Duelling head: split into value and advantages only when the caller
+    // handed us a raw head output. Both live paths already combine the head
+    // (`MortalPthModel::forward_logits` does it in Rust, the ONNX host does it
+    // in `forward_external_custom`), so a buffer of exactly `action_space`
+    // values is per-action Q and must NOT be re-split - treating `q[0]` as a
+    // state value and the rest as advantages would misread every action.
+    let (value, advantages): (f32, &[f32]) = if logits.len() == action_space + 1 {
         (logits[0], &logits[1..])
-    } else if logits.len() == action_space {
-        // Some exports emit advantages only.
-        (0.0f32, &logits[..])
     } else {
-        // Unknown head width; fall back to treating the buffer as advantages
-        // rather than returning nothing.
         (0.0f32, &logits[..])
     };
+    let raw_head = logits.len() == action_space + 1;
 
     // Map each legal action to its slot, resolving the aka/plain collision in
     // favour of whichever the model scores higher (the mask allows only one
@@ -1284,12 +1301,16 @@ pub fn rank_by_mortal_logits(
         return Vec::new();
     }
 
-    // a_mean over the legal slots only.
-    let a_sum: f32 = by_id
-        .keys()
-        .map(|&i| advantages.get(i).copied().unwrap_or(0.0))
-        .sum();
-    let a_mean = a_sum / by_id.len() as f32;
+    // a_mean over the legal slots only, and only when we split a raw head.
+    let a_mean = if raw_head {
+        let a_sum: f32 = by_id
+            .keys()
+            .map(|&i| advantages.get(i).copied().unwrap_or(0.0))
+            .sum();
+        a_sum / by_id.len() as f32
+    } else {
+        0.0
+    };
 
     let mut scored: Vec<(&Action, f32)> = by_id
         .into_iter()
@@ -1736,7 +1757,67 @@ mod tests {
         let kita = Action::new(ActionType::Kita, None, vec![], Some(0));
         assert_eq!(mortal_action_index(&pass, 4), Some(45));
         assert_eq!(mortal_action_index(&pass, 3), Some(43));
-        assert_eq!(mortal_action_index(&kita, 3), Some(40));
+        // Sanma: 37 riichi, 38 nukidora, 39 pon, 40 kan, 41 agari, 42 ryukyoku,
+        // 43 pass. Chi has no slot at all.
+        assert_eq!(mortal_action_index(&kita, 3), Some(38));
+    }
+
+    /// The sanma action slots, verified against the sanma fork's own mask
+    /// construction. Getting these permuted still produces legal play (the
+    /// engine maps the index back), but the model's advice lands on the wrong
+    /// action.
+    #[test]
+    fn mortal_action_mapping_3p_slots() {
+        let riichi = Action::new(ActionType::Riichi, None, vec![], Some(0));
+        let kita = Action::new(ActionType::Kita, None, vec![], Some(0));
+        let pon = Action::new(ActionType::Pon, Some(4), vec![5, 6], Some(0));
+        let daiminkan = Action::new(ActionType::Daiminkan, Some(4), vec![5, 6, 7], Some(0));
+        let ankan = Action::new(ActionType::Ankan, Some(4), vec![4, 5, 6, 7], Some(0));
+        let kakan = Action::new(ActionType::Kakan, Some(4), vec![4, 5, 6], Some(0));
+        let tsumo = Action::new(ActionType::Tsumo, None, vec![], Some(0));
+        let ron = Action::new(ActionType::Ron, Some(4), vec![], Some(0));
+        let kyushu = Action::new(ActionType::KyushuKyuhai, None, vec![], Some(0));
+        let pass = Action::new(ActionType::Pass, None, vec![], Some(0));
+        let chi = Action::new(ActionType::Chi, Some(0), vec![4, 8], Some(0));
+
+        assert_eq!(mortal_action_index(&riichi, 3), Some(37));
+        assert_eq!(mortal_action_index(&kita, 3), Some(38), "nukidora");
+        assert_eq!(mortal_action_index(&pon, 3), Some(39), "pon");
+        assert_eq!(mortal_action_index(&daiminkan, 3), Some(40), "daiminkan");
+        assert_eq!(mortal_action_index(&ankan, 3), Some(40), "ankan");
+        assert_eq!(mortal_action_index(&kakan, 3), Some(40), "kakan");
+        assert_eq!(mortal_action_index(&tsumo, 3), Some(41), "tsumo");
+        assert_eq!(mortal_action_index(&ron, 3), Some(41), "ron");
+        assert_eq!(mortal_action_index(&kyushu, 3), Some(42), "kyuushu kyuuhai");
+        assert_eq!(mortal_action_index(&pass, 3), Some(43), "pass");
+        assert_eq!(mortal_action_index(&chi, 3), None, "no chi in sanma");
+
+        // Every slot must sit inside the 44-wide sanma action space.
+        for a in [&riichi, &kita, &pon, &daiminkan, &ankan, &kakan, &tsumo, &ron, &kyushu, &pass] {
+            let i = mortal_action_index(a, 3).unwrap();
+            assert!(i < MORTAL_ACTION_SPACE_3P, "{:?} -> {i} out of range", a.action_type);
+        }
+    }
+
+    /// Sanma discards use the full 34-wide tile axis: 2m..8m must all map to
+    /// their own slots, and the aka fives occupy 34..=36 alongside them.
+    #[test]
+    fn mortal_sanma_discards_use_the_full_tile_axis() {
+        // 2m (raw 4) is index 1; 8m (raw 28) is index 7.
+        for (raw, want) in [(0u8, 0usize), (4, 1), (28, 7), (32, 8), (36, 9), (108, 27), (132, 33)] {
+            let a = Action::new(ActionType::Discard, Some(raw), vec![], Some(0));
+            assert_eq!(
+                mortal_action_index(&a, 3),
+                Some(want),
+                "raw {raw} should be slot {want} in sanma"
+            );
+        }
+
+        // Aka fives keep their dedicated slots, and 5m's plain copy stays at 4.
+        for (raw, want) in [(16u8, 34usize), (52, 35), (88, 36), (17, 4)] {
+            let a = Action::new(ActionType::Discard, Some(raw), vec![], Some(0));
+            assert_eq!(mortal_action_index(&a, 3), Some(want), "raw {raw} -> {want}");
+        }
     }
 
     #[test]
