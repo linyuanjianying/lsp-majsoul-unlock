@@ -151,10 +151,6 @@ fn rel(pid: u8, seat: u8) -> usize {
     ((pid + NUM_PLAYERS as u8 - seat) as usize) % NUM_PLAYERS
 }
 
-/// Shanten for a concealed-hand count vector plus `num_melds` called sets.
-///
-/// riichienv's `calc_shanten_from_counts` expects `tehai_len_div3` = number of
-/// melds, i.e. how many 3-tile groups are already fixed.
 fn dora_type(raw: u8) -> usize {
     let t = (raw / 4) as usize;
     match t {
@@ -183,24 +179,60 @@ fn count_doras(raw_tiles: &[u8], dora_types: &[bool; TILES]) -> u8 {
         .min(12) as u8
 }
 
-fn calc_shanten(tehai: &[u8; TILES], num_melds: usize) -> u8 {
+/// Shanten for a concealed-hand count vector.
+///
+/// `tehai_len_div3` is the *concealed hand length divided by three*, not the
+/// meld count: `calc_normal` uses it as a table index and
+/// `calc_shanten_from_counts` only checks chiitoitsu/kokushi when it is `>= 4`.
+/// The two differ by a constant (`len / 3 == 4 - melds` for a full hand), and
+/// feeding the meld count instead makes a closed hand look like an open one —
+/// a scattered 13-tile hand comes back as tenpai.
+fn calc_shanten(tehai: &[u8; TILES]) -> u8 {
+    let total: usize = tehai.iter().map(|&c| c as usize).sum();
     let shanten =
-        riichienv_core::shanten::calc_shanten_from_counts(tehai, num_melds as u8);
+        riichienv_core::shanten::calc_shanten_from_counts(tehai, (total / 3) as u8);
     shanten.clamp(0, 6) as u8
 }
 
-/// True when a tenpai hand (shanten 0) has at least one winning tile left.
+/// Shanten for a sanma hand, clamped to the encoded range.
 ///
-/// Used for the `unconditional_tenpai_discards` plane: a discard that leaves a
-/// hand which wins on *some* draw, independent of which tile comes next.
-fn has_any_wait(tehai: &[u8; TILES], num_melds: usize) -> bool {
+/// Exposed for `state_features_3p` and `sp_tables` so the 3-player path uses
+/// `calc_shanten_from_counts_3p` (which relocates the manzu tiles that sanma
+/// does not use) instead of the 4-player routine.
+pub fn shanten_for(tehai: &[u8; TILES]) -> u8 {
+    let total: usize = tehai.iter().map(|&c| c as usize).sum();
+    let s =
+        riichienv_core::shanten::calc_shanten_from_counts_3p(tehai, (total / 3) as u8);
+    s.clamp(0, 6) as u8
+}
+
+/// [`has_any_wait`] using the sanma shanten routine.
+pub fn has_any_wait_for(tehai: &[u8; TILES]) -> bool {
     for t in 0..TILES {
         if tehai[t] >= 4 {
             continue;
         }
         let mut probe = *tehai;
         probe[t] += 1;
-        if calc_shanten(&probe, num_melds) == 0 {
+        if shanten_for(&probe) == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a tenpai hand (shanten 0) has at least one winning tile left.
+///
+/// Used for the `unconditional_tenpai_discards` plane: a discard that leaves a
+/// hand which wins on *some* draw, independent of which tile comes next.
+fn has_any_wait(tehai: &[u8; TILES]) -> bool {
+    for t in 0..TILES {
+        if tehai[t] >= 4 {
+            continue;
+        }
+        let mut probe = *tehai;
+        probe[t] += 1;
+        if calc_shanten(&probe) == 0 {
             return true;
         }
     }
@@ -389,7 +421,7 @@ impl MortalSeatView {
         // -- shanten -------------------------------------------------------
         // The encoder one-hots `shanten` capped at 6, and the SP-table planes
         // are only meaningful at low shanten.
-        v.shanten = calc_shanten(&v.tehai, me.melds.len());
+        v.shanten = calc_shanten(&v.tehai);
 
         v
     }
@@ -474,7 +506,6 @@ impl MortalSeatView {
         // after the discard). Both are computed on the concealed hand only,
         // matching the upstream definition.
         if self.can_discard {
-            let num_melds = state.players[seat as usize].melds.len();
             let base = self.shanten;
             let mut seen: Vec<u8> = Vec::new();
             for &raw in &self.discard_candidates {
@@ -489,10 +520,10 @@ impl MortalSeatView {
                 let mut after = self.tehai;
                 after[tid] -= 1;
                 // A 13-tile remainder is what shanten expects after a discard.
-                let s_after = calc_shanten(&after, num_melds);
+                let s_after = calc_shanten(&after);
                 if s_after <= base {
                     self.keep_shanten_discards.push(raw);
-                    if s_after == 0 && has_any_wait(&after, num_melds) {
+                    if s_after == 0 && has_any_wait(&after) {
                         self.unconditional_tenpai_discards.push(raw);
                     }
                 }
@@ -520,7 +551,6 @@ impl MortalSeatView {
                 .collect();
             self.sp_candidates = crate::sp_tables::build_sp_candidates(
                 &self.tehai,
-                state.players[seat as usize].melds.len(),
                 &discard_raw,
                 self.tiles_left,
                 &self.tiles_seen,

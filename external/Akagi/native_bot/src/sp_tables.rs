@@ -44,12 +44,11 @@ const SURVIVAL_PER_TURN: f32 = 0.94;
 
 /// Compute candidate rows for the single-player table planes.
 ///
-/// `tehai` is the concealed hand as a 34-wide count vector, `num_melds` the
-/// number of called sets, `remaining` the live wall count, and `visible` the
-/// per-tile count of copies this seat can account for.
+/// `tehai` is the concealed hand as a 34-wide count vector, `discards` the raw
+/// tiles the seat may discard, `remaining` the live wall count, and `visible`
+/// the per-tile count of copies this seat can account for.
 pub fn build_sp_candidates(
     tehai: &[u8; TILES],
-    num_melds: usize,
     discards: &[u8],
     remaining: u8,
     visible: &[u8; TILES],
@@ -71,14 +70,14 @@ pub fn build_sp_candidates(
         after[tid] -= 1;
 
         // The tiles that complete the hand after this discard.
-        let required = required_tiles(&after, num_melds);
+        let required = required_tiles(&after);
         let ukeire: u32 = required
             .iter()
             .map(|&t| 4u32.saturating_sub(visible[t as usize] as u32))
             .sum();
 
         let (tenpai_probs, win_probs, exp_values) =
-            project(&after, num_melds, &required, ukeire, remaining);
+            project(&after, &required, ukeire, remaining);
 
         out.push(SpCandidate {
             tile: raw,
@@ -93,8 +92,8 @@ pub fn build_sp_candidates(
 }
 
 /// The tiles that reduce this hand's shanten by one (i.e. its ukeire).
-fn required_tiles(tehai: &[u8; TILES], num_melds: usize) -> Vec<u8> {
-    let base = shanten(tehai, num_melds);
+fn required_tiles(tehai: &[u8; TILES]) -> Vec<u8> {
+    let base = shanten(tehai);
     let mut out = Vec::new();
     for t in 0..TILES {
         if tehai[t] >= 4 {
@@ -102,15 +101,19 @@ fn required_tiles(tehai: &[u8; TILES], num_melds: usize) -> Vec<u8> {
         }
         let mut probe = *tehai;
         probe[t] += 1;
-        if shanten(&probe, num_melds) < base {
+        if shanten(&probe) < base {
             out.push(t as u8);
         }
     }
     out
 }
 
-fn shanten(tehai: &[u8; TILES], num_melds: usize) -> i8 {
-    riichienv_core::shanten::calc_shanten_from_counts(tehai, num_melds as u8)
+/// `tehai_len_div3` here is the concealed hand length divided by three, which
+/// is what `calc_shanten_from_counts` expects. Passing the meld count instead
+/// mis-sizes the lookup and can report a tenpai that does not exist.
+fn shanten(tehai: &[u8; TILES]) -> i8 {
+    let total: usize = tehai.iter().map(|&c| c as usize).sum();
+    riichienv_core::shanten::calc_shanten_from_counts(tehai, (total / 3) as u8)
 }
 
 /// Project tenpai/win/EV per turn from the ukeire count.
@@ -120,7 +123,6 @@ fn shanten(tehai: &[u8; TILES], num_melds: usize) -> i8 {
 /// meaningful" — `encode_sp_table` stops writing at the first zero.
 fn project(
     tehai: &[u8; TILES],
-    num_melds: usize,
     required: &[u8],
     ukeire: u32,
     remaining: u8,
@@ -129,7 +131,7 @@ fn project(
     let mut win_probs = vec![0.0f32; MAX_NUM_TURNS];
     let mut exp_values = vec![0.0f32; MAX_NUM_TURNS];
 
-    let already = shanten(tehai, num_melds) <= 0;
+    let already = shanten(tehai) <= 0;
     let wall = remaining.max(1) as f32;
 
     // Expected number of winning tiles drawn over `n` draws, hypergeometric.

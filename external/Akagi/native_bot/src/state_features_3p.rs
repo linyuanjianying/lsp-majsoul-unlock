@@ -281,6 +281,35 @@ impl MortalSeatView {
             self.waits[(w as usize).min(T - 1)] = true;
         }
 
+        // -- discard quality flags -----------------------------------------
+        // Same meaning as the 4-player builder: a discard that does not
+        // increase shanten, and one that reaches tenpai outright.
+        if self.can_discard {
+            let base = self.shanten;
+            let mut seen: Vec<u8> = Vec::new();
+            for &raw in &self.discard_candidates {
+                let tid = mortal_obs_deaka(raw);
+                if seen.contains(&(tid as u8)) || self.tehai[tid] == 0 {
+                    continue;
+                }
+                seen.push(tid as u8);
+                let mut after = self.tehai;
+                after[tid] -= 1;
+                let s_after = crate::state_features::shanten_for(&after);
+                if s_after <= base {
+                    self.keep_shanten_discards.push(raw);
+                    if s_after == 0 && crate::state_features::has_any_wait_for(&after) {
+                        self.unconditional_tenpai_discards.push(raw);
+                    }
+                }
+            }
+            self.next_shanten_discards = self.keep_shanten_discards.clone();
+        }
+
+        // -- kan-select flag -------------------------------------------------
+        self.at_kan_select = !self.ankan_candidates.is_empty()
+            || !self.kakan_candidates.is_empty();
+
         if let Some((_, tile)) = state.last_discard {
             self.last_kawa_tile = Some(KawaItem {
                 tile: mortal_obs_deaka(tile),
