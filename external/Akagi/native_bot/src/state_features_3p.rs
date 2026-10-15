@@ -25,10 +25,34 @@ fn rel3(pid: u8, seat: u8) -> usize {
 /// `tehai_len_div3` is the hand *length* divided by three (4 for a full
 /// 13/14-tile hand), not the number of called melds - `calc_shanten_from_counts`
 /// uses it to decide whether chiitoitsu/kokushi are worth testing.
+///
+/// Callers pass the **13-tile** hand: libriichi computes shanten before the drawn
+/// tile is folded in, so a 14-tile vector must be reduced first. See
+/// [`shanten_from_hand_vec`].
 fn shanten_3p(tehai: &[u8; T]) -> u8 {
     let len: usize = tehai.iter().map(|&c| c as usize).sum();
     let s = riichienv_core::shanten::calc_shanten_from_counts_3p(tehai, (len / 3) as u8);
     s.clamp(0, 6) as u8
+}
+
+/// Shanten of a raw hand vector (tile ids 0..135) with the drawn tile removed.
+///
+/// libriichi's `PlayerState.shanten` is maintained from the 3n+1 hand, i.e. it
+/// excludes the freshly drawn tile. Computing it on the 3n+2 hand can read one
+/// lower (the drawn tile completes a set), which is what the sanma parity
+/// fixture showed on two of its eight cases.
+fn shanten_from_hand_vec(hand: &[u8], drawn: Option<u8>) -> u8 {
+    let mut counts = [0u8; T];
+    for &t in hand {
+        counts[mortal_obs_deaka(t)] += 1;
+    }
+    if let Some(d) = drawn {
+        let i = mortal_obs_deaka(d);
+        if counts[i] > 0 {
+            counts[i] -= 1;
+        }
+    }
+    shanten_3p(&counts)
 }
 
 /// Per-discard tedashi flags for every seat, reconstructed from the state's
@@ -184,11 +208,12 @@ impl MortalSeatView {
                 &tedashi,
                 &player.discard_is_riichi,
             );
-            v.kawa_overview[r] = player
-                .discards
-                .iter()
-                .map(|&t| mortal_obs_deaka(t) as u8)
-                .collect();
+            // NOTE: `kawa_overview` holds *raw* tile ids (0..135), because
+            // `encode_tile_set` de-akas its input. The 4-player builder stores
+            // de-aka'd ids, matching its own reference; the sanma reference was
+            // captured from `libriichi3p`, which expects raw ids. The two forks
+            // genuinely differ here, so this stays asymmetric on purpose.
+            v.kawa_overview[r] = player.discards.clone();
 
             let (fuuro, ankan) = crate::mortal_obs::split_melds(&player.melds);
             v.fuuro_overview[r] = fuuro;
@@ -234,7 +259,9 @@ impl MortalSeatView {
 
         let me = &state.players[seat as usize];
         v.at_furiten = !me.forbidden_discards.is_empty();
-        v.shanten = shanten_3p(&v.tehai);
+        // libriichi keeps `shanten` from the 3n+1 hand, so the drawn tile is
+        // excluded even though `tehai` (the encoded feature) includes it.
+        v.shanten = shanten_from_hand_vec(&me.hand, state.drawn_tile);
 
         v
     }
@@ -298,12 +325,11 @@ impl MortalSeatView {
                 let s_after = crate::state_features::shanten_for(&after);
                 if s_after <= base {
                     self.keep_shanten_discards.push(raw);
-                    if s_after == 0 && crate::state_features::has_any_wait_for(&after) {
-                        self.unconditional_tenpai_discards.push(raw);
-                    }
+                }
+                if s_after == 0 && crate::state_features::has_any_wait_for(&after) {
+                    self.unconditional_tenpai_discards.push(raw);
                 }
             }
-            self.next_shanten_discards = self.keep_shanten_discards.clone();
         }
 
         // -- kan-select flag -------------------------------------------------

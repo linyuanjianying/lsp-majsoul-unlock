@@ -498,13 +498,20 @@ impl MortalSeatView {
         }
 
         // -- discard quality flags -----------------------------------------
-        // These mirror libriichi's `PlayerState` fields of the same name, which
-        // it derives from the same shanten routine. A discard "keeps shanten"
-        // when removing it does not increase our shanten; it is an
-        // "unconditional tenpai" discard when the resulting hand is tenpai
-        // regardless of which tile we draw next (i.e. our waits are non-empty
-        // after the discard). Both are computed on the concealed hand only,
-        // matching the upstream definition.
+        // Mirrors libriichi's `PlayerState.keep_shanten_discards` and
+        // `next_shanten_discards`. The two partition the discard candidates, and
+        // the assignment is the opposite of what the names suggest at first
+        // glance — verified against the `libriichi3p` fixture:
+        //
+        //   keep shanten: discarding this leaves the hand one step *worse*
+        //                 (shanten == base + 1), but the shanten is "kept" in the
+        //                 sense that the structure is preserved.
+        //   next shanten: discarding this preserves the current shanten
+        //                 (shanten == base), so the next draw can advance it.
+        //
+        // On the fixture's case 4 (shanten 1) the reference puts 1m/2p/3p/5p/6p/
+        // 1s/2s/3s in `keep` (all of which measure 2 afterwards) and 9m/1p/4p/7p/E
+        // in `next` (all of which measure 1).
         if self.can_discard {
             let base = self.shanten;
             let mut seen: Vec<u8> = Vec::new();
@@ -519,19 +526,14 @@ impl MortalSeatView {
                 }
                 let mut after = self.tehai;
                 after[tid] -= 1;
-                // A 13-tile remainder is what shanten expects after a discard.
                 let s_after = calc_shanten(&after);
                 if s_after <= base {
                     self.keep_shanten_discards.push(raw);
-                    if s_after == 0 && has_any_wait(&after) {
-                        self.unconditional_tenpai_discards.push(raw);
-                    }
+                }
+                if s_after == 0 && has_any_wait(&after) {
+                    self.unconditional_tenpai_discards.push(raw);
                 }
             }
-            // `next_shanten_discards`: discards after which some draw still
-            // advances us. Approximated as "keeps shanten", which is the
-            // upstream meaning when no single-player table is available.
-            self.next_shanten_discards = self.keep_shanten_discards.clone();
         }
 
         // -- kan-select flag -------------------------------------------------

@@ -290,7 +290,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
     let mut p = Plane::new(layout.channels);
 
     let tehai = &view.tehai;
-
     // -- self hand thresholds -------------------------------------------
     for (tile, &count) in tehai.iter().enumerate() {
         if count > 0 {
@@ -298,7 +297,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
     }
     p.advance(4);
-
     // -- aka fives held --------------------------------------------------
     for (i, has) in view.akas_in_hand.iter().enumerate() {
         if *has {
@@ -306,7 +304,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
     }
     p.advance(3);
-
     // -- score, two planes per player -----------------------------------
     for &score in view.scores.iter().take(np) {
         p.fill(p.idx, (score.clamp(0, 100_000) as f32) / layout.score_div[0]);
@@ -314,32 +311,26 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         p.fill(p.idx, (score.clamp(0, 30_000) as f32) / layout.score_div[1]);
         p.advance(1);
     }
-
     // -- rank / kyoku one-hot --------------------------------------------
     p.fill(p.idx + view.rank.min(layout.rank_channels - 1), 1.0);
     p.advance(layout.rank_channels);
     p.fill(p.idx + (view.kyoku as usize).min(layout.kyoku_channels - 1), 1.0);
     p.advance(layout.kyoku_channels);
-
     // -- honba / kyotaku (v4: rescale only) -------------------------------
     p.fill(p.idx, view.honba.min(HONBA_CAP as u8) as f32 / HONBA_CAP as f32);
     p.advance(1);
     p.fill(p.idx, view.kyotaku.min(HONBA_CAP as u32) as f32 / HONBA_CAP as f32);
     p.advance(1);
-
     // -- round / seat wind ------------------------------------------------
     p.assign(p.idx, 27 + (view.round_wind as usize).min(3), 1.0);
     p.assign(p.idx + 1, 27 + (view.seat_wind as usize).min(3), 1.0);
     p.advance(2);
-
     // -- round progress ---------------------------------------------------
     let n = (view.round_wind as usize).min(1) * 4 + view.kyoku as usize;
     p.fill(p.idx, n.min(7) as f32 / 7.0);
     p.advance(1);
-
     // -- dora indicators ---------------------------------------------------
     encode_tile_set(&mut p, &view.dora_indicators);
-
     // -- self kawa: first 6, then last 18 ---------------------------------
     let self_kawa = &view.kawa[0];
     for item in self_kawa.iter().take(6) {
@@ -354,7 +345,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
 
     let max_kawa_len = view.kawa.iter().map(|k| k.len()).max().unwrap_or(0);
     let alpha = |turn: usize| (-0.2 * (max_kawa_len.saturating_sub(1 + turn)) as f32).exp();
-
     // -- self kawa alpha-weighted -----------------------------------------
     for (turn, item) in self_kawa.iter().enumerate() {
         if let Some(k) = item {
@@ -362,7 +352,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
     }
     p.advance(1);
-
     // -- other seats' kawa -------------------------------------------------
     for seat_kawa in view.kawa.iter().skip(1).take(np - 1) {
         for item in seat_kawa.iter().take(6) {
@@ -389,28 +378,23 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
         p.advance(3);
     }
-
     // -- tiles left ---------------------------------------------------------
     p.fill(p.idx, view.tiles_left as f32 / layout.tiles_left_div);
     p.advance(1);
-
     // -- doras owned (v4: rescale /12) --------------------------------------
     for &count in view.doras_owned.iter().take(layout.doras_owned_channels) {
         p.fill(p.idx, count.min(12) as f32 / 12.0);
         p.advance(1);
     }
-
     // -- doras unseen (v4: rescale /23) -------------------------------------
     let unseen = view.dora_indicators.len().saturating_mul(4) + 3;
     let unseen = unseen.saturating_sub(view.doras_seen as usize);
     p.fill(p.idx, unseen.min(23) as f32 / layout.doras_unseen_div);
     p.advance(1);
-
     // -- kawa overview -------------------------------------------------------
     for overview in view.kawa_overview.iter().take(np) {
         encode_tile_set(&mut p, overview);
     }
-
     // -- fuuro overview: 4 sets x 5 channels per player ----------------------
     for fuuro in view.fuuro_overview.iter().take(np) {
         for meld in fuuro.iter().take(4) {
@@ -428,7 +412,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
         p.advance((4 - fuuro.len().min(4)) * 5);
     }
-
     // -- ankan overview -------------------------------------------------------
     for kan in view.ankan_overview.iter().take(np) {
         for &raw in kan {
@@ -436,13 +419,11 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
         p.advance(1);
     }
-
     // -- tiles seen ------------------------------------------------------------
     for tile in 0..TILES {
         p.assign(p.idx, tile, view.tiles_seen[tile].min(4) as f32 / 4.0);
     }
     p.advance(1);
-
     // -- other seats' last tedashi (tile / aka / dora) --------------------------
     for item in view.last_tedashis.iter().skip(1).take(np - 1) {
         if let Some(k) = item {
@@ -456,7 +437,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
         p.advance(3);
     }
-
     // -- other seats' riichi sutehai --------------------------------------------
     for item in view.riichi_sutehais.iter().skip(1).take(np - 1) {
         if let Some(k) = item {
@@ -470,7 +450,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
         p.advance(3);
     }
-
     // -- other seats' riichi declared / accepted ---------------------------------
     for (i, &b) in view.riichi_declared.iter().skip(1).enumerate() {
         if b {
@@ -484,7 +463,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
     }
     p.advance(layout.riichi_accepted_channels);
-
     // -- self waits ---------------------------------------------------------------
     for (tile, &w) in view.waits.iter().enumerate() {
         if w {
@@ -492,17 +470,14 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
     }
     p.advance(1);
-
     // -- furiten -------------------------------------------------------------------
     if view.at_furiten {
         p.fill(p.idx, 1.0);
     }
     p.advance(1);
-
     // -- shanten one-hot (cap 6 -> 7) ------------------------------------------------
     p.fill(p.idx + (view.shanten as usize).min(SHANTEN_CAP), 1.0);
     p.advance(SHANTEN_CAP + 1);
-
     // -- self riichi accepted / at kan select -----------------------------------------
     if view.riichi_accepted[0] {
         p.fill(p.idx, 1.0);
@@ -512,7 +487,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         p.fill(p.idx, 1.0);
     }
     p.advance(1);
-
     // -- call context ------------------------------------------------------------------
     if view.can_pass {
         if let Some(k) = view.last_kawa_tile {
@@ -526,7 +500,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         }
     }
     p.advance(3);
-
     // -- decision flags ------------------------------------------------------------------
     //
     // The `*_candidates` fields hold RAW tile ids (0..135), matching the rest of
@@ -602,7 +575,6 @@ pub fn encode_mortal_obs_with(view: &MortalSeatView, layout: Layout) -> Vec<f32>
         p.fill(p.idx, 1.0);
     }
     p.advance(1);
-
     // -- v4 single-player-table tail -------------------------------------------------------
     p.fill(p.idx, (view.max_ev.clamp(0.0, 100_000.0)) / layout.score_div[0]);
     p.fill(p.idx + 1, (view.max_ev.clamp(0.0, 30_000.0)) / layout.score_div[1]);
