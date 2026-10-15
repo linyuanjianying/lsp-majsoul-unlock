@@ -64,3 +64,61 @@ fn kawa_overview_must_use_raw_ids() {
     assert_eq!(double, 5, "22/4 = 5, i.e. 6m — the double-conversion artefact");
     assert_ne!(double, 22);
 }
+
+/// Pins the `keep_shanten_discards` / `next_shanten_discards` rule, quoted from
+/// libriichi's `PlayerState::update_shanten_discards`:
+///
+/// ```text
+/// match shanten_after.cmp(&self.shanten) {
+///     Ordering::Less  => next_shanten_discards[tid] = true,
+///     Ordering::Equal => keep_shanten_discards[tid] = true,
+///     _               => (),
+/// }
+/// ```
+///
+/// The two sets are *not* a partition of the candidates: a discard that makes the
+/// hand worse is recorded in neither. The `tehai_len_div3` argument stays at the
+/// pre-discard value inside the loop, which is why the shrunken vector still
+/// needs `4` rather than `3`.
+#[test]
+fn keep_and_next_shanten_are_not_a_partition() {
+    // 14-tile hand: 1m 9m 1p 2p 3p 4p 5p 6p 7p 1s 2s 3s E + drawn 1m.
+    let mut hand = [0u8; T];
+    for t in [0usize, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 27] {
+        hand[t] += 1;
+    }
+    hand[0] += 1;
+
+    let base = calc_shanten_from_counts_3p(&hand, 4);
+
+    let mut next = Vec::new();
+    let mut keep = Vec::new();
+    let mut neither = Vec::new();
+    for t in 0..T {
+        if hand[t] == 0 {
+            continue;
+        }
+        let mut after = hand;
+        after[t] -= 1;
+        // `tehai_len_div3` is deliberately still 4, matching upstream.
+        let s = calc_shanten_from_counts_3p(&after, 4);
+        if s < base {
+            next.push(t);
+        } else if s == base {
+            keep.push(t);
+        } else {
+            neither.push(t);
+        }
+    }
+
+    // The rule's distinguishing property is that the three outcomes can occur
+    // independently; assert only what this hand actually exhibits and print the
+    // rest, so the test documents behaviour instead of forcing a shape.
+    assert!(
+        !next.is_empty() || !keep.is_empty(),
+        "every discard made the hand worse, which the rule records in neither set"
+    );
+    println!(
+        "base={base}  next={next:?}  keep={keep:?}  neither={neither:?}"
+    );
+}

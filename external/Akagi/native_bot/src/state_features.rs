@@ -194,6 +194,17 @@ fn calc_shanten(tehai: &[u8; TILES]) -> u8 {
     shanten.clamp(0, 6) as u8
 }
 
+/// Shanten with `tehai_len_div3` held at the *pre-discard* value.
+///
+/// libriichi's `update_shanten_discards` calls `shanten::calc_all(&tehai,
+/// self.tehai_len_div3)` inside the loop without recomputing the length, so the
+/// table index stays at `4` (for a full hand) even though the vector it is
+/// looking at has one fewer tile. Deriving the length from the shrunken vector
+/// instead gives `3`, which selects a different table entry.
+fn calc_shanten_same_span(tehai: &[u8; TILES]) -> i8 {
+    riichienv_core::shanten::calc_shanten_from_counts(tehai, 4)
+}
+
 /// Shanten for a sanma hand, clamped to the encoded range.
 ///
 /// Exposed for `state_features_3p` and `sp_tables` so the 3-player path uses
@@ -206,9 +217,14 @@ pub fn shanten_for(tehai: &[u8; TILES]) -> u8 {
     s.clamp(0, 6) as u8
 }
 
+/// Sanma counterpart of [`calc_shanten_same_span`]: `tehai_len_div3` stays at the
+/// pre-discard value while the vector has one fewer tile.
+pub fn shanten_same_span_3p(tehai: &[u8; TILES]) -> i8 {
+    riichienv_core::shanten::calc_shanten_from_counts_3p(tehai, 4)
+}
+
 /// [`has_any_wait`] using the sanma shanten routine.
-pub fn has_any_wait_for(tehai: &[u8; TILES]) -> bool {
-    for t in 0..TILES {
+pub fn has_any_wait_for(tehai: &[u8; TILES]) -> bool {    for t in 0..TILES {
         if tehai[t] >= 4 {
             continue;
         }
@@ -498,22 +514,24 @@ impl MortalSeatView {
         }
 
         // -- discard quality flags -----------------------------------------
-        // Mirrors libriichi's `PlayerState.keep_shanten_discards` and
-        // `next_shanten_discards`. The two partition the discard candidates, and
-        // the assignment is the opposite of what the names suggest at first
-        // glance — verified against the `libriichi3p` fixture:
+        // Verbatim from libriichi `PlayerState::update_shanten_discards`:
         //
-        //   keep shanten: discarding this leaves the hand one step *worse*
-        //                 (shanten == base + 1), but the shanten is "kept" in the
-        //                 sense that the structure is preserved.
-        //   next shanten: discarding this preserves the current shanten
-        //                 (shanten == base), so the next draw can advance it.
+        //     match shanten_after.cmp(&self.shanten) {
+        //         Ordering::Less    => next_shanten_discards[tid] = true,
+        //         Ordering::Equal   => keep_shanten_discards[tid] = true,
+        //         _                 => (),
+        //     }
         //
-        // On the fixture's case 4 (shanten 1) the reference puts 1m/2p/3p/5p/6p/
-        // 1s/2s/3s in `keep` (all of which measure 2 afterwards) and 9m/1p/4p/7p/E
-        // in `next` (all of which measure 1).
+        // So "next" means the discard *improves* the hand by one step, "keep"
+        // means it holds the current shanten, and a discard that makes things
+        // worse is recorded in neither. The two are not a partition of the
+        // candidates: a worsening discard belongs to no set.
+        //
+        // `tehai_len_div3` is constant across the loop upstream (it describes
+        // the hand's 3n+2 length, not the length after the discard), so it is
+        // passed unchanged here too.
         if self.can_discard {
-            let base = self.shanten;
+            let base = self.shanten as i8;
             let mut seen: Vec<u8> = Vec::new();
             for &raw in &self.discard_candidates {
                 let tid = crate::mortal_obs::mortal_obs_deaka(raw);
@@ -526,8 +544,10 @@ impl MortalSeatView {
                 }
                 let mut after = self.tehai;
                 after[tid] -= 1;
-                let s_after = calc_shanten(&after);
-                if s_after <= base {
+                let s_after = calc_shanten_same_span(&after);
+                if s_after < base {
+                    self.next_shanten_discards.push(raw);
+                } else if s_after == base {
                     self.keep_shanten_discards.push(raw);
                 }
                 if s_after == 0 && has_any_wait(&after) {

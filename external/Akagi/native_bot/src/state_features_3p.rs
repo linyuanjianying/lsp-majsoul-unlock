@@ -309,8 +309,9 @@ impl MortalSeatView {
         }
 
         // -- discard quality flags -----------------------------------------
-        // Same meaning as the 4-player builder: a discard that does not
-        // increase shanten, and one that reaches tenpai outright.
+        // Verbatim from libriichi `PlayerState::update_shanten_discards`; see
+        // the 4-player builder for the quoted match. "next" improves the hand,
+        // "keep" holds it, a worsening discard is in neither set.
         if self.can_discard {
             let base = self.shanten;
             let mut seen: Vec<u8> = Vec::new();
@@ -322,8 +323,10 @@ impl MortalSeatView {
                 seen.push(tid as u8);
                 let mut after = self.tehai;
                 after[tid] -= 1;
-                let s_after = crate::state_features::shanten_for(&after);
-                if s_after <= base {
+                let s_after = crate::state_features::shanten_same_span_3p(&after);
+                if s_after < base as i8 {
+                    self.next_shanten_discards.push(raw);
+                } else if s_after == base as i8 {
                     self.keep_shanten_discards.push(raw);
                 }
                 if s_after == 0 && crate::state_features::has_any_wait_for(&after) {
