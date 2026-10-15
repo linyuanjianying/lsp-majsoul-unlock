@@ -108,11 +108,32 @@ pub fn load_and_activate_pth(expected_players: u8, path: &str) -> i32 {
         return -3;
     }
     let dummy_obs = vec![0.0f32; model.meta.in_channels * MORTAL_TILE_DIM];
+    // A well-formed Mortal Q head returns values on the order of a game score
+    // (roughly -10..+10). A head bound to the wrong tensor — for example a trunk
+    // tensor picked up because the checkpoint's real head had an unexpected shape
+    // — still produces `action_space` finite floats, so length and finiteness
+    // alone cannot tell a good checkpoint from a broken binding. Bound the
+    // magnitude as well, and report the observed range on failure.
+    const SANE_Q_ABS_LIMIT: f32 = 1.0e4;
     match model.forward_logits(&dummy_obs) {
         Ok(logits)
             if logits.len() == model.meta.action_space
-                && logits.iter().all(|v| v.is_finite()) => {}
-        _ => return -4,
+                && logits.iter().all(|v| v.is_finite())
+                && logits.iter().all(|v| v.abs() <= SANE_Q_ABS_LIMIT) => {}
+        Ok(logits) => {
+            let lo = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "mortal: refusing checkpoint — Q values are out of range \
+(min={lo:.3}, max={hi:.3}, limit={SANE_Q_ABS_LIMIT}). The output head is \
+probably bound to the wrong tensor."
+            );
+            return -6;
+        }
+        Err(e) => {
+            eprintln!("mortal: forward pass failed: {e}");
+            return -4;
+        }
     }
     if let Ok(mut guard) = contract_slot(players).lock() {
         *guard = CustomContract::MortalPth(Arc::new(model));
@@ -127,16 +148,27 @@ struct FoldedConv1d {
     weight: Tensor,
     bias: Tensor,
     padding: usize,
-    /// `Some(actv)` when a BatchNorm+activation preceded this convolution in
-    /// the checkpoint (Mortal's pre-activation blocks). `forward` then applies
-    /// the activation to its input before convolving.
-    pre_actv: Option<Actv>,
+    /// `Some((actv, bn))` when a `[BatchNorm, actv]` pair preceded this
+    /// convolution (Mortal's pre-activation blocks). `forward` then applies
+    /// `bn -> actv -> conv` in that order.
+    ///
+    /// The BN affine CANNOT be folded into `weight`/`bias` here, because the
+    /// activation sits *between* the BN and the conv: `conv(actv(bn(x)))` is not
+    /// `conv_folded(actv(x))` for a nonlinear `actv`. Folding it would apply the
+    /// activation to raw, un-normalised activations — which is exactly the kind
+    /// of silent mismatch that yields plausible-looking but wrong Q values.
+    pre_actv: Option<(Actv, (Tensor, Tensor))>,
 }
 
 impl FoldedConv1d {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let x = match self.pre_actv {
-            Some(actv) => actv.apply(x)?,
+        let x = match &self.pre_actv {
+            Some((actv, (scale, shift))) => {
+                // Upstream order is `[BN, actv, Conv]`.
+                let n = x.broadcast_mul(scale)?.broadcast_add(shift)?;
+                let a = actv.apply(&n)?;
+                a
+            }
             None => x.clone(),
         };
         let y = x.conv1d(&self.weight, self.padding, 1, 1, 1)?;
@@ -452,12 +484,16 @@ impl MortalPthModel {
             h = block.forward(&h)?;
         }
 
-        // Mortal's tail: BatchNorm1d -> Conv1d -> flatten -> Linear.
+        // Mortal's tail, in upstream `ResNet.net` order:
+        //   ... [BN, actv] [Conv1d(256->32), actv] [Flatten] [Linear(1088->1024)]
+        // `PostConvStage::apply` walks that whole sequence, including the final
+        // BatchNorm1d. `try_load_standalone_bn` resolves the *same* `net.55`
+        // tensor, so applying it here as well would run the BN (and its
+        // activation) twice, exponentially inflating the trunk output. Only use
+        // it when the stage did not already consume it.
         if !self.post_conv.is_empty() {
             h = self.post_conv.apply(&h, self.actv)?;
-        }
-
-        if let Some((scale, bias)) = &self.post_bn_scale {
+        } else if let Some((scale, bias)) = &self.post_bn_scale {
             h = h.broadcast_mul(scale)?.broadcast_add(bias)?;
             h = self.actv.apply(&h)?;
         }
@@ -697,21 +733,18 @@ impl MortalPthModel {
                     Tensor::zeros((out_channels,), DType::F32, dev)?
                 };
 
-                // candle has no BatchNorm1d builder here, so fold it by hand.
-                // `eps` is 1e-5 for v1/v2 and 1e-3 for v3/v4 (the model builder
-                // passes `eps=1e-3` for versions 3 and 4); the caller selects
-                // the matching `actv`, and `norm_eps` below mirrors that split.
+                // The BN affine stays separate: the activation sits between the
+                // BN and the convolution, so folding BN into the weights would
+                // change the function (see `FoldedConv1d::pre_actv`).
                 let std = (var + norm_eps(actv))?.sqrt()?;
-                let scale = (&gamma / &std)?;
-                let scale_3d = scale.reshape((out_channels, 1, 1))?;
-                let folded_w = w.broadcast_mul(&scale_3d)?;
-                let folded_b =
-                    (((&conv_b - &mean)? * &scale)? + &beta)?.reshape((1, out_channels, 1))?;
+                let scale = (&gamma / &std)?.reshape((1, out_channels, 1))?;
+                let shift =
+                    (&beta - (&mean * (&gamma / &std)?)?)?.reshape((1, out_channels, 1))?;
                 return Ok(FoldedConv1d {
-                    weight: folded_w,
-                    bias: folded_b,
+                    weight: w,
+                    bias: conv_b.reshape((1, out_channels, 1))?,
                     padding,
-                    pre_actv: Some(actv),
+                    pre_actv: Some((actv, (scale, shift))),
                 });
             }
         }
@@ -801,10 +834,18 @@ impl MortalPthModel {
                     let conv2 = Self::fold_conv_with_bn(&sub, c2_p, &bn2_p, channels, dev, actv)?;
                     // In real Mortal checkpoints the channel attention is a
                     // SIBLING of `res_unit` (e.g. `encoder.net.N.ca...`), not a
-                    // child, so look it up in both the block and its parent.
+                    // child, so it is only reachable from the *parent* scope.
+                    // `sub` points at `<bp>` itself, so the second probe has to
+                    // strip the trailing `.res_unit` segment rather than re-apply
+                    // the same prefix (which would search the same place twice
+                    // and always miss).
+                    let parent = bp.rsplit_once('.').map(|(head, _)| head.to_string());
                     let ca = match Self::try_load_ca(&sub)? {
                         Some(ca) => Some(ca),
-                        None => Self::try_load_ca(&vb.pp(bp.clone()))?,
+                        None => match parent {
+                            Some(p) => Self::try_load_ca(&vb.pp(p))?,
+                            None => None,
+                        },
                     };
                     return Ok(Some(ResBlock { conv1, conv2, ca }));
                 }
@@ -1026,118 +1067,159 @@ impl MortalPthModel {
         conv_channels: usize,
         action_space: usize,
     ) -> CandleResult<(Option<(Tensor, Tensor)>, OutputHead)> {
+        // The output head MUST come from the DQN scope. Searching `brain_vb`
+        // (the trunk) as a fallback is how a checkpoint whose head does not match
+        // the expected shape ends up silently bound to an unrelated 2-D trunk
+        // tensor: the loader reports success, and inference returns garbage.
+        //
+        // A real Mortal DQN head is one of:
+        //   v4+      `net`         -> [1 + ACTION_SPACE, F]
+        //   v2/v3    `v_head`/`a_head` (or `v_a`) -> [1, F] and [ACTION_SPACE, F]
+        //   exported `head`/`policy`/... -> [ACTION_SPACE, F]
+        //
+        // Anything else is a hard error that names what was found, so the message
+        // is actionable instead of a silently bad game.
+        let _ = brain_vb;
         let mut head_fc1 = None;
         for fc1_p in ["v_a.0", "fc1", "fc", "net.0", "0"] {
             let wk = format!("{fc1_p}.weight");
             let bk = format!("{fc1_p}.bias");
-            for vb in [dqn_vb, brain_vb] {
-                if vb.contains_tensor(&wk) && vb.contains_tensor(&bk) {
-                    if let Ok(w) = vb.get_unchecked_dtype(&wk, DType::F32) {
-                        if w.dims().len() == 2
-                            && w.dims()[0] != action_space + 1
-                            && w.dims()[0] != action_space
-                            && w.dims()[0] != 1
-                        {
-                            let b = vb
-                                .get_unchecked_dtype(&bk, DType::F32)?
-                                .reshape((1, w.dims()[0]))?;
-                            head_fc1 = Some((w, b));
-                            break;
-                        }
+            if dqn_vb.contains_tensor(&wk) && dqn_vb.contains_tensor(&bk) {
+                if let Ok(w) = dqn_vb.get_unchecked_dtype(&wk, DType::F32) {
+                    if w.dims().len() == 2
+                        && w.dims()[0] != action_space + 1
+                        && w.dims()[0] != action_space
+                        && w.dims()[0] != 1
+                    {
+                        let b = dqn_vb
+                            .get_unchecked_dtype(&bk, DType::F32)?
+                            .reshape((1, w.dims()[0]))?;
+                        head_fc1 = Some((w, b));
+                        break;
                     }
                 }
             }
-            if head_fc1.is_some() {
-                break;
-            }
         }
 
+        // --- 1. Dueling, combined: one [1 + ACTION_SPACE, F] matrix -------------
         for p in ["v_a", "v_a.2", "v_a.1", "net", "head", "out", "fc_out", "2", "1", "0"] {
             let wk = format!("{p}.weight");
             let bk = format!("{p}.bias");
-            for vb in [dqn_vb, brain_vb] {
-                if vb.contains_tensor(&wk) && vb.contains_tensor(&bk) {
-                    let w = vb.get_unchecked_dtype(&wk, DType::F32)?;
-                    if w.dims().len() == 2 && w.dims()[0] == action_space + 1 {
-                        let feat_dim = w.dims()[1];
-                        let b = vb
-                            .get_unchecked_dtype(&bk, DType::F32)?
-                            .reshape((1, action_space + 1))?;
-                        return Ok((
-                            head_fc1,
-                            OutputHead::DuelingCombined {
-                                weight: w,
-                                bias: b,
-                                action_space,
-                                feat_dim,
-                            },
-                        ));
-                    }
-                }
+            if !dqn_vb.contains_tensor(&wk) || !dqn_vb.contains_tensor(&bk) {
+                continue;
             }
+            let w = dqn_vb.get_unchecked_dtype(&wk, DType::F32)?;
+            if w.dims().len() != 2 {
+                continue;
+            }
+            if w.dims()[0] == action_space + 1 {
+                let feat_dim = w.dims()[1];
+                let b = dqn_vb
+                    .get_unchecked_dtype(&bk, DType::F32)?
+                    .reshape((1, action_space + 1))?;
+                return Ok((
+                    head_fc1,
+                    OutputHead::DuelingCombined {
+                        weight: w,
+                        bias: b,
+                        action_space,
+                        feat_dim,
+                    },
+                ));
+            }
+            // A 2-D head in the DQN scope with the wrong row count is the exact
+            // signature of a mismatched checkpoint. Refuse it loudly.
+            let found = w.dims()[0];
+            let expected = action_space + 1;
+            let hint = if found % action_space == 0 {
+                format!(
+                    " ({} = {} x {}, which looks like a sequence/multi-head output \
+rather than a single-step DQN head)",
+                    found,
+                    action_space,
+                    found / action_space
+                )
+            } else {
+                String::new()
+            };
+            return Err(candle_core::Error::Msg(format!(
+                "Mortal DQN head has the wrong shape: '{wk}' is [{found}, {}], \
+expected [{expected}, F] for a {action_space}-action dueling head{hint}. \
+This checkpoint is not a plain Mortal DQN export.",
+                w.dims()[1]
+            )));
         }
 
+        // --- 2. Dueling, split value/advantage heads ---------------------------
         for (vp, ap) in [
             ("v_head", "a_head"),
             ("v", "a"),
             ("value", "advantage"),
             ("val", "adv"),
         ] {
-            for vb in [dqn_vb, brain_vb] {
-                if vb.contains_tensor(&format!("{vp}.weight"))
-                    && vb.contains_tensor(&format!("{ap}.weight"))
-                {
-                    let v_w = vb.get_unchecked_dtype(&format!("{vp}.weight"), DType::F32)?;
-                    let v_b = vb
-                        .get_unchecked_dtype(&format!("{vp}.bias"), DType::F32)?
-                        .reshape((1, 1))?;
-                    let a_w = vb.get_unchecked_dtype(&format!("{ap}.weight"), DType::F32)?;
-                    let a_b = vb
-                        .get_unchecked_dtype(&format!("{ap}.bias"), DType::F32)?
-                        .reshape((1, action_space))?;
-                    let feat_dim = a_w.dims()[1];
-                    return Ok((
-                        head_fc1,
-                        OutputHead::DuelingSplit {
-                            v_w,
-                            v_b,
-                            a_w,
-                            a_b,
-                            feat_dim,
-                        },
-                    ));
-                }
+            let (vw, ab) = (format!("{vp}.weight"), format!("{ap}.weight"));
+            if !dqn_vb.contains_tensor(&vw) || !dqn_vb.contains_tensor(&ab) {
+                continue;
             }
+            let v_w = dqn_vb.get_unchecked_dtype(&vw, DType::F32)?;
+            let v_b = dqn_vb
+                .get_unchecked_dtype(&format!("{vp}.bias"), DType::F32)?
+                .reshape((1, 1))?;
+            let a_w = dqn_vb.get_unchecked_dtype(&ab, DType::F32)?;
+            if a_w.dims().len() != 2 || a_w.dims()[0] != action_space {
+                return Err(candle_core::Error::Msg(format!(
+                    "Mortal advantage head '{ab}' is {:?}, expected [{}, F]",
+                    a_w.dims(),
+                    action_space
+                )));
+            }
+            let a_b = dqn_vb
+                .get_unchecked_dtype(&format!("{ap}.bias"), DType::F32)?
+                .reshape((1, action_space))?;
+            let feat_dim = a_w.dims()[1];
+            return Ok((
+                head_fc1,
+                OutputHead::DuelingSplit {
+                    v_w,
+                    v_b,
+                    a_w,
+                    a_b,
+                    feat_dim,
+                },
+            ));
         }
 
+        // --- 3. Plain policy head ---------------------------------------------
         for p in ["head", "policy", "actor", "fc_out", "out", "v_a", "0", "2"] {
             let wk = format!("{p}.weight");
             let bk = format!("{p}.bias");
-            for vb in [dqn_vb, brain_vb] {
-                if vb.contains_tensor(&wk) && vb.contains_tensor(&bk) {
-                    let w = vb.get_unchecked_dtype(&wk, DType::F32)?;
-                    if w.dims().len() == 2 && w.dims()[0] == action_space {
-                        let feat_dim = w.dims()[1];
-                        let b = vb
-                            .get_unchecked_dtype(&bk, DType::F32)?
-                            .reshape((1, action_space))?;
-                        return Ok((
-                            head_fc1,
-                            OutputHead::Direct {
-                                weight: w,
-                                bias: b,
-                                feat_dim,
-                            },
-                        ));
-                    }
-                }
+            if !dqn_vb.contains_tensor(&wk) || !dqn_vb.contains_tensor(&bk) {
+                continue;
+            }
+            let w = dqn_vb.get_unchecked_dtype(&wk, DType::F32)?;
+            if w.dims().len() == 2 && w.dims()[0] == action_space {
+                let feat_dim = w.dims()[1];
+                let b = dqn_vb
+                    .get_unchecked_dtype(&bk, DType::F32)?
+                    .reshape((1, action_space))?;
+                return Ok((
+                    head_fc1,
+                    OutputHead::Direct {
+                        weight: w,
+                        bias: b,
+                        feat_dim,
+                    },
+                ));
             }
         }
 
         let _ = conv_channels;
-        Err(candle_core::Error::Msg(
-            "Unable to locate Dueling DQN or Policy output head in Mortal .pth".into(),
-        ))
+        Err(candle_core::Error::Msg(format!(
+            "No Mortal DQN output head found in the 'current_dqn' scope for a \
+{action_space}-action model. Expected a [{}x F] dueling matrix, a v_head/a_head \
+pair, or a [{action_space} x F] policy head.",
+            action_space + 1
+        )))
     }
 }
 
