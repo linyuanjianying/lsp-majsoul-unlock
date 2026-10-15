@@ -34,6 +34,9 @@ pub mod mortal;
 /// Mortal's own `[C, 34]` observation layout (libriichi parity).
 #[cfg(feature = "infer")]
 pub mod mortal_obs;
+
+/// Analytic stand-in for Mortal's precomputed single-player tables.
+pub mod sp_tables;
 /// Self-relative seat features derived from a live game state.
 #[cfg(feature = "infer")]
 pub mod state_features;

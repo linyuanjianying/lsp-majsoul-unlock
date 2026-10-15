@@ -10,7 +10,7 @@
 use riichienv_core::state::GameState;
 use riichienv_core::types::Meld;
 
-use crate::mortal_obs::{build_kawa, split_melds, KawaItem, SpCandidate, TILES};
+use crate::mortal_obs::{build_kawa_with_dora, split_melds, KawaItem, SpCandidate, TILES};
 
 /// Number of players this view supports.
 pub const NUM_PLAYERS: usize = 4;
@@ -155,15 +155,59 @@ fn rel(pid: u8, seat: u8) -> usize {
 ///
 /// riichienv's `calc_shanten_from_counts` expects `tehai_len_div3` = number of
 /// melds, i.e. how many 3-tile groups are already fixed.
+fn dora_type(raw: u8) -> usize {
+    let t = (raw / 4) as usize;
+    match t {
+        0..=8 => 9 + (t + 1) % 9,
+        9..=17 => 9 + (t - 9 + 1) % 9,
+        18..=26 => 18 + (t - 18 + 1) % 9,
+        27..=30 => 27 + (t - 27 + 1) % 4,
+        31..=33 => 31 + (t - 31 + 1) % 3,
+        _ => t.min(TILES - 1),
+    }
+}
+
+fn dora_flags(indicators: &[u8]) -> [bool; TILES] {
+    let mut flags = [false; TILES];
+    for &ind in indicators {
+        flags[dora_type(ind)] = true;
+    }
+    flags
+}
+
+fn count_doras(raw_tiles: &[u8], dora_types: &[bool; TILES]) -> u8 {
+    raw_tiles
+        .iter()
+        .filter(|&&t| dora_types[crate::mortal_obs::mortal_obs_deaka(t)])
+        .count()
+        .min(12) as u8
+}
+
 fn calc_shanten(tehai: &[u8; TILES], num_melds: usize) -> u8 {
     let shanten =
         riichienv_core::shanten::calc_shanten_from_counts(tehai, num_melds as u8);
-    // The encoder one-hots up to 6; negative means a winning hand.
     shanten.clamp(0, 6) as u8
 }
 
+/// True when a tenpai hand (shanten 0) has at least one winning tile left.
+///
+/// Used for the `unconditional_tenpai_discards` plane: a discard that leaves a
+/// hand which wins on *some* draw, independent of which tile comes next.
+fn has_any_wait(tehai: &[u8; TILES], num_melds: usize) -> bool {
+    for t in 0..TILES {
+        if tehai[t] >= 4 {
+            continue;
+        }
+        let mut probe = *tehai;
+        probe[t] += 1;
+        if calc_shanten(&probe, num_melds) == 0 {
+            return true;
+        }
+    }
+    false
+}
+
 impl MortalSeatView {
-    /// Derive the view for `seat` from a live game state.
     ///
     /// This fills the structural fields (hand, melds, kawa, tiles_seen, winds,
     /// scores). The *decision* fields (legal-action flags, shanten, waits and
@@ -179,6 +223,9 @@ impl MortalSeatView {
             seat_wind: (seat + NUM_PLAYERS as u8 - state.oya) % NUM_PLAYERS as u8,
             ..Default::default()
         };
+
+        let dora_types = dora_flags(&state.wall.dora_indicators);
+        let me = &state.players[seat as usize];
 
         // -- hands, melds, kawa, per-seat features ------------------------
         for pid in 0..NUM_PLAYERS as u8 {
@@ -197,10 +244,15 @@ impl MortalSeatView {
                 }
             }
 
-            let kawa = build_kawa(
+            let kawa = build_kawa_with_dora(
                 &player.discards,
                 &player.discard_from_hand,
                 &player.discard_is_riichi,
+                &player
+                    .discards
+                    .iter()
+                    .map(|&t| dora_types[crate::mortal_obs::mortal_obs_deaka(t)])
+                    .collect::<Vec<_>>(),
             );
             v.kawa[r] = kawa.clone();
             v.kawa_overview[r] = player
@@ -252,33 +304,87 @@ impl MortalSeatView {
         }
 
         // -- tiles seen / left --------------------------------------------
+        // `tiles_seen` is every copy of a tile the seat can account for: all
+        // four ponds, all open and concealed melds, the dora indicators, and
+        // the seat's own hand. libriichi feeds this straight into its wait and
+        // ukeire tables, so omitting our own hand would understate how dead a
+        // wait is.
         for player in state.players.iter() {
             for &t in player.discards.iter() {
-                v.tiles_seen[crate::mortal_obs::mortal_obs_deaka(t)] = v.tiles_seen
-                    [crate::mortal_obs::mortal_obs_deaka(t)]
-                .saturating_add(1);
+                let tid = crate::mortal_obs::mortal_obs_deaka(t);
+                v.tiles_seen[tid] = v.tiles_seen[tid].saturating_add(1);
             }
             for m in &player.melds {
                 for &t in &m.tiles {
-                    v.tiles_seen[crate::mortal_obs::mortal_obs_deaka(t)] = v.tiles_seen
-                        [crate::mortal_obs::mortal_obs_deaka(t)]
-                    .saturating_add(1);
+                    let tid = crate::mortal_obs::mortal_obs_deaka(t);
+                    v.tiles_seen[tid] = v.tiles_seen[tid].saturating_add(1);
                 }
             }
         }
         for &t in &v.dora_indicators {
-            v.tiles_seen[crate::mortal_obs::mortal_obs_deaka(t)] =
-                v.tiles_seen[crate::mortal_obs::mortal_obs_deaka(t)].saturating_add(1);
+            let tid = crate::mortal_obs::mortal_obs_deaka(t);
+            v.tiles_seen[tid] = v.tiles_seen[tid].saturating_add(1);
+        }
+        for &t in &me.hand {
+            let tid = crate::mortal_obs::mortal_obs_deaka(t);
+            v.tiles_seen[tid] = v.tiles_seen[tid].saturating_add(1);
         }
 
         // `tiles_left` is the live wall count; libriichi divides by 69.
         v.tiles_left = state.wall.tiles.len().min(69) as u8;
 
+        // -- dora ----------------------------------------------------------
+        // `doras_owned` counts dora among each seat's *visible* tiles (melds and
+        // pond), plus our own hand for our seat. `doras_seen` counts the
+        // indicators themselves, which is what libriichi's `doras_unseen` plane
+        // needs: `indicators * 4 + 3 - doras_seen`.
+        for pid in 0..NUM_PLAYERS as u8 {
+            let r = rel(pid, seat);
+            let player = &state.players[pid as usize];
+            let mut owned: u8 = count_doras(&player.discards, &dora_types);
+            owned = owned.saturating_add(
+                player
+                    .melds
+                    .iter()
+                    .flat_map(|m| m.tiles.iter().copied())
+                    .filter(|&t| dora_types[crate::mortal_obs::mortal_obs_deaka(t)])
+                    .count() as u8,
+            );
+            if pid == seat {
+                owned = owned.saturating_add(count_doras(&player.hand, &dora_types));
+            }
+            v.doras_owned[r] = owned.min(12);
+        }
+        v.doras_seen = state.wall.dora_indicators.len().min(5) as u8;
+        // Per-tile dora weight, used for the call-context and last-tedashi
+        // planes (`state.dora_factor` upstream).
+        for (t, slot) in v.dora_factor.iter_mut().enumerate() {
+            let mut n = 0u8;
+            for ind in &state.wall.dora_indicators {
+                if dora_type(*ind) == t {
+                    n = n.saturating_add(1);
+                }
+            }
+            *slot = n;
+        }
+
         // -- furiten -------------------------------------------------------
-        // `forbidden_discards` is exactly the set of tiles the seat may not
-        // win on, i.e. the furiten tiles.
-        let me = &state.players[seat as usize];
-        v.at_furiten = !me.forbidden_discards.is_empty();
+        // A seat is furiten when one of its own waits appears in its own pond
+        // (permanent) or when it passed on a winning tile this cycle (temporary
+        // — `missed_agari_doujun`). `forbidden_discards` is kuikae, not furiten.
+        let own_discard_types: [bool; TILES] = {
+            let mut f = [false; TILES];
+            for &t in &me.discards {
+                f[crate::mortal_obs::mortal_obs_deaka(t)] = true;
+            }
+            f
+        };
+        let wait_hits_own_pond = v
+            .waits
+            .iter()
+            .enumerate()
+            .any(|(t, &w)| w && own_discard_types[t]);
+        v.at_furiten = wait_hits_own_pond || me.missed_agari_doujun || me.missed_agari_riichi;
 
         // -- shanten -------------------------------------------------------
         // The encoder one-hots `shanten` capped at 6, and the SP-table planes
@@ -357,6 +463,69 @@ impl MortalSeatView {
         self.waits = [false; TILES];
         for &w in &obs.waits {
             self.waits[(w as usize).min(TILES - 1)] = true;
+        }
+
+        // -- discard quality flags -----------------------------------------
+        // These mirror libriichi's `PlayerState` fields of the same name, which
+        // it derives from the same shanten routine. A discard "keeps shanten"
+        // when removing it does not increase our shanten; it is an
+        // "unconditional tenpai" discard when the resulting hand is tenpai
+        // regardless of which tile we draw next (i.e. our waits are non-empty
+        // after the discard). Both are computed on the concealed hand only,
+        // matching the upstream definition.
+        if self.can_discard {
+            let num_melds = state.players[seat as usize].melds.len();
+            let base = self.shanten;
+            let mut seen: Vec<u8> = Vec::new();
+            for &raw in &self.discard_candidates {
+                let tid = crate::mortal_obs::mortal_obs_deaka(raw);
+                if seen.contains(&(tid as u8)) {
+                    continue;
+                }
+                seen.push(tid as u8);
+                if self.tehai[tid] == 0 {
+                    continue;
+                }
+                let mut after = self.tehai;
+                after[tid] -= 1;
+                // A 13-tile remainder is what shanten expects after a discard.
+                let s_after = calc_shanten(&after, num_melds);
+                if s_after <= base {
+                    self.keep_shanten_discards.push(raw);
+                    if s_after == 0 && has_any_wait(&after, num_melds) {
+                        self.unconditional_tenpai_discards.push(raw);
+                    }
+                }
+            }
+            // `next_shanten_discards`: discards after which some draw still
+            // advances us. Approximated as "keeps shanten", which is the
+            // upstream meaning when no single-player table is available.
+            self.next_shanten_discards = self.keep_shanten_discards.clone();
+        }
+
+        // -- kan-select flag -------------------------------------------------
+        // libriichi sets this while the player is choosing which kan to declare.
+        self.at_kan_select = !self.ankan_candidates.is_empty()
+            || !self.kakan_candidates.is_empty();
+
+        // -- single-player table ---------------------------------------------
+        // The last 123 channels are EV, required tiles and the per-turn
+        // tenpai/win/EV planes. Without them the model sees a block of zeros,
+        // which it reads as "no line has any value". See `crate::sp_tables`.
+        if self.can_discard {
+            let discard_raw: Vec<u8> = self
+                .discard_candidates
+                .iter()
+                .copied()
+                .collect();
+            self.sp_candidates = crate::sp_tables::build_sp_candidates(
+                &self.tehai,
+                state.players[seat as usize].melds.len(),
+                &discard_raw,
+                self.tiles_left,
+                &self.tiles_seen,
+            );
+            self.max_ev = crate::sp_tables::max_ev(&self.sp_candidates);
         }
 
         if let Some((_, tile)) = state.last_discard {
