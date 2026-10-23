@@ -52,8 +52,9 @@ local HINT_DARK = { 0.05, 0.09, 0.07 }
 local function diag(code)
     if hint.diag[code] then return end
     hint.diag[code] = true
-    local log = rawget(_G, '__majmax_ui_log')
-    if type(log) == 'function' then pcall(log, 'hint ' .. code) end
+    -- Empty id plus the dedicated "hint" state: the manager records these and
+    -- never matches them against a pending command's ordered ack sequence.
+    ack('', 'hint', code)
 end
 
 local function hintClear()
@@ -185,7 +186,17 @@ local function hintRender(command)
         end
     end
     -- One positive record per distinct snapshot: proof the overlay drew.
-    if painted > 0 then diag('PAINTED') end
+    if painted > 0 then diag('PAINTED') end  -- diag() is once-per-code
+end
+
+-- cjson is loaded lazily but must not wait for install(): the badge path runs
+-- before the autoplay wiring is verified.
+local function decoder()
+    if not A.json then
+        local ok, json = pcall(require, 'cjson')
+        if ok then A.json = json end
+    end
+    return A.json
 end
 
 local function install()
@@ -253,8 +264,7 @@ local function noteMode(mode)
     -- ordered proof for autoplay and extra entries there disturb its sequence.
     if hint.lastMode == mode then return end
     hint.lastMode = mode
-    local log = rawget(_G, '__majmax_ui_log')
-    if type(log) == 'function' then pcall(log, 'mode ' .. tostring(mode)) end
+    ack('', 'hint', 'MODE_' .. tostring(mode == nil and 'nil' or mode):gsub('[^0-9]', '0'))
 end
 
 local function continuation(command)
@@ -574,22 +584,25 @@ local function execute(command)
 end
 function __majmax_auto_tick()
     local ok = pcall(function()
-        if not install() or type(__majmax_auto_command) ~= 'function' then return end
-        local text = __majmax_auto_command()
-        if not text or text == '' then
+        local channel = type(__majmax_auto_command) == 'function'
+        local raw = channel and __majmax_auto_command() or nil
+        local json = decoder()
+        local command = (json and raw and raw ~= '') and json.decode(raw) or nil
+        if type(command) ~= 'table' then command = nil end
+        -- Badges are presentation only and must not depend on the autoplay
+        -- wiring below: an uninstalled network hook or a missing command
+        -- channel would otherwise silently take the overlay down with it.
+        if command == nil or command.control ~= 'mode' then
+            pcall(hintRender, command)
+        end
+        if not install() or not channel then return end
+        if command == nil then
             A.armed = false; A.continuation = nil; A.resyncDue = nil
-            pcall(hintRender, nil)
             return
         end
-        local command = A.json.decode(text)
-        if type(command) == 'table' then
-            -- Badges are refreshed for every snapshot, before any autoplay
-            -- decision, and must never break the command path below.
-            if command.control ~= 'mode' then pcall(hintRender, command) end
-            A.armed = (command.control == 'mode' and command.enabled == true) or command.unattended == true
-            continuation(command)
-            if command.control ~= 'mode' then execute(command) end
-        end
+        A.armed = (command.control == 'mode' and command.enabled == true) or command.unattended == true
+        continuation(command)
+        if command.control ~= 'mode' then execute(command) end
     end)
     if not ok then ack('', 'adapter_exception') end
 end

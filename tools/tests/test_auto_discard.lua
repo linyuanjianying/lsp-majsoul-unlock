@@ -6,6 +6,9 @@ local function fixture()
     UnityEngine={Time={realtimeSinceStartup=0}}
     UI_Win=nil; UI_HuleShow=nil; UI_ScoreChange=nil; UI_ConfirmNewRound=nil; UI_HangUpWarn=nil
     local state = { sent = {}, acks = {}, current = true }
+    -- autoplay assertions index acks by command sequence; overlay diagnostics
+    -- use an empty id and would shift those indices.
+    local _ack = nil
     local function view(name)
         return { valid=true, is_open=false, pai={ToString=function() return name end}, transform={} }
     end
@@ -15,7 +18,10 @@ local function fixture()
     state.command = {id='one',step=3,seat=0,hand={'5m','5mr','9p'},gameTile='0m',tsumogiri=false,
         action={kind='discard',type=1,tile='0m',moqie=false,method='inputOperation'},
         autoContext={wind='E',kyoku=1,honba=0}}
-    cjson = {encode=function(value) state.acks[#state.acks+1]=value; return 'ack' end,
+    -- Overlay diagnostics arrive as state "hint" with an empty id; they are not
+    -- command acknowledgements and must not be counted as such.
+    cjson = {encode=function(value) if type(value)=='table' and value.state=='hint' then return 'ack' end
+        state.acks[#state.acks+1]=value; return 'ack' end,
         decode=function() return state.command end}
     package.loaded.cjson = cjson
     __majmax_auto_command = function() return state.leaseExpired and '' or 'command' end

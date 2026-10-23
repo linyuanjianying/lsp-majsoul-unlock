@@ -256,6 +256,13 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                     if (enabled) suspend("游戏反馈为手动操作，撤销当前指令并等待重新同步")
                     continue
                 }
+                // The overlay reports its own state on a dedicated "hint" state
+                // with an empty id. Record it; never match it against a command.
+                if (ack.optString("state") == "hint") {
+                    val code = ack.optString("reason")
+                    log(code.takeIf { it.matches(Regex("[A-Z0-9_]{2,48}")) } ?: "HINT_UNKNOWN")
+                    continue
+                }
                 if (ack.optString("id") != pending?.optString("id")) continue
                 when (ack.optString("state")) {
                     "probe" -> { log("CLAIM_PROBE ${ack.optString("reason")}") }
