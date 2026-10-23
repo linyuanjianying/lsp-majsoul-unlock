@@ -34,6 +34,118 @@ local function tile(value)
     if value:match('^5[mps]r$') then return '0'..value:sub(2,2) end
     if value:match('^[1-9][mps]$') then return value end
 end
+
+-- Recommendation badges painted on the hand tiles. Pure presentation: nothing
+-- here feeds back into the autoplay path, and every failure degrades to "no
+-- badge" rather than throwing into the decision code.
+local hint = { owned = {}, signature = nil, last = 0 }
+-- Ranked colours, best first; index 1..3 matches recommendation rank.
+local HINT_COLORS = {
+    { 1.00, 0.84, 0.33 }, -- gold: best discard
+    { 0.40, 0.72, 1.00 }, -- blue: runner-up
+    { 0.62, 0.85, 0.98 }, -- pale blue: third
+}
+local HINT_DARK = { 0.05, 0.09, 0.07 }
+
+local function hintClear()
+    for _, badge in ipairs(hint.owned) do
+        pcall(function()
+            if not badge then return end
+            -- Unity's Destroy is delayed by a frame; deactivate first so a
+            -- stale badge can never show next to a live one.
+            if badge.SetActive then badge:SetActive(false) end
+            local destroy = (rawget(_G, 'CS') or {}).UnityObject
+            destroy = destroy and destroy.Destroy
+            if destroy then destroy(badge)
+            elseif rawget(_G, 'Object') and Object.Destroy then Object.Destroy(badge) end
+        end)
+    end
+    hint.owned = {}
+    hint.signature = nil
+end
+
+-- Resolve the n-th hand view showing `name`, counting only tiles that are
+-- actually visible; duplicates in hand are ordered left to right.
+local function hintTarget(views, name, ordinal)
+    local seen = 0
+    for _, view in ipairs(views) do
+        local ok, value = pcall(function() return view.pai:ToString() end)
+        if ok and value == name and view.valid ~= false and not view.is_open then
+            if seen == (ordinal or 0) then return view end
+            seen = seen + 1
+        end
+    end
+end
+
+-- xLua injects `typeof`; resolve it defensively so a missing global can never
+-- take the whole tick down.
+local function unityType(value)
+    local kind = rawget(_G, 'typeof')
+    return kind and kind(value) or value
+end
+
+-- Unity's uGUI lives under CS.UnityEngine.UI; some xLua setups also alias a
+-- top-level CS.UI. Resolve once and reuse so a missing namespace degrades to
+-- "no badge" instead of an error.
+local function unityUI()
+    local engine = rawget(_G, 'CS')
+    engine = engine and engine.UnityEngine
+    local ui = engine and engine.UI
+    return ui and ui.Text and ui or nil
+end
+
+local function hintBadge(root, percent, color)
+    local ui = unityUI()
+    if not ui then return nil end
+    local view = CS.UnityEngine.GameObject('MajsoulMaxHint')
+    local rect = view:AddComponent(unityType(CS.UnityEngine.RectTransform))
+    rect:SetParent(root, false)
+    -- Sit on the tile's head: centred horizontally, anchored to the top edge.
+    rect.anchorMin = CS.UnityEngine.Vector2(0.5, 1)
+    rect.anchorMax = CS.UnityEngine.Vector2(0.5, 1)
+    rect.sizeDelta = CS.UnityEngine.Vector2(46, 20)
+    rect.anchoredPosition = CS.UnityEngine.Vector2(0, -12)
+    local text = view:AddComponent(unityType(ui.Text))
+    text.text = percent or ''
+    text.fontSize = 16
+    text.fontStyle = CS.UnityEngine.FontStyle.Bold
+    text.alignment = CS.UnityEngine.TextAnchor.MiddleCenter
+    text.color = CS.UnityEngine.Color(HINT_DARK[1], HINT_DARK[2], HINT_DARK[3], 1)
+    view:AddComponent(unityType(ui.Outline)).effectColor =
+        CS.UnityEngine.Color(color[1], color[2], color[3], 0.9)
+    return view
+end
+
+-- Redraw the hand badges for `command`. Called on the main thread from tick.
+local function hintRender(command)
+    local d = DesktopMgr and DesktopMgr.Inst
+    local r = d and d.mainrole
+    if not r or not r._handpai then return end
+    local rows = command and command.recommendations
+    local signature = ''
+    if type(rows) == 'table' then
+        for _, row in ipairs(rows) do
+            signature = signature .. tostring(row.kind) .. ':' .. tostring(row.tile)
+                .. ':' .. tostring(row.handOrdinal) .. ':' .. tostring(row.percent) .. ';'
+        end
+    end
+    if signature == hint.signature then return end
+    hintClear()
+    hint.signature = signature
+    if type(rows) ~= 'table' then return end
+    for _, row in ipairs(rows) do
+        local rank = tonumber(row.rank) or 0
+        if rank < 3 and (row.kind == 'discard' or row.kind == 'riichi') then
+            local name = tile(row.tile)
+            local target = name and hintTarget(r._handpai, name, tonumber(row.handOrdinal))
+            if target and target.transform then
+                local view = hintBadge(target.transform, row.percent, HINT_COLORS[rank + 1])
+                if view then hint.owned[#hint.owned + 1] = view end
+            end
+        end
+    end
+end
+
 local function install()
     if not A.json then local ok, json = pcall(require, 'cjson'); if ok then A.json = json end end
     if not A.json or not MJNetMgr or type(MJNetMgr.SendRequest) ~= 'function' then return false end
@@ -399,9 +511,16 @@ function __majmax_auto_tick()
     local ok = pcall(function()
         if not install() or type(__majmax_auto_command) ~= 'function' then return end
         local text = __majmax_auto_command()
-        if not text or text == '' then A.armed = false; A.continuation = nil; A.resyncDue = nil; return end
+        if not text or text == '' then
+            A.armed = false; A.continuation = nil; A.resyncDue = nil
+            pcall(hintRender, nil)
+            return
+        end
         local command = A.json.decode(text)
         if type(command) == 'table' then
+            -- Badges are refreshed for every snapshot, before any autoplay
+            -- decision, and must never break the command path below.
+            if command.control ~= 'mode' then pcall(hintRender, command) end
             A.armed = (command.control == 'mode' and command.enabled == true) or command.unattended == true
             continuation(command)
             if command.control ~= 'mode' then execute(command) end

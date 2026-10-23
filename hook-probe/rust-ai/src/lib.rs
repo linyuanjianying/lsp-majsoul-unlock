@@ -205,6 +205,7 @@ impl Assistant {
             }
         }
         let own = &snap.players[seat as usize];
+        decorate_recommendations(&mut recommendations, &own.tehai);
         // NewGame sorts all 14 opening tiles before assigning its UI last tile.
         // The bridge's virtual dealer draw may therefore have a different identity.
         // This exception ends as soon as any discard, meld or kita is observed.
@@ -232,6 +233,34 @@ impl Assistant {
                 "drawnTile":own.drawn_tile,"riichi":own.riichi_declared || own.riichi_stage,
                 "phase":snap.phase,"melds":own.melds},
         }))
+    }
+}
+
+/// Number a recommendation card: rank, slot in the hand, and an ordinal that
+/// disambiguates duplicated tiles so the game-side overlay can paint exactly
+/// one tile per card. `hand` is the mjai tehai as the HUD lists it.
+fn decorate_recommendations(recommendations: &mut [Value], hand: &[String]) {
+    let mut used = vec![false; hand.len()];
+    for (rank, row) in recommendations.iter_mut().enumerate() {
+        let tile = match row.get("tile").and_then(Value::as_str) {
+            Some(value) if !value.is_empty() => value.to_string(),
+            _ => continue,
+        };
+        let slot = hand
+            .iter()
+            .enumerate()
+            .find(|(index, held)| !used[*index] && **held == tile)
+            .map(|(index, _)| index);
+        let Some(slot) = slot else { continue };
+        used[slot] = true;
+        // The game-side view picks the n-th visible tile matching `tile`.
+        let ordinal = hand[..=slot].iter().filter(|held| **held == tile).count() - 1;
+        row["rank"] = json!(rank);
+        row["handIndex"] = json!(slot);
+        row["handOrdinal"] = json!(ordinal);
+        if let Some(probability) = row.get("policyProbability").and_then(Value::as_f64) {
+            row["percent"] = json!(format!("{:.1}%", (probability * 1000.0).round() / 10.0));
+        }
     }
 }
 
@@ -551,6 +580,38 @@ mod tests {
         if first["kind"] == "discard" || first["kind"] == "riichi" {
             assert!(result["hand"].as_array().unwrap().contains(&first["tile"]));
         }
+    }
+
+    #[test]
+    fn recommendation_badges_pick_distinct_hand_slots() {
+        let hand: Vec<String> = ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "5s", "5s"]
+            .iter().map(|tile| tile.to_string()).collect();
+        let mut rows = vec![
+            json!({"kind":"discard","tile":"5s","policyProbability":0.947}),
+            json!({"kind":"discard","tile":"5s","policyProbability":0.023}),
+            json!({"kind":"discard","tile":"1m","policyProbability":0.012}),
+            json!({"kind":"pass","tile":"","policyProbability":0.001}),
+        ];
+        decorate_recommendations(&mut rows, &hand);
+        // Duplicated tiles must land on different slots, in hand order.
+        assert_eq!(rows[0]["handOrdinal"], 0);
+        assert_eq!(rows[0]["handIndex"], 12);
+        assert_eq!(rows[1]["handOrdinal"], 1);
+        assert_eq!(rows[1]["handIndex"], 13);
+        assert_eq!(rows[0]["percent"], "94.7%");
+        assert_eq!(rows[1]["percent"], "2.3%");
+        assert_eq!(rows[2]["handIndex"], 0);
+        // A tile that is not in hand carries no badge fields.
+        assert!(rows[3].get("handIndex").is_none());
+        assert!(rows[3].get("rank").is_none());
+    }
+
+    #[test]
+    fn unheld_discard_is_never_badged() {
+        let hand: Vec<String> = ["1m", "2m"].iter().map(|tile| tile.to_string()).collect();
+        let mut rows = vec![json!({"kind":"discard","tile":"9p","policyProbability":0.5})];
+        decorate_recommendations(&mut rows, &hand);
+        assert!(rows[0].get("handIndex").is_none());
     }
 
     #[test]
