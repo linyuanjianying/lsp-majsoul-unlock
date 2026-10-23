@@ -3,6 +3,7 @@ package com.yefeng.majmax.hookprobe.manager
 import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
@@ -163,13 +164,31 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     }
 
     /** Queue one command; a repeat inside the polling window uses no random delay. */
+    /** Only the fields the deck overlay reads: three ranked rows, no analysis. */
+    private fun hintRows(result: JSONObject): JSONArray {
+        val rows = result.optJSONArray("recommendations") ?: return JSONArray()
+        val trimmed = JSONArray()
+        for (index in 0 until minOf(3, rows.length())) {
+            val row = rows.optJSONObject(index) ?: continue
+            trimmed.put(JSONObject().apply {
+                put("kind", row.optString("kind"))
+                put("tile", row.optString("tile"))
+                put("percent", row.optString("percent"))
+            })
+        }
+        return trimmed
+    }
+
     private fun enqueue(result: JSONObject, action: JSONObject, delay: Long) {
         pending = null
         wireConfirmed = false; submitted = false; accepted = false
         pendingAt = now()
         notBefore = pendingAt + delay
         pending = JSONObject(result.toString()).apply {
-            remove("analysis"); remove("recommendations"); remove("input")
+            remove("analysis"); remove("input")
+            // The game-side deck badges are drawn from these rows alone; the
+            // payload is trimmed to what the overlay reads.
+            put("recommendations", hintRows(result))
             put("id", "$serial-${++count}")
             put("action", action)
             put("delayMs", delay)

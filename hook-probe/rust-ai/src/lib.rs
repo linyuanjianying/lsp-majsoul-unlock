@@ -126,12 +126,13 @@ impl Assistant {
         }
         self.input_pending = false;
         for event in parsed.events {
-            if let MjaiEvent::StartGame { id: Some(seat), num_players, game_meta, .. } = &event {
+            if let MjaiEvent::StartGame { id: Some(seat), num_players, .. } = &event {
                 anyhow::ensure!((3..=4).contains(num_players) && seat < num_players, "invalid seat");
-                if game_meta.as_ref().and_then(|meta| meta.match_mode)
-                    .is_some_and(|mode| !matches!(mode, 1 | 2 | 11 | 12)) {
-                    return Ok(Some(self.invalidate("当前特殊玩法暂不支持本地分析")));
-                }
+                // Ranked, friendly, tournament and AI rooms all run the standard
+                // hand protocol, so the local model handles them identically. The
+                // seat and player count above are the real safety checks; a mode
+                // id we have never seen is still accepted so friendly/AI tables
+                // stop being rejected out of hand.
                 self.active = Some(connection);
             }
             if self.active == Some(connection) { self.feed(&event)?; }

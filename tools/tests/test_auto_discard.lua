@@ -154,8 +154,11 @@ test('manual network input is reported and preserves callback',function(s)
     local result=MJNetMgr.Inst:SendRequest('FastTest','inputChiPengGang',{},function() called=true end)
     assert(result=='original' and called and s.acks[#s.acks].state=='manual')
 end)
-test('unsupported modes never execute',function(s)
-    DesktopMgr.Inst.game_config.mode.mode=5; __majmax_auto_tick(); assert(#s.sent==0)
+test('friendly and AI rooms drive the same as ranked',function(s)
+    for _,mode in ipairs({1,2,3,4,5,11,12}) do
+        s=fixture(); DesktopMgr.Inst.game_config.mode.mode=mode
+        __majmax_auto_tick(); assert(#s.sent==1, 'mode '..mode..' did not execute')
+    end
 end)
 local function operation(s,kind,op,combo)
     s.command.action={kind=kind,type=op,index=0,target=3,tile='3m',combination=combo,method='inputChiPengGang'}

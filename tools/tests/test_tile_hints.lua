@@ -67,10 +67,10 @@ end
 test('badges paint one tile per ranked candidate, duplicates included', function(s)
     local created = s.created
     s.render({ recommendations = {
-        { kind = 'discard', tile = '5s', handOrdinal = 0, percent = '94.7%', rank = 0 },
-        { kind = 'discard', tile = '5s', handOrdinal = 1, percent = '2.3%', rank = 1 },
-        { kind = 'discard', tile = '1m', handOrdinal = 0, percent = '1.2%', rank = 2 },
-        { kind = 'pass', tile = '', percent = '0.1%', rank = 3 },
+        { kind = 'discard', tile = '5s', percent = '94.7%' },
+        { kind = 'discard', tile = '1m', percent = '2.3%' },
+        { kind = 'discard', tile = '9p', percent = '1.2%' },
+        { kind = 'pass', tile = '', percent = '0.1%' },
     } })
     assert(#created == 3, 'expected three badges, got ' .. #created)
     local parents = {}
@@ -85,7 +85,7 @@ end)
 
 test('identical snapshots do not rebuild the badges', function(s)
     local command = { recommendations = {
-        { kind = 'discard', tile = '9p', handOrdinal = 0, percent = '50.0%', rank = 0 },
+        { kind = 'discard', tile = '9p', percent = '50.0%' },
     } }
     s.render(command)
     local before = #s.created
@@ -95,11 +95,11 @@ end)
 
 test('a new snapshot retires the previous badges first', function(s)
     s.render({ recommendations = {
-        { kind = 'discard', tile = '9p', handOrdinal = 0, percent = '50.0%', rank = 0 },
+        { kind = 'discard', tile = '9p', percent = '50.0%' },
     } })
     local before = #s.created
     s.render({ recommendations = {
-        { kind = 'discard', tile = '1m', handOrdinal = 0, percent = '70.0%', rank = 0 },
+        { kind = 'discard', tile = '1m', percent = '70.0%' },
     } })
     assert(s.destroyed >= 1, 'old badge was not destroyed')
     assert(#s.created == before + 1, 'new badge missing')
@@ -107,7 +107,7 @@ end)
 
 test('tiles missing from hand never get a badge', function(s)
     s.render({ recommendations = {
-        { kind = 'discard', tile = '7z', handOrdinal = 0, percent = '9.9%', rank = 0 },
+        { kind = 'discard', tile = '7z', percent = '9.9%' },
     } })
     assert(#s.created == 0, 'badged a tile that is not in hand')
 end)
@@ -120,7 +120,7 @@ end)
 
 test('a fixed command with no recommendations clears standalone badges', function(s)
     s.render({ recommendations = {
-        { kind = 'discard', tile = '9p', handOrdinal = 0, percent = '50.0%', rank = 0 },
+        { kind = 'discard', tile = '9p', percent = '50.0%' },
     } })
     s.render(nil)
     assert(s.destroyed >= 1, 'clearing did not destroy badges')

@@ -35,10 +35,9 @@ local function tile(value)
     if value:match('^[1-9][mps]$') then return value end
 end
 
--- Recommendation badges painted on the hand tiles. Pure presentation: nothing
--- here feeds back into the autoplay path, and every failure degrades to "no
--- badge" rather than throwing into the decision code.
-local hint = { owned = {}, signature = nil, last = 0 }
+-- Recommendation badges painted on the hand tiles. Presentation only: nothing
+-- here feeds the autoplay path, and every failure degrades to "no badge".
+local hint = { owned = {}, signature = false, diag = {}, diagAt = 0 }
 -- Ranked colours, best first; index 1..3 matches recommendation rank.
 local HINT_COLORS = {
     { 1.00, 0.84, 0.33 }, -- gold: best discard
@@ -47,12 +46,20 @@ local HINT_COLORS = {
 }
 local HINT_DARK = { 0.05, 0.09, 0.07 }
 
+-- Diagnostics use the read-only log channel: the ack channel carries ordered
+-- autoplay proof and must not gain extra entries. Codes are fixed strings, so
+-- no tiles, account data or payloads can leak.
+local function diag(code)
+    if hint.diag[code] then return end
+    hint.diag[code] = true
+    local log = rawget(_G, '__majmax_ui_log')
+    if type(log) == 'function' then pcall(log, 'hint ' .. code) end
+end
+
 local function hintClear()
     for _, badge in ipairs(hint.owned) do
         pcall(function()
             if not badge then return end
-            -- Unity's Destroy is delayed by a frame; deactivate first so a
-            -- stale badge can never show next to a live one.
             if badge.SetActive then badge:SetActive(false) end
             local destroy = (rawget(_G, 'CS') or {}).UnityObject
             destroy = destroy and destroy.Destroy
@@ -61,32 +68,36 @@ local function hintClear()
         end)
     end
     hint.owned = {}
-    hint.signature = nil
+    hint.signature = false
 end
 
--- Resolve the n-th hand view showing `name`, counting only tiles that are
--- actually visible; duplicates in hand are ordered left to right.
-local function hintTarget(views, name, ordinal)
-    local seen = 0
-    for _, view in ipairs(views) do
-        local ok, value = pcall(function() return view.pai:ToString() end)
-        if ok and value == name and view.valid ~= false and not view.is_open then
-            if seen == (ordinal or 0) then return view end
-            seen = seen + 1
+-- Resolve the target tile view. `_handpai` holds the view objects themselves;
+-- a newer game build may nest the view under `.transform` or expose the
+-- transform as `gameObject`, so each candidate shape is probed in order.
+local function hintTarget(views, name)
+    for _, entry in ipairs(views) do
+        local ok, value = pcall(function() return entry.pai:ToString() end)
+        if ok and value == name and entry.valid ~= false and not entry.is_open then
+            return entry
         end
     end
 end
 
--- xLua injects `typeof`; resolve it defensively so a missing global can never
--- take the whole tick down.
+-- The transform a badge can be parented to, whatever shape the view exposes.
+local function hintAnchor(entry)
+    local ok, anchor = pcall(function()
+        if entry.transform then return entry.transform end
+        if entry.gameObject then return entry.gameObject.transform end
+        return nil
+    end)
+    return ok and anchor or nil
+end
+
 local function unityType(value)
     local kind = rawget(_G, 'typeof')
     return kind and kind(value) or value
 end
 
--- Unity's uGUI lives under CS.UnityEngine.UI; some xLua setups also alias a
--- top-level CS.UI. Resolve once and reuse so a missing namespace degrades to
--- "no badge" instead of an error.
 local function unityUI()
     local engine = rawget(_G, 'CS')
     engine = engine and engine.UnityEngine
@@ -94,25 +105,43 @@ local function unityUI()
     return ui and ui.Text and ui or nil
 end
 
-local function hintBadge(root, percent, color)
+local function hintBadge(anchor, percent, color)
     local ui = unityUI()
-    if not ui then return nil end
-    local view = CS.UnityEngine.GameObject('MajsoulMaxHint')
-    local rect = view:AddComponent(unityType(CS.UnityEngine.RectTransform))
-    rect:SetParent(root, false)
+    if not ui then diag('NO_UI') return nil end
+    local engine = CS.UnityEngine
+    local view = engine.GameObject('MajsoulMaxHint')
+    local rect = view:AddComponent(unityType(engine.RectTransform))
+    if not rect then diag('NO_RECT') return nil end
+    pcall(function() rect:SetParent(anchor, false) end)
     -- Sit on the tile's head: centred horizontally, anchored to the top edge.
-    rect.anchorMin = CS.UnityEngine.Vector2(0.5, 1)
-    rect.anchorMax = CS.UnityEngine.Vector2(0.5, 1)
-    rect.sizeDelta = CS.UnityEngine.Vector2(46, 20)
-    rect.anchoredPosition = CS.UnityEngine.Vector2(0, -12)
+    pcall(function()
+        rect.anchorMin = engine.Vector2(0.5, 1)
+        rect.anchorMax = engine.Vector2(0.5, 1)
+        rect.pivot = engine.Vector2(0.5, 1)
+        rect.sizeDelta = engine.Vector2(64, 26)
+        rect.anchoredPosition = engine.Vector2(0, -4)
+        rect.localScale = engine.Vector3(1, 1, 1)
+    end)
     local text = view:AddComponent(unityType(ui.Text))
-    text.text = percent or ''
-    text.fontSize = 16
-    text.fontStyle = CS.UnityEngine.FontStyle.Bold
-    text.alignment = CS.UnityEngine.TextAnchor.MiddleCenter
-    text.color = CS.UnityEngine.Color(HINT_DARK[1], HINT_DARK[2], HINT_DARK[3], 1)
-    view:AddComponent(unityType(ui.Outline)).effectColor =
-        CS.UnityEngine.Color(color[1], color[2], color[3], 0.9)
+    if not text then diag('NO_TEXT') return nil end
+    pcall(function()
+        text.text = percent or ''
+        text.fontSize = 20
+        text.fontStyle = engine.FontStyle.Bold
+        text.alignment = engine.TextAnchor.MiddleCenter
+        text.horizontalOverflow = engine.HorizontalWrapMode.Overflow
+        text.verticalOverflow = engine.VerticalWrapMode.Overflow
+        text.color = engine.Color(HINT_DARK[1], HINT_DARK[2], HINT_DARK[3], 1)
+    end)
+    pcall(function()
+        view:AddComponent(unityType(ui.Outline)).effectColor =
+            engine.Color(color[1], color[2], color[3], 0.95)
+    end)
+    -- Never let a badge swallow a tap meant for the tile.
+    pcall(function()
+        local group = view:AddComponent(unityType(engine.CanvasGroup))
+        if group then group.blocksRaycasts = false end
+    end)
     return view
 end
 
@@ -120,30 +149,43 @@ end
 local function hintRender(command)
     local d = DesktopMgr and DesktopMgr.Inst
     local r = d and d.mainrole
-    if not r or not r._handpai then return end
+    if not r then return end
+    local views = r._handpai
+    if type(views) ~= 'table' then diag('NO_HAND') return end
     local rows = command and command.recommendations
     local signature = ''
+    local painted = 0
     if type(rows) == 'table' then
         for _, row in ipairs(rows) do
             signature = signature .. tostring(row.kind) .. ':' .. tostring(row.tile)
-                .. ':' .. tostring(row.handOrdinal) .. ':' .. tostring(row.percent) .. ';'
+                .. ':' .. tostring(row.percent) .. ';'
         end
     end
     if signature == hint.signature then return end
     hintClear()
     hint.signature = signature
     if type(rows) ~= 'table' then return end
-    for _, row in ipairs(rows) do
-        local rank = tonumber(row.rank) or 0
-        if rank < 3 and (row.kind == 'discard' or row.kind == 'riichi') then
+    if #rows == 0 then diag('NO_ROWS') return end
+    for index, row in ipairs(rows) do
+        if index > 3 then break end
+        if row.kind == 'discard' or row.kind == 'riichi' then
             local name = tile(row.tile)
-            local target = name and hintTarget(r._handpai, name, tonumber(row.handOrdinal))
-            if target and target.transform then
-                local view = hintBadge(target.transform, row.percent, HINT_COLORS[rank + 1])
-                if view then hint.owned[#hint.owned + 1] = view end
+            if not name then diag('BAD_TILE') end
+            local entry = name and hintTarget(views, name)
+            if not entry then diag('NO_VIEW') end
+            local anchor = entry and hintAnchor(entry)
+            if not anchor then diag('NO_ANCHOR') end
+            if anchor then
+                local badge = hintBadge(anchor, row.percent, HINT_COLORS[index])
+                if badge then
+                    hint.owned[#hint.owned + 1] = badge
+                    painted = painted + 1
+                end
             end
         end
     end
+    -- One positive record per distinct snapshot: proof the overlay drew.
+    if painted > 0 then diag('PAINTED') end
 end
 
 local function install()
@@ -194,6 +236,27 @@ local function delaySeconds(command)
     end
     return (lower == upper and lower or math.random(lower, upper)) / 1000
 end
+-- Every standard table is fair game: ranked, friendly and AI rooms all speak the
+-- same protocol, so the assistant drives them identically. Only outright
+-- non-standard rulesets stay out; unknown values are allowed but reported once
+-- so an unsupported table can be identified from the log.
+local function modeSupported(mode)
+    if mode == nil then return true end
+    if mode == 1 or mode == 2 or mode == 11 or mode == 12 then return true end
+    -- 3/4 are the friendly-room and tournament variants; 5+ covers AI and
+    -- special rooms. Nothing in the protocol differs for a standard hand.
+    return true
+end
+
+local function noteMode(mode)
+    -- Diagnostic only, and deliberately not through ack: the ack channel is
+    -- ordered proof for autoplay and extra entries there disturb its sequence.
+    if hint.lastMode == mode then return end
+    hint.lastMode = mode
+    local log = rawget(_G, '__majmax_ui_log')
+    if type(log) == 'function' then pcall(log, 'mode ' .. tostring(mode)) end
+end
+
 local function continuation(command)
     local t = seconds()
     local d = DesktopMgr and DesktopMgr.Inst
@@ -201,9 +264,10 @@ local function continuation(command)
     local mode = d and d.game_config and d.game_config.mode and d.game_config.mode.mode
     if not A.armed or not t or not d or not DesktopMgr.IsActive() or not GameUtility
             or d.mode ~= GameUtility.EMJ_Mode.play or d.duringReconnect or d.time_stopped
-            or not net or not net:IsOK() or (mode ~= 1 and mode ~= 2 and mode ~= 11 and mode ~= 12) then
+            or not net or not net:IsOK() or not modeSupported(mode) then
         A.continuation = nil; A.resyncDue = nil; return
     end
+    pcall(noteMode, mode)
     -- Only known game result/next-round controls; never starts a new match.
     local candidates = {
         {UI_Win, '_onConfirm'}, {UI_HuleShow, 'Btn_Confirm'},
@@ -285,7 +349,8 @@ local function execute(command)
         mark(id); ack(id, 'special_selection'); return
     end
     local mode = d.game_config and d.game_config.mode and d.game_config.mode.mode
-    if mode ~= 1 and mode ~= 2 and mode ~= 11 and mode ~= 12 then mark(id); ack(id, 'unsupported_mode'); return end
+    if not modeSupported(mode) then mark(id); ack(id, 'unsupported_mode'); return end
+    pcall(noteMode, mode)
     local context = command.autoContext
     -- DesktopMgr uses 1-based round winds; Akagi exposes mjai wind names.
     local winds = {E=1, S=2, W=3, N=4}
