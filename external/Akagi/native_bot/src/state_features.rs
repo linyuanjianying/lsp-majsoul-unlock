@@ -154,7 +154,7 @@ fn rel(pid: u8, seat: u8) -> usize {
 fn dora_type(raw: u8) -> usize {
     let t = (raw / 4) as usize;
     match t {
-        0..=8 => 9 + (t + 1) % 9,
+        0..=8 => (t + 1) % 9,
         9..=17 => 9 + (t - 9 + 1) % 9,
         18..=26 => 18 + (t - 18 + 1) % 9,
         27..=30 => 27 + (t - 27 + 1) % 4,
@@ -389,7 +389,7 @@ impl MortalSeatView {
         for pid in 0..NUM_PLAYERS as u8 {
             let r = rel(pid, seat);
             let player = &state.players[pid as usize];
-            let mut owned: u8 = count_doras(&player.discards, &dora_types);
+            let mut owned: u8 = 0;
             owned = owned.saturating_add(
                 player
                     .melds
@@ -427,6 +427,18 @@ impl MortalSeatView {
             }
             f
         };
+        let mut hand = v.tehai;
+        if hand.iter().map(|&n| n as usize).sum::<usize>() % 3 == 2 {
+            if let Some(t) = state.drawn_tile { hand[crate::mortal_obs::mortal_obs_deaka(t)] -= 1; }
+        }
+        let span = (hand.iter().map(|&n| n as usize).sum::<usize>() / 3) as u8;
+        for t in 0..TILES {
+            if hand[t] < 4 {
+                hand[t] += 1;
+                v.waits[t] = riichienv_core::shanten::calc_shanten_from_counts(&hand, span) == -1;
+                hand[t] -= 1;
+            }
+        }
         let wait_hits_own_pond = v
             .waits
             .iter()
@@ -558,8 +570,7 @@ impl MortalSeatView {
 
         // -- kan-select flag -------------------------------------------------
         // libriichi sets this while the player is choosing which kan to declare.
-        self.at_kan_select = !self.ankan_candidates.is_empty()
-            || !self.kakan_candidates.is_empty();
+        self.at_kan_select = false; // Only set for a separate kan-selection observation, not its offer window.
 
         // -- single-player table ---------------------------------------------
         // The last 123 channels are EV, required tiles and the per-turn

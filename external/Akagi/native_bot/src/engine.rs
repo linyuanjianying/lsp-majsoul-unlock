@@ -350,6 +350,10 @@ impl Engine {
         }
     }
 
+    pub fn uses_experimental_policy(&self) -> bool {
+        self.uses_external_policy() && !matches!(active_contract(self.num_players), CustomContract::AkagiOnnx)
+    }
+
     /// Return a human-readable description of the active model for the HUD.
     pub fn active_model_label(&self) -> &'static str {
         if !self.uses_external_policy() {
@@ -379,6 +383,8 @@ fn eval_mortal_logits(
     obs: &[f32],
     model: &Model,
     contract: &CustomContract,
+    legal: &[Action],
+    players: u8,
 ) -> Option<Vec<f32>> {
     match contract {
         CustomContract::MortalPth(pth) => match pth.forward_logits(obs) {
@@ -388,7 +394,18 @@ fn eval_mortal_logits(
                 None
             }
         },
-        CustomContract::MortalOnnx(meta) => model.forward_external_custom(obs, meta.action_space),
+        CustomContract::MortalOnnx(meta) => {
+            // The host receives a real legal mask appended after the observation.
+            let mut input = obs.to_vec();
+            let mut mask = vec![0.0; meta.action_space];
+            for action in legal {
+                if let Some(i) = crate::mortal::mortal_action_index(action, players) {
+                    if i < mask.len() { mask[i] = 1.0; }
+                }
+            }
+            input.extend(mask);
+            model.forward_external_custom(&input, meta.action_space)
+        },
         CustomContract::AkagiOnnx => None,
     }
 }
@@ -409,7 +426,7 @@ fn decide_mortal_4p(
         return None;
     }
     let forced = legal.len() == 1;
-    let logits = eval_mortal_logits(&obs, model, contract)?;
+    let logits = eval_mortal_logits(&obs, model, contract, &legal, 4)?;
     let ranked = rank_by_mortal_logits(&legal, &logits, 4, SHOW_TOP_N);
     let (top, _) = ranked.first()?;
     let reach_pai = if top.action_type == ActionType::Riichi {
@@ -421,7 +438,7 @@ fn decide_mortal_4p(
         if legal_r.is_empty() {
             None
         } else {
-            let logits_r = eval_mortal_logits(&obs_r, model, contract)?;
+            let logits_r = eval_mortal_logits(&obs_r, model, contract, &legal_r, 4)?;
             rank_by_mortal_logits(&legal_r, &logits_r, 4, 1)
                 .into_iter()
                 .next()
@@ -449,7 +466,7 @@ fn decide_mortal_3p(
         return None;
     }
     let forced = legal.len() == 1;
-    let logits = eval_mortal_logits(&obs, model, contract)?;
+    let logits = eval_mortal_logits(&obs, model, contract, &legal, 3)?;
     let ranked = rank_by_mortal_logits(&legal, &logits, 3, SHOW_TOP_N);
     let (top, _) = ranked.first()?;
     let reach_pai = if top.action_type == ActionType::Riichi {
@@ -461,7 +478,7 @@ fn decide_mortal_3p(
         if legal_r.is_empty() {
             None
         } else {
-            let logits_r = eval_mortal_logits(&obs_r, model, contract)?;
+            let logits_r = eval_mortal_logits(&obs_r, model, contract, &legal_r, 3)?;
             rank_by_mortal_logits(&legal_r, &logits_r, 3, 1)
                 .into_iter()
                 .next()

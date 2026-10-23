@@ -69,6 +69,10 @@ impl Model {
         external: ExternalInferenceFn, activate: ExternalActivateFn) -> Result<Self> {
         let mut model = Self::from_safetensors(bytes, num_players)?;
         let status = unsafe { activate(num_players) };
+        if status != 0 {
+            model.external_failed.store(true, Ordering::Relaxed);
+            return Ok(model);
+        }
         model.external = Some(external);
         model.external_failed.store(status != 0, Ordering::Relaxed);
         Ok(model)

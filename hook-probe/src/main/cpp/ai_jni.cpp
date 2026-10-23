@@ -11,7 +11,7 @@ using PolicyCallback = int32_t (*)(uint8_t, const float *, size_t, float *, size
 using PolicyActivate = int32_t (*)(uint8_t);
 void majmax_ai_register_policy_callbacks(PolicyCallback callback, PolicyActivate activate);
 void majmax_ai_set_policy_mask(uint8_t mask);
-int32_t majmax_ai_load_mortal_pth(uint8_t expected_players, const char *path);
+int32_t majmax_ai_load_mortal_pth(uint8_t expected_players, const char *path, uint8_t activate);
 void majmax_ai_set_custom_contract(uint8_t players, uint8_t kind, uint8_t version, uint32_t in_channels, uint32_t action_space);
 }
 
@@ -112,11 +112,11 @@ Java_com_yefeng_majmax_hookprobe_manager_AiNative_configurePolicy(JNIEnv *, jcla
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_yefeng_majmax_hookprobe_manager_AiNative_loadMortalPth(
-        JNIEnv *env, jclass, jint expectedPlayers, jstring path) {
+        JNIEnv *env, jclass, jint expectedPlayers, jstring path, jboolean activate) {
     if (!path) return -1;
     const char *utf = env->GetStringUTFChars(path, nullptr);
     if (!utf) return -1;
-    int32_t status = majmax_ai_load_mortal_pth(static_cast<uint8_t>(expectedPlayers), utf);
+    int32_t status = majmax_ai_load_mortal_pth(static_cast<uint8_t>(expectedPlayers), utf, activate ? 1 : 0);
     env->ReleaseStringUTFChars(path, utf);
     return status;
 }

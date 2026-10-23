@@ -1,4 +1,6 @@
-//! Native Mortal (.pth and .onnx) support for 4-player (v1..=v4) and 3-player (v5 sanma).
+//! Experimental Mortal support; public import/activation accepts four-player v4 only.
+//! Other observation/action helpers remain internal compatibility code and do not
+//! establish upstream parity. Experimental models are excluded from unattended play.
 //!
 //! Provides:
 //! - Direct PyTorch `.pth` checkpoint loading via `candle_nn::VarBuilder` with
@@ -82,6 +84,9 @@ pub fn set_custom_onnx_contract(
     action_space: usize,
 ) {
     if let Ok(mut guard) = contract_slot(num_players).lock() {
+        if kind == 1 && (num_players != 4 || version != 4 || in_channels != 1012 || action_space != 46) {
+            return;
+        }
         if kind == 1 {
             *guard = CustomContract::MortalOnnx(MortalMeta {
                 num_players,
@@ -99,6 +104,9 @@ pub fn set_custom_onnx_contract(
 
 /// Load, validate, and activate a Mortal `.pth` checkpoint from `path`.
 pub fn load_and_activate_pth(expected_players: u8, path: &str) -> i32 {
+    load_pth(expected_players, path, true)
+}
+pub fn load_pth(expected_players: u8, path: &str, activate: bool) -> i32 {
     let model = match MortalPthModel::load_from_file(Path::new(path)) {
         Ok(m) => m,
         Err(_) => return -2,
@@ -135,6 +143,7 @@ probably bound to the wrong tensor."
             return -4;
         }
     }
+    if !activate { return players as i32; }
     if let Ok(mut guard) = contract_slot(players).lock() {
         *guard = CustomContract::MortalPth(Arc::new(model));
         players as i32
@@ -404,6 +413,7 @@ impl MortalPthModel {
         let brain_vb = Self::open_brain_vb(path, &dev)?;
         let dqn_vb = Self::open_dqn_vb(path, &dev)?;
         let (entry_conv, conv_channels, in_channels) = Self::load_entry_conv(&brain_vb, &dev)?;
+        if conv_channels > 512 { return Err(candle_core::Error::Msg("Mortal trunk exceeds supported width".into())); }
 
         // `in_channels` is the entry convolution's depth, which is exactly
         // libriichi's `obs_shape(version).0`. Upstream Mortal only defines
@@ -412,21 +422,10 @@ impl MortalPthModel {
         //
         // Do not confuse v2/v3: upstream is `{1: 938, 2: 942, 3: 934, 4: 1012}`,
         // so v3 (934) is *narrower* than v2 (942) and v1 (938).
-        let (num_players, version, action_space) = match in_channels {
-            1012 => (4u8, 4u8, MORTAL_ACTION_SPACE_4P),
-            942 => (4u8, 2u8, MORTAL_ACTION_SPACE_4P),
-            938 => (4u8, 1u8, MORTAL_ACTION_SPACE_4P),
-            934 => (4u8, 3u8, MORTAL_ACTION_SPACE_4P),
-            775 => (3u8, 5u8, MORTAL_ACTION_SPACE_3P),
-            other => {
-                // Unknown width: fall back to the newest 4p layout rather than
-                // silently mislabel a version, and say so.
-                eprintln!(
-                    "mortal: unrecognised in_channels={other}; assuming 4p v4 (1012)"
-                );
-                (4u8, 4u8, MORTAL_ACTION_SPACE_4P)
-            }
-        };
+        if in_channels != 1012 {
+            return Err(candle_core::Error::Msg("Only experimental four-player Mortal v4 (1012 channels) is supported".into()));
+        }
+        let (num_players, version, action_space) = (4u8, 4u8, MORTAL_ACTION_SPACE_4P);
 
         let actv = Actv::for_version(version);
         let mut blocks = Vec::new();
@@ -445,6 +444,9 @@ impl MortalPthModel {
         let num_blocks = blocks.len();
         let post_bn_scale = Self::try_load_standalone_bn(&brain_vb, conv_channels)?;
         let post_conv = Self::load_post_conv_stage(&brain_vb, conv_channels, &dev)?;
+        if post_conv.bn_scale.is_none() || post_conv.conv.is_none() || post_conv.fc.is_none() {
+            return Err(candle_core::Error::Msg("Incomplete Mortal v4 tail".into()));
+        }
         let (head_fc1, head) = Self::load_output_head(&dqn_vb, &brain_vb, conv_channels, action_space)?;
 
         Ok(Self {
@@ -478,7 +480,7 @@ impl MortalPthModel {
         let x = Tensor::from_slice(obs, (1, self.meta.in_channels, MORTAL_TILE_DIM), &dev)?;
 
         let mut h = self.entry_conv.forward(&x)?;
-        h = self.actv.apply(&h)?;
+        // v4 starts with a plain convolution; the first block owns BN + Mish.
 
         for block in &self.blocks {
             h = block.forward(&h)?;
@@ -847,6 +849,7 @@ impl MortalPthModel {
                             None => None,
                         },
                     };
+                    if ca.is_none() { return Err(candle_core::Error::Msg("Missing Mortal v4 channel attention".into())); }
                     return Ok(Some(ResBlock { conv1, conv2, ca }));
                 }
             }
@@ -974,7 +977,7 @@ impl MortalPthModel {
                         let mean = vb.get_unchecked_dtype(&format!("{p}.running_mean"), DType::F32)?;
                         let var = vb.get_unchecked_dtype(&format!("{p}.running_var"), DType::F32)?;
                         let beta = vb.get_unchecked_dtype(&format!("{p}.bias"), DType::F32)?;
-                        let std = (var + 1e-5f64)?.sqrt()?;
+                        let std = (var + 1e-3f64)?.sqrt()?;
                         let scale = (&w / &std)?.reshape((1, conv_channels, 1))?;
                         let shift =
                             (&beta - (&mean * (&w / &std)?)?)?.reshape((1, conv_channels, 1))?;
@@ -1052,7 +1055,7 @@ impl MortalPthModel {
                 let var = vb.get_unchecked_dtype(&var_k, DType::F32)?;
                 let gamma = vb.get_unchecked_dtype(&format!("{prefix}.weight"), DType::F32)?;
                 let beta = vb.get_unchecked_dtype(&format!("{prefix}.bias"), DType::F32)?;
-                let std = (var + 1e-5f64)?.sqrt()?;
+                let std = (var + 1e-3f64)?.sqrt()?;
                 let scale = (&gamma / &std)?.reshape((1, channels, 1))?;
                 let shift = (&beta - (&mean * (&gamma / &std)?)?)?.reshape((1, channels, 1))?;
                 return Ok(Some((scale, shift)));
@@ -1416,7 +1419,7 @@ pub fn rank_by_mortal_logits(
     order
         .into_iter()
         .map(|i| {
-            let prob = if sum > 0.0 { exps[i] / sum } else { 0.0 };
+            let prob = if sum > 0.0 { (scored[i].1 - max_q).exp() / sum } else { 0.0 };
             (scored[i].0.clone(), prob)
         })
         .collect()

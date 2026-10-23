@@ -89,6 +89,41 @@ end)
 test('incorrect tsumogiri never substitutes another copy',function(s)
     s.command.tsumogiri=true; __majmax_auto_tick(); assert(#s.sent==0 and s.acks[1].state=='illegal_tile')
 end)
+
+local function openingDealer(s)
+    for i=1,11 do
+        local name='1m'
+        s.command.hand[#s.command.hand+1]=name
+        s.role._handpai[#s.role._handpai+1]={valid=true,is_open=false,pai={ToString=function() return name end}}
+    end
+    s.command.autoContext.openingDealerDiscard=true
+    s.command.autoContext.dealer=0; s.command.autoContext.phase='wait_act'
+    s.command.autoContext.melds={}; s.command.autoContext.riichi=false
+    s.command.action.clientOpeningDraw=true
+end
+
+test('opening dealer uses client draw identity after whole hand sorting',function(s)
+    openingDealer(s)
+    -- The virtual protocol draw is a red five; the game's sorted last tile is 9p.
+    s.command.tsumogiri=true; s.command.action.moqie=true
+    __majmax_auto_tick()
+    assert(#s.sent==1 and s.sent[1].tile=='0m' and not s.sent[1].moqie)
+end)
+
+test('opening dealer may discard the client last tile despite a virtual hand cut',function(s)
+    openingDealer(s)
+    s.command.gameTile='9p'; s.command.action.tile='9p'
+    __majmax_auto_tick()
+    assert(#s.sent==1 and s.sent[1].tile=='9p' and s.sent[1].moqie)
+end)
+
+test('opening exception requires protocol dealer and phase proof',function(s)
+    openingDealer(s)
+    s.command.tsumogiri=true; s.command.action.moqie=true
+    s.command.autoContext.dealer=1
+    __majmax_auto_tick()
+    assert(#s.sent==0 and s.acks[1].state=='illegal_tile')
+end)
 test('revoked or newer capture never executes',function(s)
     s.current=false; __majmax_auto_tick(); assert(#s.sent==0 and s.acks[1].state=='waiting')
     s.current=true; __majmax_auto_tick(); assert(#s.sent==1)
@@ -200,35 +235,9 @@ end)
 test('open kan uses claim window',function(s)
     operation(s,'kan',5,'3m|3m|3m'); __majmax_auto_tick(); assert(s.sent[1].type==5)
 end)
-test('claim ignores unstable UI seat when tile and server operation match',function(s)
-    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
-    DesktopMgr.Inst.lastqipai_seat=2
-    __majmax_auto_tick(); assert(s.sent[1].type==3)
-    local saw=false
-    for _,row in ipairs(s.acks) do
-        saw=saw or (row.state=='probe' and row.reason=='claim_target_seat_ignored')
-    end
-    assert(saw)
-end)
-test('stale UI discard tile is diagnostic only when server claim matches',function(s)
-    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
-    DesktopMgr.Inst.lastqipai.ToString=function() return '4m' end
-    __majmax_auto_tick(); assert(s.sent[1].type==3)
-    local saw=false
-    for _,row in ipairs(s.acks) do
-        saw=saw or (row.state=='probe' and row.reason=='claim_target_tile_ignored')
-    end
-    assert(saw)
-end)
-test('missing UI discard state is diagnostic only when server claim matches',function(s)
-    operation(s,'chi',2,'0m|4m'); UI_ChiPengHu.Inst.data.chi={'0m|4m'}
-    DesktopMgr.Inst.lastqipai=nil
-    __majmax_auto_tick(); assert(s.sent[1].type==2)
-    local saw=false
-    for _,row in ipairs(s.acks) do
-        saw=saw or (row.state=='probe' and row.reason=='claim_target_unavailable_ignored')
-    end
-    assert(saw)
+test('stale target seat cannot claim',function(s)
+    operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.lastqipai_seat=2
+    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='target_mismatch')
 end)
 test('changed combination never substitutes red for normal five',function(s)
     operation(s,'pon',3,'5m|0m'); DesktopMgr.Inst.oplist[1].combination={'5m|5m'}
@@ -281,6 +290,43 @@ test('win result confirms only after two to five seconds and only once',function
     UnityEngine.Time.realtimeSinceStartup=due-0.001; __majmax_auto_tick(); assert(not s.continued)
     UnityEngine.Time.realtimeSinceStartup=due; __majmax_auto_tick(); __majmax_auto_tick(); assert(s.continued==1)
 end)
+
+test('configured fixed delay applies to settlement including zero',function(s)
+    for _,delay in ipairs({0,1300,5000}) do
+        local ui=resultWindow(s,'UI_Win','_onConfirm'); ui.current_index=delay
+        s.command.delayMinMs=delay; s.command.delayMaxMs=delay
+        local start=UnityEngine.Time.realtimeSinceStartup
+        local before=s.continued or 0
+        __majmax_auto_tick()
+        assert(__majmax_auto.continuation.due==start+delay/1000)
+        if delay>0 then
+            assert((s.continued or 0)==before)
+            UnityEngine.Time.realtimeSinceStartup=start+delay/1000-0.001; __majmax_auto_tick()
+            assert((s.continued or 0)==before)
+        end
+        UnityEngine.Time.realtimeSinceStartup=start+delay/1000; __majmax_auto_tick()
+        assert(s.continued==before+1)
+        UI_Win=nil; __majmax_auto_tick()
+    end
+end)
+
+test('invalid delay configuration falls back to existing safe defaults',function(s)
+    for _,range in ipairs({{-100,5000},{0,5100},{2000,1000},{101,2000},{'bad',2000},{0,0/0}}) do
+        resultWindow(s,'UI_Win','_onConfirm')
+        s.command.delayMinMs=range[1]; s.command.delayMaxMs=range[2]
+        __majmax_auto_tick()
+        assert(__majmax_auto.continuation.due>=2 and __majmax_auto.continuation.due<=5)
+        UI_Win=nil; __majmax_auto_tick()
+    end
+end)
+
+test('settlement delay changes only affect the next result page',function(s)
+    local ui=resultWindow(s,'UI_Win','_onConfirm')
+    s.command.delayMinMs=1000; s.command.delayMaxMs=1000; __majmax_auto_tick()
+    s.command.delayMinMs=3000; s.command.delayMaxMs=3000
+    UnityEngine.Time.realtimeSinceStartup=1; __majmax_auto_tick(); assert(s.continued==1)
+    ui.current_index=1; __majmax_auto_tick(); assert(__majmax_auto.continuation.due==4)
+end)
 test('all round result dialogs use their existing confirm methods',function(s)
     for _,name in ipairs({'UI_HuleShow','UI_ScoreChange','UI_ConfirmNewRound'}) do
         resultWindow(s,name,'Btn_Confirm'); __majmax_auto_tick()
@@ -320,6 +366,14 @@ test('resync uses auth and forces a complete restore with cooldown',function(s)
     MJNetMgr.Inst:SendRequest('FastTest','syncGame',{round_id='E2',step=7},function() end)
     assert(s.sent[2].round_id=='E2' and s.sent[2].step==7)
 end)
+
+test('configured zero delay resync still respects cooldown',function(s)
+    s.command={control='mode',enabled=true,resync=true,delayMinMs=0,delayMaxMs=0}
+    MJNetMgr.Inst._connectSuccess=function() s.resynced=(s.resynced or 0)+1 end
+    __majmax_auto_tick(); assert(s.resynced==1)
+    UnityEngine.Time.realtimeSinceStartup=29.999; __majmax_auto_tick(); assert(s.resynced==1)
+    UnityEngine.Time.realtimeSinceStartup=30; __majmax_auto_tick(); assert(s.resynced==2)
+end)
 test('between rounds and during reconnect never trigger extra resync',function(s)
     s.command={control='mode',enabled=true,resync=true}; DesktopMgr.Inst.gameing=false
     __majmax_auto_tick(); assert(not __majmax_auto.resyncDue)
@@ -336,5 +390,26 @@ test('restored game step waits for proof without disabling or replaying',functio
     assert(#s.sent==0 and s.acks[1].state=='waiting')
     __majmax_auto_tick(); assert(#s.acks==1)
     DesktopMgr.Inst.current_step=9; __majmax_auto_tick(); assert(#s.sent==1)
+end)
+test('protocol target tolerates stale UI but never mismatched server actor',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    s.command.autoContext.phase='wait_response'; s.command.autoContext.lastDiscard={tile='3m',seat=3}
+    DesktopMgr.Inst.lastqipai_seat=2; DesktopMgr.Inst.lastqipai=nil
+    __majmax_auto_tick(); assert(#s.sent==1)
+end)
+test('protocol target mismatch never claims even if UI looks right',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    s.command.autoContext.phase='wait_response'; s.command.autoContext.lastDiscard={tile='3m',seat=2}
+    __majmax_auto_tick(); assert(#s.sent==0 and s.acks[#s.acks].state=='target_mismatch')
+end)
+test('claim does not read unrelated own action window',function(s)
+    operation(s,'pon',3,'5m|0m'); UI_ChiPengHu.Inst.data.peng={'5m|0m'}
+    UI_LiqiZimo=setmetatable({}, {__index=function() error('not loaded') end})
+    __majmax_auto_tick(); assert(#s.sent==1)
+end)
+test('waiting claim diagnostics remain bounded across ticks',function(s)
+    operation(s,'pon',3,'5m|0m'); __majmax_auto_tick(); local n=#s.acks
+    for i=1,50 do __majmax_auto_tick() end
+    assert(#s.acks==n and #s.sent==0)
 end)
 print(string.format('%d automatic operation checks passed',count))

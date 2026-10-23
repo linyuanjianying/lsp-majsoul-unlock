@@ -25,10 +25,12 @@ internal data class ImportedPolicy(
 
 /**
  * Validates and runs Akagi (.onnx) and Mortal (.pth / .onnx) policy models
- * for both 4-player and 3-player mahjong inside app-private storage.
+ * in app-private storage. Akagi supports 4/3 players; Mortal is experimental 4-player v4 only.
  */
 internal object OnnxModelStore {
-    private const val MAX_BYTES = 128L * 1024 * 1024
+    const val MAX_MODEL_MIB = 300
+    private const val MAX_BYTES = MAX_MODEL_MIB * 1024L * 1024
+    private const val MAX_UNCOMPRESSED_BYTES = MAX_BYTES * 2
     private const val PREFS = "onnx-policy-models"
     private val environment by lazy { OrtEnvironment.getEnvironment() }
     private val timeoutScheduler = Executors.newSingleThreadScheduledExecutor { task ->
@@ -47,21 +49,20 @@ internal object OnnxModelStore {
         val obsInputName: String = "obs",
         val actionOutputName: String = "logits",
         /**
-         * Non-observation graph inputs (Mortal's `mask`) as name -> shape. We
-         * synthesize a value for each; see [makeAuxTensor].
+         * Optional Mortal legal-action mask, supplied from the current Rust legal actions.
          */
-        val auxInputs: Map<String, LongArray> = emptyMap(),
+        val auxInputs: Map<String, AuxInput> = emptyMap(),
     )
+
+    internal data class AuxInput(val type: OnnxJavaType, val shape: LongArray)
 
     private data class Cached(val file: File, val session: OrtSession, val spec: OnnxSpec)
     private val sessions = mutableMapOf<String, Cached>()
     private val activeSessions = mutableMapOf<Int, Cached>()
     private val failedPlayers = mutableSetOf<Int>()
-    private val mortal4pChannels = mapOf(1012 to 4, 948 to 3, 938 to 2, 450 to 1)
-    private const val MORTAL_3P_CHANNELS = 775
 
-    /** Action-space widths we can rank over: Akagi 4P/3P and Mortal 4P/3P. */
-    private val KNOWN_ACTION_SPACES = setOf(82, 60, 46, 44)
+    /** Akagi 4P/3P and experimental Mortal 4P v4. */
+    private val KNOWN_ACTION_SPACES = setOf(82, 60, 46)
     @Volatile private var appContext: Context? = null
 
     fun initialize(context: Context) { appContext = context.applicationContext }
@@ -170,7 +171,7 @@ internal object OnnxModelStore {
                         val count = source.read(buffer)
                         if (count < 0) break
                         bytes += count
-                        require(bytes <= MAX_BYTES) { "模型文件超过 128 MiB 限制" }
+                        require(bytes <= MAX_BYTES) { "模型文件超过 $MAX_MODEL_MIB MiB 限制" }
                         digest.update(buffer, 0, count)
                         output.write(buffer, 0, count)
                     }
@@ -180,10 +181,11 @@ internal object OnnxModelStore {
             val hash = digest.digest().joinToString("") { "%02x".format(it) }
 
             if (treatAsPth) {
-                val detectedPlayers = AiNative.loadMortalPth(0, staged.absolutePath)
-                if (detectedPlayers != 3 && detectedPlayers != 4) {
+                validatePthArchive(staged)
+                val detectedPlayers = AiNative.loadMortalPth(0, staged.absolutePath, false)
+                if (detectedPlayers != 4) {
                     rejectionReason = "invalid_mortal_pth_$detectedPlayers"
-                    throw IllegalArgumentException("无法解析 Mortal .pth 权重文件或结构不受支持 (状态码: $detectedPlayers)")
+                    throw IllegalArgumentException("仅支持实验性四麻 Mortal v4；权重文件无效或结构不受支持 (状态码: $detectedPlayers)")
                 }
                 val players = detectedPlayers
                 val folder = File(File(context.filesDir, "models"), "$players-$hash").apply { mkdirs() }
@@ -191,12 +193,6 @@ internal object OnnxModelStore {
                 val temp = File(folder, "policy.tmp")
                 staged.copyTo(temp, overwrite = true)
                 if (target.exists()) temp.delete() else check(temp.renameTo(target)) { "无法保存模型文件" }
-                // Point Rust runtime at the permanent target path.
-                check(AiNative.loadMortalPth(players, target.absolutePath) == players) { "无法激活已保存的 Mortal .pth 模型" }
-                synchronized(sessions) {
-                    activeSessions.remove(players)
-                    failedPlayers.remove(players)
-                }
                 val savedName = displayName.take(64)
                 context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                     .putString("name_$players", savedName)
@@ -225,7 +221,6 @@ internal object OnnxModelStore {
             }
             val formatTag = if (spec.contractKind == 1) "mortal-onnx" else "akagi-onnx"
             val savedName = spec.description.ifBlank { displayName }.take(64)
-            AiNative.configureCustomContract(players, spec.contractKind, spec.obsVersion, spec.obsChannels, spec.actionDim)
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString("name_$players", savedName)
                 .putString("sha_$players", hash)
@@ -243,6 +238,20 @@ internal object OnnxModelStore {
         } finally {
             staged.delete()
             parent.delete()
+        }
+    }
+
+    private fun validatePthArchive(file: File) {
+        java.util.zip.ZipFile(file).use { zip ->
+            val entries = zip.entries().asSequence().toList()
+            require(entries.size <= 5000 && entries.count { it.name.endsWith("/data.pkl") || it.name == "data.pkl" } == 1) { "不是受支持的 PyTorch 权重 ZIP" }
+            var total = 0L
+            for (entry in entries) {
+                require(entry.size in 0..MAX_BYTES) { "权重 ZIP 条目过大或长度未知" }
+                total += entry.size
+                require(total <= MAX_UNCOMPRESSED_BYTES) { "权重 ZIP 解压体积超过 ${MAX_MODEL_MIB * 2} MiB 限制" }
+                if (entry.name.endsWith("data.pkl")) require(entry.size <= 4L*1024*1024) { "权重元数据过大" }
+            }
         }
     }
 
@@ -282,7 +291,7 @@ internal object OnnxModelStore {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val format = prefs.getString("format_$players", "") ?: ""
             if (format == "mortal-pth" || file.name.endsWith(".pth", ignoreCase = true) || file.name.endsWith(".pt", ignoreCase = true)) {
-                val rc = AiNative.loadMortalPth(players, file.absolutePath)
+                val rc = AiNative.loadMortalPth(players, file.absolutePath, true)
                 check(rc == players) { "无法加载 Mortal .pth 模型 (状态码: $rc)" }
                 synchronized(sessions) {
                     activeSessions.remove(players)
@@ -318,13 +327,13 @@ internal object OnnxModelStore {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val format = prefs.getString("format_$players", "") ?: ""
         if (format == "mortal-pth" || file.name.endsWith(".pth", ignoreCase = true) || file.name.endsWith(".pt", ignoreCase = true)) {
-            val rc = AiNative.loadMortalPth(players, file.absolutePath)
+            val rc = AiNative.loadMortalPth(players, file.absolutePath, false)
             check(rc == players) { "Mortal .pth 模型自检失败 (状态码: $rc)" }
-            return "${players}人 Mortal (.pth) 模型可用 · ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)} ms"
+            return "${players}人 Mortal (.pth) 加载与推理自检通过（实验性）· ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)} ms"
         }
         val cached = createValidatedCached(file, players)
         cached.session.use {
-            run(it, cached.spec, FloatArray(cached.spec.obsChannels * cached.spec.tileDim))
+            run(it, cached.spec, FloatArray(cached.spec.obsChannels * cached.spec.tileDim), validation=true)
         }
         val kindLabel = if (cached.spec.contractKind == 1) "Mortal (.onnx)" else "Akagi (.onnx)"
         return "${players}人 $kindLabel 模型可用 · ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)} ms"
@@ -349,141 +358,83 @@ internal object OnnxModelStore {
     }
 
     private fun inspectAndVerifyOnnx(session: OrtSession, expectedPlayers: Int?): OnnxSpec {
-        // Node names are NOT part of the contract. Upstream Mortal exports are
-        // `obs` + `mask` -> `q`, while our own Akagi exports use `obs` -> `logits`.
-        // Both are legitimate, so the contract is decided by tensor *shapes* and the
-        // actual names are read back from the session.
-        val inputs = session.inputNames.associateWith { name ->
-            tensorInfo(session.inputInfo.getValue(name))
-        }
-        require(inputs.isNotEmpty()) { "ONNX 模型没有输入节点" }
-        require(inputs.values.all { it.type == OnnxJavaType.FLOAT }) {
-            "输入节点必须是 float32 张量"
-        }
-
-        // The observation input is the rank-3 tensor with the widest channel axis;
-        // `mask`-style inputs are rank-2 and are synthesized by us.
-        val obsEntry = inputs.entries
-            .filter { it.value.shape.size == 3 }
-            .maxByOrNull { it.value.shape[1] }
-            ?: throw IllegalArgumentException("找不到 [1, C, T] 形状的观察输入节点")
-        val obsName = obsEntry.key
-        val inShape = obsEntry.value.shape
-        val auxInputs = inputs.filterKeys { it != obsName }
-            .mapValues { (_, info) -> info.shape }
-
-        val outputs = session.outputNames.associateWith { name ->
-            tensorInfo(session.outputInfo.getValue(name))
-        }
-        require(outputs.isNotEmpty()) { "ONNX 模型没有输出节点" }
-        // The action head is the rank-2 float output whose second axis is a known
-        // action space.
-        val outEntry = outputs.entries
-            .filter { it.value.shape.size == 2 && it.value.type == OnnxJavaType.FLOAT }
-            .firstOrNull { it.value.shape[1].toInt() in KNOWN_ACTION_SPACES }
-            ?: throw IllegalArgumentException(
-                "找不到 [1, A] 形状的动作输出节点 (候选: $outputs)"
-            )
-        val outName = outEntry.key
-        val outShape = outEntry.value.shape
-
-        require(
-            inShape.size == 3 && outShape.size == 2 &&
-                (inShape[0] <= 0L || inShape[0] == 1L) &&
-                (outShape[0] <= 0L || outShape[0] == 1L)
-        ) { "张量形状必须为 obs[1, C, T] 与 logits[1, A]" }
-
-        val c = inShape[1].toInt()
-        val t = inShape[2].toInt()
-        val a = outShape[1].toInt()
-
-        val metadata = session.metadata
-        val contractMeta = metadata.getCustomMetadataValue("majmax.contract").orElse("")
-
-        // 1. Akagi contract ([1, 39, 34] -> [1, 82] for 4P, [1, 37, 27] -> [1, 60] for 3P)
+        val inputs = session.inputNames.associateWith { tensorInfo(session.inputInfo.getValue(it)) }
+        val obs = inputs.entries.filter { it.value.shape.size == 3 }.singleOrNull()
+            ?: throw IllegalArgumentException("需要唯一的 float32 观察输入 [1, C, T]")
+        require(obs.value.type == OnnxJavaType.FLOAT)
+        val shape = obs.value.shape
+        require(shape[0] == 1L || shape[0] == -1L)
+        val output = session.outputNames.map { it to tensorInfo(session.outputInfo.getValue(it)) }
+            .filter { (_, t) -> t.type == OnnxJavaType.FLOAT && t.shape.size == 2 && t.shape[1].toInt() in KNOWN_ACTION_SPACES }
+            .singleOrNull() ?: throw IllegalArgumentException("需要唯一的动作输出 [1, A]")
+        require(output.second.shape[0] == 1L || output.second.shape[0] == -1L)
+        val c = shape[1].toInt(); val t = shape[2].toInt(); val actions = output.second.shape[1].toInt()
+        val meta = session.metadata
+        fun value(key: String) = meta.getCustomMetadataValue(key).orElse("")
         val spec = when {
-            c == 39 && t == 34 && a == 82 -> {
-                if (contractMeta.isNotEmpty() && contractMeta != "akagi-policy-v1") {
-                    throw IllegalArgumentException("模型协议不匹配: $contractMeta")
+            (c == 39 && t == 34 && actions == 82) || (c == 37 && t == 27 && actions == 60) -> {
+                val players = if (actions == 82) 4 else 3
+                require(value("majmax.contract") == "akagi-policy-v1") { "Akagi 模型需要声明 akagi-policy-v1 协议" }
+                require(value("majmax.players") == players.toString()) { "模型人数声明不匹配" }
+                require(value("majmax.obs_schema") == "1") { "特征协议版本不匹配" }
+                require(value("majmax.action_codec") == "riichienv-core-0.4.8") { "动作编号协议不匹配" }
+                require(inputs.size == 1 && session.outputNames.size == 1) { "Akagi 模型不支持额外输入输出" }
+                OnnxSpec(players,meta.description,0,1,c,t,actions,obs.key,output.first)
+            }
+            c == 1012 && t == 34 && actions == 46 -> {
+                require(value("majmax.contract").let { it.isEmpty() || it.startsWith("mortal") }) { "模型协议与 Mortal v4 不匹配" }
+                val aux = inputs.filterKeys { it != obs.key }.mapValues { (_, info) ->
+                    require(info.shape.size == 2 && (info.shape[0] == 1L || info.shape[0] == -1L) && info.shape[1] == 46L) { "Mortal 附加输入仅支持 [1,46] 合法动作 mask" }
+                    require(info.type == OnnxJavaType.BOOL || info.type == OnnxJavaType.FLOAT) { "mask 仅支持 bool 或 float32" }
+                    AuxInput(info.type,info.shape)
                 }
-                OnnxSpec(4, metadata.description, 0, 1, 39, 34, 82, obsName, outName, auxInputs)
+                require(aux.size <= 1) { "Mortal 最多支持一个 mask 输入" }
+                OnnxSpec(4,meta.description,1,4,c,t,actions,obs.key,output.first,aux)
             }
-            c == 37 && t == 27 && a == 60 -> {
-                if (contractMeta.isNotEmpty() && contractMeta != "akagi-policy-v1") {
-                    throw IllegalArgumentException("模型协议不匹配: $contractMeta")
-                }
-                OnnxSpec(3, metadata.description, 0, 1, 37, 27, 60, obsName, outName, auxInputs)
-            }
-            // 2. Mortal 4P ONNX ([1, C, 34] -> [1, 46])
-            t == 34 && a == 46 && mortal4pChannels.containsKey(c) -> {
-                OnnxSpec(4, metadata.description, 1, mortal4pChannels.getValue(c), c, 34, 46, obsName, outName, auxInputs)
-            }
-            // 3. Mortal 3P ONNX ([1, 775, 34] -> [1, 44])
-            c == MORTAL_3P_CHANNELS && t == 34 && a == 44 -> {
-                OnnxSpec(3, metadata.description, 1, 5, c, 34, 44, obsName, outName, auxInputs)
-            }
-            else -> throw IllegalArgumentException(
-                "不支持的 ONNX 模型张量维度: obs=[1, $c, $t], logits=[1, $a]"
-            )
+            else -> throw IllegalArgumentException("暂仅支持 Akagi 协议及实验性四麻 Mortal v4（1012×34 → 46）；三麻 Mortal 和旧版暂未开放")
         }
-
-        if (expectedPlayers != null) {
-            require(spec.players == expectedPlayers) { "模型适用人数 (${spec.players}人) 与槽位 (${expectedPlayers}人) 不匹配" }
-        }
-        run(session, spec, FloatArray(spec.obsChannels * spec.tileDim))
+        require(expectedPlayers == null || spec.players == expectedPlayers) { "模型适用人数不匹配" }
+        run(session,spec,FloatArray(c*t),validation=true)
         return spec
     }
 
-    /** Synthesize a value for a non-observation graph input (Mortal's `mask`). */
-    private fun makeAuxTensor(shape: LongArray): OnnxTensor {
-        val dims = LongArray(shape.size) { i -> if (shape[i] <= 0L) 1L else shape[i] }
-        val size = dims.fold(1L) { acc, d -> acc * d }.toInt()
-        // An all-ones mask keeps the dueling mean well defined; the Rust side
-        // re-ranks over its own legal set regardless.
-        return OnnxTensor.createTensor(
-            environment,
-            FloatBuffer.wrap(FloatArray(size) { 1.0f }),
-            dims,
-        )
-    }
-
-    private fun run(
-        session: OrtSession,
-        spec: OnnxSpec,
-        observation: FloatArray,
-    ): FloatArray {
-        val obsName = spec.obsInputName
-        val outName = spec.actionOutputName
-        val auxInputs = spec.auxInputs
-        val expectedInput = spec.obsChannels * spec.tileDim
-        require(observation.size == expectedInput) { "观察特征长度不匹配: ${observation.size} != $expectedInput" }
+    private fun run(session: OrtSession, spec: OnnxSpec, observation: FloatArray, validation: Boolean = false): FloatArray {
+        val size = spec.obsChannels * spec.tileDim
         require(observation.all(Float::isFinite)) { "观察特征无效" }
-        val shape = longArrayOf(1L, spec.obsChannels.toLong(), spec.tileDim.toLong())
-        val tensor = OnnxTensor.createTensor(environment, FloatBuffer.wrap(observation), shape)
-        val options = OrtSession.RunOptions()
-        val timeout = timeoutScheduler.schedule({ runCatching { options.setTerminate(true) } }, 500, TimeUnit.MILLISECONDS)
-        val aux = ArrayList<OnnxTensor>(auxInputs.size)
-        try {
-            val feed = HashMap<String, OnnxTensor>(auxInputs.size + 1)
-            feed[obsName] = tensor
-            for ((name, shape) in auxInputs) {
-                val t = makeAuxTensor(shape)
-                aux += t
-                feed[name] = t
+        val mask = if (spec.contractKind == 1) {
+            if (validation) BooleanArray(spec.actionDim) { true } else {
+                require(observation.size == size + spec.actionDim) { "缺少当前合法动作 mask" }
+                BooleanArray(spec.actionDim) { i ->
+                    val v = observation[size+i]; require(v == 0f || v == 1f); v == 1f
+                }.also { require(it.any { legal -> legal }) }
             }
-            tensor.use {
-                session.run(feed, setOf(outName), options).use { results ->
-                    val output = results.get(outName).orElseThrow() as OnnxTensor
-                    val values = output.floatBuffer
-                    val logits = FloatArray(values.remaining()).also { values.get(it) }
-                    require(logits.size == spec.actionDim && logits.all(Float::isFinite)) { "模型输出无效" }
-                    return logits
+        } else { require(observation.size == size); BooleanArray(spec.actionDim) { true } }
+        val resources = ArrayList<OnnxTensor>()
+        val options = OrtSession.RunOptions()
+        val timeout = timeoutScheduler.schedule({ runCatching { options.setTerminate(true) } },500,TimeUnit.MILLISECONDS)
+        try {
+            val feed = HashMap<String,OnnxTensor>()
+            val obs = OnnxTensor.createTensor(environment,FloatBuffer.wrap(observation.copyOf(size)),longArrayOf(1,spec.obsChannels.toLong(),spec.tileDim.toLong()))
+            resources += obs; feed[spec.obsInputName] = obs
+            for ((name, aux) in spec.auxInputs) {
+                val tensor = if (aux.type == OnnxJavaType.BOOL)
+                    OnnxTensor.createTensor(environment,arrayOf(mask))
+                else OnnxTensor.createTensor(environment,FloatBuffer.wrap(FloatArray(mask.size) { if(mask[it]) 1f else 0f }),longArrayOf(1,mask.size.toLong()))
+                resources += tensor; feed[name] = tensor
+            }
+            session.run(feed,setOf(spec.actionOutputName),options).use { output ->
+                val buffer = (output.get(spec.actionOutputName).orElseThrow() as OnnxTensor).floatBuffer
+                val values = FloatArray(buffer.remaining()).also { buffer.get(it) }
+                require(values.size == spec.actionDim) { "模型输出长度无效" }
+                for (i in values.indices) {
+                    if (mask[i]) require(values[i].isFinite() && (spec.contractKind == 0 || kotlin.math.abs(values[i]) <= 10000f)) { "模型合法动作输出无效" }
+                    else { require(!values[i].isNaN()); values[i] = 0f } // Official Q graphs mask illegal slots to -infinity.
                 }
+                return values
             }
         } finally {
-            aux.forEach { t -> runCatching { t.close() } }
-            timeout.cancel(false)
-            options.close()
+            resources.forEach { runCatching { it.close() } }
+            timeout.cancel(false); options.close()
         }
     }
 

@@ -7,7 +7,11 @@ import org.json.JSONObject
 
 /** Runs against Android's real JSONObject, clock supplied explicitly; no game input. */
 class AutoDiscardInstrumentation : Instrumentation() {
-    override fun onCreate(arguments: Bundle?) { super.onCreate(arguments); start() }
+    private var controllerOnly = false
+    override fun onCreate(arguments: Bundle?) {
+        controllerOnly = arguments?.getString("controllerOnly") == "true"
+        super.onCreate(arguments); start()
+    }
     override fun onStart() {
         val output = Bundle()
         runCatching {
@@ -102,6 +106,25 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 return state
             }
             fun prepared(state: JSONObject) = checkNotNull(AutoDiscardController.prepareAction(state,state.getJSONArray("recommendations").getJSONObject(0)))
+            test("opening dealer accepts client moqie only with complete protocol proof") { gate, _ ->
+                val hand=listOf("1m","2m","3m","4m","5m","6m","7m","8m","9m","1p","2p","3p","1s","9s")
+                val state=actionCase("discard",1,"9s",hand=hand,response=false)
+                state.getJSONArray("recommendations").getJSONObject(0).put("tsumogiri",true)
+                state.getJSONObject("autoContext").put("openingDealerDiscard",true).put("dealer",0).put("melds",JSONArray())
+                gate.observe(state); gate.toggle()
+                val cmd=JSONObject(checkNotNull(gate.poll(null)))
+                check(cmd.getJSONObject("action").getBoolean("clientOpeningDraw"))
+                val payload=JSONObject("""{"type":1,"tile":"9s","moqie":false}""")
+                check(AutoDiscardController.matchesInput(cmd,".lq.FastTest.inputOperation",payload))
+                check(!AutoDiscardController.matchesInput(cmd,".lq.FastTest.inputOperation",JSONObject(payload.toString()).put("tile","1s")))
+                for ((key,value) in listOf("openingDealerDiscard" to false,"dealer" to 1,"phase" to "wait_response","riichi" to true,"melds" to JSONArray().put(JSONObject()))) {
+                    val invalid=JSONObject(cmd.toString())
+                    invalid.getJSONObject("autoContext").put(key,value)
+                    check(!AutoDiscardController.matchesInput(invalid,".lq.FastTest.inputOperation",payload))
+                }
+                val shortHand=JSONObject(cmd.toString()).put("hand",JSONArray(hand.dropLast(1)))
+                check(!AutoDiscardController.matchesInput(shortHand,".lq.FastTest.inputOperation",payload))
+            }
             test("riichi retains red tile and declaration type") { gate, _ ->
                 val state=actionCase("riichi",7,"5mr",combo=listOf("5m"),response=false)
                 gate.observe(state); gate.toggle()
@@ -202,6 +225,47 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs") in 1_000L..3_000L)
                 }
             }
+            test("custom delay boundaries and fixed delay") { _, _ ->
+                for (value in listOf(0, 1, 13, 50)) {
+                    val range=AutoDelayRange(value,value)
+                    repeat(10) { check(range.randomDelayMs()==value*100L) }
+                    var time=0L
+                    val gate=AutoDiscardController({}, {time}, range::randomDelayMs)
+                    gate.observe(live()); gate.toggle()
+                    if (value>0) { time=value*100L-1; check(gate.poll(null)==null) }
+                    time=value*100L
+                    check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs")==time)
+                }
+                repeat(100) { check(AutoDelayRange(10,30).randomDelayMs() in 1_000L..3_000L) }
+                check(AutoDelayRange(20,30).withMinimum(40)==AutoDelayRange(40,40))
+                check(AutoDelayRange(20,30).withMaximum(10)==AutoDelayRange(10,10))
+            }
+            test("delay edits affect new decisions without restarting a queued wait") { _, _ ->
+                var time=0L
+                var range=AutoDelayRange(10,10)
+                val gate=AutoDiscardController({}, {time}, {range.randomDelayMs()})
+                gate.observe(live()); gate.toggle()
+                range=AutoDelayRange(30,30)
+                time=999; check(gate.poll(null)==null)
+                time=1_000; check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs")==1_000L)
+                gate.observe(live(2))
+                time=3_999; check(gate.poll(null)==null)
+                time=4_000; check(JSONObject(checkNotNull(gate.poll(null))).getLong("delayMs")==3_000L)
+            }
+            test("delay settings persist and recover invalid saved values") { _, _ ->
+                // Instrumentation package preferences only: never replace the user's settings.
+                val prefs=context.getSharedPreferences("unattended",0)
+                try {
+                    prefs.edit().clear().commit()
+                    check(AutoDelaySettings.read(context)==AutoDelayRange(20,50))
+                    AutoDelaySettings.save(context,AutoDelayRange(13,27))
+                    check(AutoDelaySettings.read(context)==AutoDelayRange(13,27))
+                    prefs.edit().putInt("delay_min_tenths",99).putInt("delay_max_tenths",-1).commit()
+                    check(AutoDelaySettings.read(context)==AutoDelayRange(0,50))
+                    prefs.edit().putString("delay_min_tenths","bad").remove("delay_max_tenths").commit()
+                    check(AutoDelaySettings.read(context)==AutoDelayRange(20,50))
+                } finally { prefs.edit().clear().commit() }
+            }
             test("round settlement resumes automatically with a new round") { gate, _ ->
                 gate.observe(live()); gate.toggle()
                 gate.observe(JSONObject().put("status","waiting"))
@@ -290,6 +354,38 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.poll(ack(cmd.getString("id"),"waiting"))
                 check(gate.isEnabled() && JSONObject(checkNotNull(gate.poll(null))).getString("id")==cmd.getString("id"))
             }
+            test("validated custom model can arm and continue unattended") { gate, _ ->
+                gate.observe(live().put("modelExperimental",true)); gate.toggle()
+                val command=JSONObject(checkNotNull(gate.poll(null)))
+                check(gate.isEnabled() && command.getJSONObject("action").getString("kind")=="discard")
+                gate.poll(ack(command.getString("id"),"submitted"))
+                gate.observe(live().put("modelExperimental",true).put("canAct",false).put("input",JSONObject("""
+                    {"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"0m","moqie":false}}
+                """)))
+                gate.observe(live(2).put("modelExperimental",true))
+                check(gate.poll(null)==null)
+                gate.poll(ack(command.getString("id"),"accepted"))
+                check(gate.isEnabled() && JSONObject(checkNotNull(gate.poll(null))).getInt("revision")==2)
+            }
+            test("custom model fallback or missing proof still blocks unattended input") { gate, _ ->
+                gate.observe(live().put("modelExperimental",true).put("modelFallback",true)); gate.toggle()
+                check(gate.isEnabled() && gate.poll(null)==null)
+                gate.observe(live(2).put("modelExperimental",true)); check(gate.poll(null)!=null)
+                gate.observe(live(3).put("modelExperimental",true).put("modelFallback",true))
+                check(gate.isEnabled() && gate.poll(null)==null)
+                gate.observe(live(4).put("modelExperimental",true).put("sourceSequence",0))
+                check(gate.isEnabled() && gate.poll(null)==null)
+            }
+            test("custom model preserves stale rejection and manual stop") { gate, _ ->
+                gate.observe(live().put("modelExperimental",true)); gate.toggle()
+                val command=JSONObject(checkNotNull(gate.poll(null)))
+                gate.poll(ack(command.getString("id"),"stale"))
+                gate.observe(live().put("modelExperimental",true)); check(gate.poll(null)==null)
+                gate.observe(live(2).put("modelExperimental",true)); check(gate.poll(null)!=null)
+                gate.poll(ack("","manual"))
+                check(!gate.isEnabled() && gate.poll(null)==null)
+            }
+            if (!controllerOnly) ModelContractChecks.run(targetContext, context)
             output.putString("stream", "$tests controller checks passed\n")
             finish(-1, output)
         }.onFailure {

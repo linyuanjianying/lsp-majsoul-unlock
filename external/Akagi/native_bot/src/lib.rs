@@ -31,18 +31,14 @@ pub mod engine;
 pub mod model;
 #[cfg(feature = "infer")]
 pub mod mortal;
-/// Mortal's own `[C, 34]` observation layout (libriichi parity).
 #[cfg(feature = "infer")]
 pub mod mortal_obs;
-
-/// Analytic stand-in for Mortal's precomputed single-player tables.
-pub mod sp_tables;
-/// Self-relative seat features derived from a live game state.
 #[cfg(feature = "infer")]
 pub mod state_features;
-/// 3-player variants of the seat view.
 #[cfg(feature = "infer")]
 pub mod state_features_3p;
+#[cfg(feature = "infer")]
+pub mod sp_tables;
 
 /// Feature-plane and action-space geometry for a given player count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

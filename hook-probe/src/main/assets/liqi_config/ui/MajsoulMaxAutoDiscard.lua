@@ -22,6 +22,9 @@ local function claimWaiting(id, reason)
     waiting(id, 'claim_' .. reason)
 end
 local function claimProbe(id, stage)
+    if A.probeId ~= id then A.probeId = id; A.probeStages = {} end
+    if A.probeStages[stage] then return end
+    A.probeStages[stage] = true
     ack(id, 'probe', 'claim_' .. stage)
 end
 local function tile(value)
@@ -71,6 +74,14 @@ end
 local function seconds()
     return UnityEngine and UnityEngine.Time and UnityEngine.Time.realtimeSinceStartup
 end
+local function delaySeconds(command)
+    local lower, upper = command.delayMinMs, command.delayMaxMs
+    if type(lower) ~= 'number' or type(upper) ~= 'number' or lower ~= lower or upper ~= upper
+            or lower < 0 or upper > 5000 or lower > upper or lower % 100 ~= 0 or upper % 100 ~= 0 then
+        lower, upper = 2000, 5000
+    end
+    return (lower == upper and lower or math.random(lower, upper)) / 1000
+end
 local function continuation(command)
     local t = seconds()
     local d = DesktopMgr and DesktopMgr.Inst
@@ -107,7 +118,7 @@ local function continuation(command)
                 ..':'..tostring(ui.during_show_liujumanguan or false)
             local pending = A.continuation
             if not pending or pending.ui ~= ui or pending.key ~= key then
-                pending = {ui=ui, key=key, due=t + math.random(2000,5000)/1000}
+                pending = {ui=ui, key=key, due=t + delaySeconds(command)}
                 A.continuation = pending
             end
             A.resyncDue = nil
@@ -122,7 +133,7 @@ local function continuation(command)
     A.continuation = nil
     if command.control == 'mode' and command.resync and d.gameing
             and type(net._connectSuccess) == 'function' and t >= (A.nextResync or 0) then
-        A.resyncDue = A.resyncDue or (t + math.random(2000,5000)/1000)
+        A.resyncDue = A.resyncDue or (t + delaySeconds(command))
         if t >= A.resyncDue then
             A.resyncDue = nil; A.nextResync = t + 3; A.resyncing = true
             local ok = pcall(net._connectSuccess, net)
@@ -176,6 +187,13 @@ local function execute(command)
         return
     end
     if type(action) ~= 'table' then mark(id); ack(id, 'unknown_action'); return end
+    -- NewGame sorts the complete opening hand; only its first dealer discard
+    -- delegates moqie to the original client method. Never relax tile/hand proof.
+    local opening = context.openingDealerDiscard == true and action.clientOpeningDraw == true
+        and (action.kind == 'discard' or action.kind == 'riichi')
+        and context.dealer == command.seat and context.phase == 'wait_act'
+        and context.riichi ~= true and type(context.melds) == 'table' and #context.melds == 0
+        and type(command.hand) == 'table' and #command.hand == 14
     local kind, operation = action.kind, nil
     for _, op in ipairs(d.oplist or {}) do
         if op.type == action.type then operation = op end
@@ -204,14 +222,14 @@ local function execute(command)
         local name = view.pai:ToString()
         actual[#actual + 1] = name
         if name == command.gameTile and view.valid and not view.pai.baida and not view.is_open then
-            if command.tsumogiri == (view == r._last_tile) then selected = view end
+            if command.tsumogiri == (view == r._last_tile) or opening then selected = view end
         end
     end
     table.sort(actual); table.sort(expected)
     if #expected == 0 or table.concat(actual, ',') ~= table.concat(expected, ',') then
         mark(id); ack(id, 'hand_mismatch'); return
     end
-    if claimKind then waiting(id, 'claim_hand_verified') end
+    if claimKind then claimProbe(id, 'hand_verified') end
     local own, claim
     if claimKind then
         -- Unity property access may throw before the ordinary readiness check can report.
@@ -269,10 +287,17 @@ local function execute(command)
             if not d.lastqipai or type(d.lastqipai.ToString) ~= 'function' then return nil, nil end
             return d.lastqipai:ToString() == action.tile, d.lastqipai_seat
         end)
-        -- DesktopMgr.lastqipai and lastqipai_seat are presentation state and are
-        -- stale/inconsistently encoded in current game builds. They are diagnostic
-        -- only. The current server operation type, exact combination/index, hand,
-        -- response phase and capture proof remain mandatory before any claim call.
+        -- Prefer the captured server discard to unstable presentation fields.
+        -- Legacy commands without protocol context must still pass the UI guard.
+        local source = context.lastDiscard
+        if type(source) == 'table' then
+            if context.phase ~= 'wait_response' or tile(source.tile) ~= action.tile
+                    or source.seat ~= action.target then
+                mark(id); ack(id, 'target_mismatch'); return
+            end
+        elseif not targetOk or not tileMatches or seatValue ~= action.target + 1 then
+            mark(id); ack(id, 'target_mismatch'); return
+        end
         if claimKind then
             if not targetOk then claimProbe(id, 'target_read_ignored')
             elseif tileMatches == nil then claimProbe(id, 'target_unavailable_ignored')

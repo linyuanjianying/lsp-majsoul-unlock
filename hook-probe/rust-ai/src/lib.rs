@@ -7,7 +7,7 @@ use akagi_mobile_core::{
 };
 use native_bot::engine::{BotAction, Engine};
 use native_bot::model::{ExternalActivateFn, ExternalInferenceFn};
-use native_bot::mortal::{load_and_activate_pth, set_custom_onnx_contract};
+use native_bot::mortal::{load_pth, set_custom_onnx_contract};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -35,6 +35,7 @@ struct Assistant {
     step: u64,
     operations: Value,
     operation_seat: Option<u64>,
+    last_discard: Option<(u8, String)>,
 }
 
 fn waiting(message: &str) -> Value {
@@ -47,7 +48,7 @@ impl Assistant {
             flows: HashMap::new(), active: None, tracker: GameTracker::new(),
             engine: None, round_ready: false, input_pending: false, revision: 0, step: 0,
             operations: json!([]),
-            operation_seat: None,
+            operation_seat: None, last_discard: None,
         }
     }
 
@@ -159,6 +160,11 @@ impl Assistant {
                 _ => None,
             };
         }
+        match event {
+            MjaiEvent::Dahai { actor, pai, .. } => self.last_discard = Some((*actor, pai.to_string())),
+            MjaiEvent::Reach { .. } | MjaiEvent::ReachAccepted { .. } => {},
+            _ => self.last_discard = None,
+        }
         self.tracker.handle(event)?;
         if let Some(engine) = self.engine.as_mut() {
             engine.feed_line(&serde_json::to_string(event)?);
@@ -199,6 +205,12 @@ impl Assistant {
             }
         }
         let own = &snap.players[seat as usize];
+        // NewGame sorts all 14 opening tiles before assigning its UI last tile.
+        // The bridge's virtual dealer draw may therefore have a different identity.
+        // This exception ends as soon as any discard, meld or kita is observed.
+        let opening_dealer_discard = can_act && snap.oya == seat && snap.current_player == seat
+            && own.tehai.len() == 14 && !own.riichi_declared && !own.riichi_stage
+            && snap.players.iter().all(|p| p.river.is_empty() && p.melds.is_empty() && p.kita_tiles.is_empty());
         let model_label = self
             .engine
             .as_ref()
@@ -213,9 +225,10 @@ impl Assistant {
             "analysis":analysis, "recommendations":recommendations,
             "elapsedMs":begin.elapsed().as_millis() as u64,
             "model":model_label,
-            "modelFallback":custom_fallback, "estimated":true,
+            "modelFallback":custom_fallback, "modelExperimental":self.engine.as_ref().is_some_and(Engine::uses_experimental_policy), "estimated":true,
             "legalOperations":if self.operation_seat == Some(seat as u64) { self.operations.clone() } else { json!([]) },
-            "autoContext":{"wind":snap.bakaze,"kyoku":snap.kyoku,"honba":snap.honba,
+            "autoContext":{"openingDealerDiscard":opening_dealer_discard,"dealer":snap.oya,
+                "lastDiscard":self.last_discard.as_ref().map(|(seat,tile)| json!({"seat":seat,"tile":tile})),"wind":snap.bakaze,"kyoku":snap.kyoku,"honba":snap.honba,
                 "drawnTile":own.drawn_tile,"riichi":own.riichi_declared || own.riichi_stage,
                 "phase":snap.phase,"melds":own.melds},
         }))
@@ -303,14 +316,14 @@ pub extern "C" fn majmax_ai_set_policy_mask(mask: u8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn majmax_ai_load_mortal_pth(expected_players: u8, path: *const c_char) -> i32 {
+pub unsafe extern "C" fn majmax_ai_load_mortal_pth(expected_players: u8, path: *const c_char, activate: u8) -> i32 {
     if path.is_null() {
         return -1;
     }
     let Ok(path_str) = CStr::from_ptr(path).to_str() else {
         return -1;
     };
-    match catch_unwind(AssertUnwindSafe(|| load_and_activate_pth(expected_players, path_str))) {
+    match catch_unwind(AssertUnwindSafe(|| load_pth(expected_players, path_str, activate != 0))) {
         Ok(status) => status,
         Err(_) => -6,
     }
@@ -373,6 +386,36 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use prost::Message;
     use prost_reflect::DynamicMessage;
+
+    #[test]
+    fn opening_draw_identity_exception_ends_after_the_first_discard() {
+        for players in [4, 3] {
+            let mut host = Assistant::new();
+            authenticate(&mut host, players);
+            let opening = live_round(&mut host, players);
+            assert_eq!(opening["autoContext"]["openingDealerDiscard"], true);
+            assert_eq!(opening["autoContext"]["dealer"], opening["seat"]);
+            let discard: MjaiEvent = serde_json::from_value(json!({"type":"dahai","actor":0,
+                "pai":if players == 4 { "9s" } else { "9m" },"tsumogiri":true})).unwrap();
+            host.feed(&discard).unwrap();
+            assert_eq!(host.render().unwrap()["autoContext"]["openingDealerDiscard"], false);
+        }
+    }
+
+    #[test]
+    fn claim_context_comes_from_protocol_and_clears_on_next_draw() {
+        let mut host = Assistant::new();
+        authenticate(&mut host, 4);
+        live_round(&mut host, 4);
+        let discard: MjaiEvent = serde_json::from_value(json!({
+            "type":"dahai", "actor":0, "pai":"9s", "tsumogiri":true
+        })).unwrap();
+        host.feed(&discard).unwrap();
+        assert_eq!(host.render().unwrap()["autoContext"]["lastDiscard"],json!({"seat":0,"tile":"9s"}));
+        let draw: MjaiEvent = serde_json::from_value(json!({"type":"tsumo","actor":1,"pai":"?"})).unwrap();
+        host.feed(&draw).unwrap();
+        assert!(host.render().unwrap()["autoContext"]["lastDiscard"].is_null());
+    }
 
     #[test]
     fn automation_actions_preserve_target_and_consumed_red_tiles() {

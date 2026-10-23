@@ -24,6 +24,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Slider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -32,6 +33,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -44,6 +47,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlin.math.roundToInt
 
 @Composable
 internal fun AiScreen(padding: PaddingValues) {
@@ -51,12 +55,10 @@ internal fun AiScreen(padding: PaddingValues) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var allowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var showLicense by remember { mutableStateOf(false) }
+    var autoDelay by remember { mutableStateOf(AutoDelaySettings.read(context)) }
     var fourModel by remember { mutableStateOf(OnnxModelStore.info(context, 4)) }
     var threeModel by remember { mutableStateOf(OnnxModelStore.info(context, 3)) }
-    var modelMessage by remember { mutableStateOf("支持直接导入 Mortal 原生权重 (.pth / .pt) 或策略模型 (.onnx，含 Akagi 与 Mortal 协议)，支持四麻与三麻自动识别与切换。") }
-    val delayWindow = remember { AiOverlayService.readDelayRange(context) }
-    var delayMin by remember { mutableStateOf(delayWindow.first / 1000f) }
-    var delayMax by remember { mutableStateOf(delayWindow.last / 1000f) }
+    var modelMessage by remember { mutableStateOf("支持 Akagi ONNX，以及实验性四麻 Mortal v4（ONNX/PTH/PT，单文件上限 ${OnnxModelStore.MAX_MODEL_MIB} MiB）。兼容的自定义模型可用于无人值守，仍需手动开启；三麻 Mortal 暂不开放。模型仅保存在本机。") }
     val scope = rememberCoroutineScope()
     val status by AiStatus.state.collectAsStateWithLifecycle()
     val autoStatus by AutoDiscardState.state.collectAsStateWithLifecycle()
@@ -114,31 +116,27 @@ internal fun AiScreen(padding: PaddingValues) {
                         onCheckedChange = { AiOverlayService.toggleAuto() })
                 }
                 Text(autoStatus.message)
-                Text("出牌延迟 ${"%.1f".format(delayMin)} – ${"%.1f".format(delayMax)} 秒${if (delayMin == delayMax) "（固定）" else "（随机）"}",
-                    style = MaterialTheme.typography.titleSmall)
-                Text("最小延迟 ${"%.1f".format(delayMin)} 秒", style = MaterialTheme.typography.bodySmall)
-                Slider(value = delayMin,
-                    onValueChange = { delayMin = (minOf(it, delayMax) * 10).roundToInt() / 10f },
-                    onValueChangeFinished = {
-                        AiOverlayService.writeDelayRange(context,
-                            (delayMin * 1000).roundToLong(), (delayMax * 1000).roundToLong())
-                    },
-                    valueRange = 0f..5f, steps = 49)
-                Text("最大延迟 ${"%.1f".format(delayMax)} 秒", style = MaterialTheme.typography.bodySmall)
-                Slider(value = delayMax,
-                    onValueChange = { delayMax = (maxOf(it, delayMin) * 10).roundToInt() / 10f },
-                    onValueChangeFinished = {
-                        AiOverlayService.writeDelayRange(context,
-                            (delayMin * 1000).roundToLong(), (delayMax * 1000).roundToLong())
-                    },
-                    valueRange = 0f..5f, steps = 49)
-                Text("实际延迟在最小与最大之间随机，两端相同即为固定延迟；范围 0–5 秒、0.1 秒步进，默认 1.0–3.0 秒，下一手生效。",
+                Text("操作延迟 ${autoDelay.label}", style = MaterialTheme.typography.bodyMedium)
+                Text("最小延迟 ${autoDelay.seconds(autoDelay.minTenths)} 秒", style = MaterialTheme.typography.bodySmall)
+                Slider(value = autoDelay.minTenths.toFloat(),
+                    onValueChange = { autoDelay = autoDelay.withMinimum(it.roundToInt()) },
+                    onValueChangeFinished = { AutoDelaySettings.save(context, autoDelay) },
+                    valueRange = 0f..50f, steps = 49,
+                    modifier = Modifier.semantics { contentDescription = "最小操作延迟" })
+                Text("最大延迟 ${autoDelay.seconds(autoDelay.maxTenths)} 秒", style = MaterialTheme.typography.bodySmall)
+                Slider(value = autoDelay.maxTenths.toFloat(),
+                    onValueChange = { autoDelay = autoDelay.withMaximum(it.roundToInt()) },
+                    onValueChangeFinished = { AutoDelaySettings.save(context, autoDelay) },
+                    valueRange = 0f..50f, steps = 49,
+                    modifier = Modifier.semantics { contentDescription = "最大操作延迟" })
+                Text("范围 0–5 秒，步进 0.1 秒；两端相同时为固定延迟。默认 2–5 秒，设置自动保存，下次操作生效，当前倒计时不变。出牌、立直、鸣牌、和牌、跳过和结算继续共用此设置。",
                     style = MaterialTheme.typography.bodySmall)
-                Text("首次默认关闭；开启状态会保存。按 AI 首选操作，结算后继续下一局；断线或游戏退出后尝试恢复，取得完整牌局后继续。所有操作在设定的最小–最大区间内随机延迟。手动出牌或停止助手会关闭此模式。",
+                Text("首次默认关闭；开启状态会保存。按 AI 首选操作，结算后继续下一局；断线或游戏退出后尝试恢复，取得完整牌局后继续。所有操作按上方范围等待。手动出牌或停止助手会关闭此模式。",
                     style = MaterialTheme.typography.bodySmall)
                 Text("关闭模式后可正常退出游戏；收纳后点击“停”浮标会先关闭无人值守模式。整场结束后不会自动创建新对局。", style = MaterialTheme.typography.bodySmall)
             }
         }
+        Text("实验性 Mortal v4 仅支持四麻，可手动开启无人值守；特征含近似计算，尚未完成与上游的完整一致性验证。", style = MaterialTheme.typography.bodySmall)
         Text("策略模型", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
         PolicyModelCard(
             players = 4, model = fourModel, selectedCustom = OnnxModelStore.selectedCustom(context, 4),
@@ -212,18 +210,18 @@ internal fun AiScreen(padding: PaddingValues) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("如何理解这些指标", fontWeight = FontWeight.SemiBold)
                 Text("和牌率仅在听牌时显示；未听牌时显示向听数和进张。放铳风险指数包含打点权重，越低越好，并非实际放铳概率。分析只使用己方手牌与公开牌面。")
-                Text("内置 Akagi 本地轻量模型，同时支持直接导入四麻和三麻的 Mortal (.pth / .onnx) 及 Akagi (.onnx) 模型。自检使用内置样例，窗口会明确标记“非当前牌局”。")
-                TextButton(onClick = { showLicense = true }) { Text("Akagi 开源许可") }
+                Text("使用 Akagi 的本地轻量模型，支持普通四麻和三麻。自检使用内置样例，窗口会明确标记“非当前牌局”。")
+                TextButton(onClick = { showLicense = true }) { Text("助手开源许可") }
             }
         }
     }
     if (showLicense) {
         val license = remember {
-            listOf("licenses/Akagi-NOTICE.txt", "licenses/Akagi-LICENSE.txt").joinToString("\n\n") { name ->
+            listOf("licenses/Akagi-NOTICE.txt", "licenses/Akagi-LICENSE.txt", "licenses/Mortal-NOTICE.txt", "licenses/Mortal-LICENSE.txt").joinToString("\n\n") { name ->
                 runCatching { context.assets.open(name).bufferedReader().use { it.readText() } }.getOrDefault(name)
             }
         }
-        AlertDialog(onDismissRequest = { showLicense = false }, title = { Text("Akagi · Apache-2.0") },
+        AlertDialog(onDismissRequest = { showLicense = false }, title = { Text("Akagi / Mortal 开源许可") },
             text = { Text(license, Modifier.verticalScroll(rememberScrollState()), style = MaterialTheme.typography.bodySmall) },
             confirmButton = { TextButton(onClick = { showLicense = false }) { Text("关闭") } })
     }
@@ -250,7 +248,7 @@ private fun PolicyModelCard(
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(if (players == 4) "四麻模型" else "三麻模型", fontWeight = FontWeight.SemiBold)
-            Text("当前：$activeLabel")
+            Text("当前：${if (selectedCustom && model != null) model.format else "内置 Akagi"}")
             if (model != null) {
                 Text("${model.name} (${model.format}) · ${"%.1f".format(model.bytes / (1024f * 1024f))} MiB · SHA-256 ${model.sha256.take(12)}",
                     style = MaterialTheme.typography.bodySmall)
