@@ -32,7 +32,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private val dimmed = Color.rgb(180, 180, 200)
     private var opacity = preferences.getInt("opacity", 78).coerceIn(25, 95)
     private var width = preferences.getInt("width", 300).coerceIn(220, 420)
-    private var collapsed = preferences.getBoolean("collapsed", false)
+    private var collapsed = preferences.getBoolean("collapsed", true)
     private var settings = false
     private var auto = AutoDiscardStatus()
     private var result = JSONObject().put("status", "waiting").put("message", "等待牌局连接")
@@ -66,9 +66,12 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         if (auto == value) return
         auto = value
         title?.text = caption()
-        title?.contentDescription = if (collapsed && auto.enabled) "关闭无人值守模式，可拖动" else if (collapsed) "展开 AI 悬浮窗，可拖动" else "拖动悬浮窗"
+        title?.contentDescription = captionHint()
         if (!collapsed) renderBody()
     }
+    private fun captionHint() = if (collapsed) "点按展开 AI 悬浮窗，可拖动" else "拖动悬浮窗"
+    // The floating button is now only a control: it opens the panel, which
+    // carries the recommendation list and the unattended switch.
     private fun caption() = if (collapsed) (if (auto.enabled) "停" else "AI")
         else if (result.optString("status") == "demo") "本地自检 · 样例" else "雀魂 · 本地 AI"
 
@@ -110,11 +113,11 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         title = caption
         caption.gravity = if (collapsed) Gravity.CENTER else Gravity.CENTER_VERTICAL
         caption.setPadding(dp(if (collapsed) 0 else 12), 0, 0, 0)
-        caption.contentDescription = if (collapsed && auto.enabled) "关闭无人值守模式，可拖动" else if (collapsed) "展开 AI 悬浮窗，可拖动" else "拖动悬浮窗"
+        caption.contentDescription = captionHint()
         heading.addView(caption, LinearLayout.LayoutParams(if (collapsed) dp(48) else 0, dp(48), if (collapsed) 0f else 1f))
+        // Collapsed: a tap opens the panel, which also carries the auto switch.
         makeDraggable(caption) {
-            if (collapsed && auto.enabled) toggleAuto()
-            else if (collapsed) { collapsed = false; save(); rebuild() }
+            if (collapsed) { collapsed = false; save(); rebuild() }
         }
         if (!collapsed) {
             heading.addView(action("调节", "调节透明度和宽度") { settings = !settings; rebuild() })

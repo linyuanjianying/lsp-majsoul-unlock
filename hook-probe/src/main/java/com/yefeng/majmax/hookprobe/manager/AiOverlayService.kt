@@ -92,6 +92,7 @@ class AiOverlayService : Service() {
     private var reader: Thread? = null
     private var worker: Thread? = null
     private var overlay: AiFloatingWindow? = null
+    private var badges: TileBadgeOverlay? = null
     @Volatile private var fallbackLogged = false
     private val autoUiTick = object : Runnable {
         override fun run() {
@@ -133,6 +134,7 @@ class AiOverlayService : Service() {
             return
         }
         overlay = AiFloatingWindow(this, { stop(this) }, { auto.toggle() }).also { it.show() }
+        badges = TileBadgeOverlay(this).also { it.show() }
         main.post(autoUiTick)
         worker = Thread({ consume() }, "majmax-ai-engine").also { it.start() }
         reader = Thread({ listen() }, "majmax-ai-reader").also { it.start() }
@@ -291,6 +293,7 @@ class AiOverlayService : Service() {
         main.post {
             if (!alive.get() || epoch.get() != generation || revision.get() != ticket) return@post
             overlay?.update(result)
+            badges?.update(result)
             AiStatus.mutable.value = AiServiceStatus(true, connected, result.optString("message"))
         }
     }
@@ -298,6 +301,7 @@ class AiOverlayService : Service() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         overlay?.configurationChanged()
+        badges?.configurationChanged()
     }
 
     override fun onDestroy() {
@@ -312,6 +316,7 @@ class AiOverlayService : Service() {
         worker?.interrupt()
         queue.clear()
         main.removeCallbacksAndMessages(null)
+        badges?.close()
         overlay?.close()
         runCatching { revokeUriPermission(ENDPOINT_URI, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         AiStatus.mutable.value = AiServiceStatus()
