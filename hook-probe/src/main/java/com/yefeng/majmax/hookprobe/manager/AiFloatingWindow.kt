@@ -28,6 +28,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private val preferences = context.getSharedPreferences("ai-window", Context.MODE_PRIVATE)
     private val green = Color.rgb(114, 236, 176)
     private val muted = Color.rgb(200, 213, 206)
+    private val accent = Color.rgb(120, 180, 255)
+    private val dimmed = Color.rgb(180, 180, 200)
     private var opacity = preferences.getInt("opacity", 78).coerceIn(25, 95)
     private var width = preferences.getInt("width", 300).coerceIn(220, 420)
     private var collapsed = preferences.getBoolean("collapsed", false)
@@ -176,11 +178,13 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val analysis = result.optJSONObject("analysis") ?: return
         if (result.optBoolean("modelExperimental")) content.addView(label("实验性 Mortal v4 · 特征含近似计算", 12f, muted))
         val rows = result.optJSONArray("recommendations") ?: JSONArray()
+        if (rows.length() > 0) content.addView(recommendationHeader())
         if (rows.length() == 0) {
             content.addView(label("等待操作机会", 21f, green, true))
             analysis.optJSONObject("hand13")?.let { content.addView(label(handDescription(it), 12f, muted)) }
         }
-        for (i in 0 until minOf(3, rows.length())) {
+        val shown = minOf(3, rows.length())
+        for (i in 0 until shown) {
             val row = rows.getJSONObject(i)
             val tile = row.optString("tile")
             val kind = row.optString("kind")
@@ -195,35 +199,70 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
                 "abort" -> "九种九牌流局"
                 else -> "跳过"
             }
-            content.addView(label((if (i == 0) "推荐  " else "备选  ") + name,
-                if (i == 0) 23f else 16f, if (i == 0) green else Color.WHITE, true))
+            val color = when (i) { 0 -> green; 1 -> accent; else -> dimmed }
+            val weight = row.optDouble("weight", -1.0)
+            content.addView(recommendationRow(name, if (weight > 0.0) String.format(Locale.ROOT, "%.1f%%", weight * 100) else "", color))
             if (kind == "discard" || kind == "riichi") {
                 val index = tileIndex(tile)
                 val risks = analysis.optJSONArray("mixed_risk")
                 val risk = if (index >= 0 && risks != null && index < risks.length()) number(risks.optDouble(index)) else "—"
                 val hand = discardResult(analysis, tile)
-                if (i == 0) {
-                    if (hand != null) content.addView(label(handDescription(hand), 12f, muted))
-                    content.addView(label("放铳风险指数  $risk", 12f, muted))
-                } else {
+                if (i == 0) content.addView(label(mainDetail(hand, risk), 11f, muted))
+                else {
                     val chance = if (hand?.optInt("shanten") == 0) "估计和率 ${number(hand.optDouble("avg_agari_rate"))}%"
                         else "${hand?.optInt("shanten") ?: "—"}向听"
                     content.addView(label("$chance · 风险 $risk", 11f, muted))
                 }
             }
+            if (i < shown - 1) content.addView(divider(Color.argb(30, 255, 255, 255)))
         }
+        if (shown > 0) content.addView(divider(Color.argb(60, 139, 201, 164)))
         val defence = analysis.optString("best_defence_discard").takeUnless { it == "null" || it.isBlank() }
         val mixed = analysis.optJSONArray("mixed_risk") ?: JSONArray()
         if (defence != null && rows.length() > 0 && (0 until mixed.length()).any { mixed.optDouble(it) > 0.0 }) {
-            content.addView(label("防守参考  ${tileName(defence)}", 12f, muted))
+            content.addView(label("🛡️ 防守参考  ${tileName(defence)}", 12f, muted))
         }
         val opponents = analysis.optJSONArray("opponents") ?: JSONArray()
         val riichiSeats = (0 until opponents.length()).map { opponents.getJSONObject(it) }
             .filter { it.optBoolean("is_riichi") }.map { relativeSeat(it.optInt("seat"), result.optInt("seat"), result.optInt("players", 4)) }
-        if (riichiSeats.isNotEmpty()) content.addView(label("已立直：${riichiSeats.joinToString("、")}", 12f, Color.rgb(255, 191, 120)))
+        if (riichiSeats.isNotEmpty()) content.addView(label("⚠️ 已立直：${riichiSeats.joinToString("、")}", 12f, Color.rgb(255, 191, 120)))
         content.addView(label("和牌率为听牌后的估计；风险指数越低越好，含打点权重，并非实际放铳概率。", 10f, muted))
         val duration = if (status == "demo") result.optLong("loadAndInferenceMs") else result.optLong("elapsedMs")
         content.addView(label("手机本地计算 · ${duration} ms${if (status == "demo") "（含模型加载）" else ""}", 10f, muted))
+    }
+
+    private fun divider(color: Int) = View(context).apply {
+        setBackgroundColor(color)
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1))
+    }
+    private fun recommendationHeader() = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(6), dp(6), dp(6), dp(6))
+        addView(label("🎯 推荐切牌", 14f, green, true).apply { setPadding(0, 0, 0, 0) })
+        addView(divider(Color.argb(60, 139, 201, 164)))
+    }
+    private fun recommendationRow(name: String, chance: String, color: Int) = LinearLayout(context).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(36))
+        addView(label(name, 15f, color, true).apply {
+            maxLines = 1
+            includeFontPadding = false
+            setPadding(0, 0, 0, 0)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (chance.isNotBlank()) addView(label(chance, 14f, color, true).apply {
+            gravity = Gravity.END
+            setPadding(0, 0, 0, 0)
+        })
+    }
+    private fun mainDetail(hand: JSONObject?, risk: String): String {
+        if (hand == null) return "放铳风险指数 $risk"
+        val shanten = hand.optInt("shanten", 99)
+        val stage = when { shanten == 0 -> "听牌"; shanten < 0 -> "和牌形"; else -> "${shanten}向听" }
+        val waits = hand.optInt("waits_total")
+        val rate = if (shanten == 0) "和率 ${number(hand.optDouble("avg_agari_rate"))}%" else null
+        return listOfNotNull(stage, "进张 $waits 枚", rate, if (hand.optBoolean("is_furiten")) "振听" else null, "风险 $risk")
+            .joinToString(" · ")
     }
 
     private fun addSlider(parent: LinearLayout, name: String, min: Int, max: Int, value: Int,
