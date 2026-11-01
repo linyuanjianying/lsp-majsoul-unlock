@@ -8,6 +8,7 @@ import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,10 +16,8 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * Micro badges rendered directly above each recommended discard tile.
- *
- * Fully click-through (FLAG_NOT_TOUCHABLE), positioned precisely above
- * the player's in-hand tiles.
+ * High-visibility solid color badge cards rendered precisely above each recommended hand tile,
+ * mirroring the classic mahjong assistant HUD styling (ZizhiAssistant / Akagi).
  */
 internal class TileBadgeOverlay(private val context: Context) {
     private data class DiscardHint(
@@ -30,16 +29,18 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     private val windows = context.getSystemService(WindowManager::class.java)
     private val display = context.resources.displayMetrics
-    private val green = Color.rgb(114, 236, 176)
-    private val accent = Color.rgb(120, 190, 255)
-    private val dimmed = Color.rgb(200, 210, 220)
+
+    // Vibrant solid colors matching the reference style (Image 2)
+    private val primaryColor = Color.rgb(255, 140, 0)   // Vivid Deep Orange for top pick
+    private val secondaryColor = Color.rgb(33, 150, 243) // Bright Blue for secondary picks
+    private val subtleColor = Color.rgb(41, 128, 185)    // Muted Blue for minor suggestions
 
     private var root: FrameLayout? = null
     private var hand: List<String> = emptyList()
     private var result: JSONObject? = null
 
     private val layout = WindowManager.LayoutParams(
-        WindowManager.LayoutParams.MATCH_PARENT, dp(26),
+        WindowManager.LayoutParams.MATCH_PARENT, dp(36),
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -80,21 +81,18 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     private fun parseHints(rows: JSONArray): List<DiscardHint> {
-        val hints = ArrayList<DiscardHint>(3)
+        val hints = ArrayList<DiscardHint>(4)
         val usedIndices = HashSet<Int>()
 
         for (i in 0 until rows.length()) {
-            if (hints.size >= 3) break
+            if (hints.size >= 4) break
             val row = rows.optJSONObject(i) ?: continue
             val kind = row.optString("kind")
             val tile = row.optString("tile")
             if (kind !in DISCARD_KINDS || tile.isBlank() || tile == "null") continue
 
-            // Standardize red-dora format: 0m -> 5m, 0p -> 5p, 0s -> 5s
             val normalizedTile = tile.replace(Regex("^0([mps])$"), "5$1")
 
-            // Locate target tile position in player's current hand.
-            // When multiple identical tiles exist, prefer the drawn tile (last tile) or rightmost copy.
             var targetIndex = -1
             if (hand.isNotEmpty()) {
                 for (hIdx in hand.indices.reversed()) {
@@ -105,7 +103,7 @@ internal class TileBadgeOverlay(private val context: Context) {
                         break
                     }
                 }
-                if (targetIndex < 0) continue // Tile is not currently in hand
+                if (targetIndex < 0) continue
             }
 
             val rawWeight = row.optDouble("weight", Double.NaN).takeIf { it.isFinite() }
@@ -144,21 +142,21 @@ internal class TileBadgeOverlay(private val context: Context) {
         frame.removeAllViews()
 
         val tileCenters = computeTileCenters(hand.size)
-        val badges = ArrayList<Pair<TextView, Int>>()
+        val badgeViews = ArrayList<Pair<LinearLayout, Int>>()
 
         for ((rank, hint) in hints.withIndex()) {
-            val badgeView = createBadge(hint, rank)
             val center = tileCenters.getOrNull(hint.handIndex)
             if (center != null) {
+                val badgeView = createBadgeCard(hint, rank)
                 frame.addView(badgeView, FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT
                 ))
-                badges.add(badgeView to center)
+                badgeViews.add(badgeView to center)
             }
         }
 
-        if (badges.isEmpty()) {
+        if (badgeViews.isEmpty()) {
             detach()
             return
         }
@@ -171,10 +169,10 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
 
         frame.post {
-            for ((badgeView, centerX) in badges) {
+            for ((badgeView, centerX) in badgeViews) {
                 val badgeWidth = badgeView.width
                 val desiredLeft = (centerX - badgeWidth / 2)
-                    .coerceIn(dp(4), (frame.width - badgeWidth - dp(4)).coerceAtLeast(0))
+                    .coerceIn(dp(2), (frame.width - badgeWidth - dp(2)).coerceAtLeast(0))
                 val lp = badgeView.layoutParams as FrameLayout.LayoutParams
                 if (lp.leftMargin != desiredLeft) {
                     lp.leftMargin = desiredLeft
@@ -185,11 +183,63 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     /**
-     * Compute horizontal center (X) for every hand tile on the screen.
-     * In Majsoul landscape gameplay:
-     * - Hand starts at ~18.5% screen width
-     * - Drawn tile (14th tile) ends at ~75.8% screen width
-     * - Tile pitch is ~3.95% screen width
+     * Creates a solid-color two-row badge card (action on top, probability on bottom)
+     * matching the style shown in the reference assistant (Image 2).
+     */
+    private fun createBadgeCard(hint: DiscardHint, rank: Int) = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        isClickable = false
+        isFocusable = false
+        setPadding(dp(4), dp(1), dp(4), dp(1))
+
+        val bgColor = when (rank) {
+            0 -> primaryColor   // Solid Orange/Amber for #1
+            1 -> secondaryColor // Solid Bright Blue for #2
+            else -> subtleColor // Solid Steel Blue for #3 / #4
+        }
+
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(4).toFloat()
+            setColor(bgColor)
+            // Delicate white outline for crisp contrast against any game background
+            setStroke(dp(1), Color.argb(120, 255, 255, 255))
+        }
+
+        val isRiichi = hint.kind == "riichi"
+        val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
+
+        // Top line: Action name (e.g. "切西", "切9万", "立·切9索")
+        addView(TextView(context).apply {
+            text = actionText
+            textSize = 10f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            includeFontPadding = false
+            gravity = Gravity.CENTER
+            isClickable = false
+            isFocusable = false
+        })
+
+        // Bottom line: Percentage (e.g. "94.7%", "73.0%")
+        addView(TextView(context).apply {
+            text = if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
+            textSize = 9.5f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            includeFontPadding = false
+            gravity = Gravity.CENTER
+            isClickable = false
+            isFocusable = false
+        })
+    }
+
+    /**
+     * Compute horizontal center (X) for each hand tile on the screen.
+     * Aligned with actual gameplay screenshot:
+     * - Hand begins at ~18.5% of screen width
+     * - Tile pitch is ~3.95% of screen width
      * - Drawn tile has ~0.65x pitch gap from the 13th tile
      */
     private fun computeTileCenters(handSize: Int): List<Int> {
@@ -209,47 +259,19 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
     }
 
-    private fun createBadge(hint: DiscardHint, rank: Int) = TextView(context).apply {
-        val isRiichi = hint.kind == "riichi"
-        val prefix = if (isRiichi) "立·" else ""
-        text = if (hint.weight > 0.0) {
-            "$prefix${String.format(Locale.ROOT, "%.1f%%", hint.weight)}"
-        } else {
-            if (isRiichi) "立直" else "推荐"
-        }
-
-        textSize = 10f
-        setTextColor(when (rank) { 0 -> green; 1 -> accent; else -> dimmed })
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        includeFontPadding = false
-        maxLines = 1
-        gravity = Gravity.CENTER
-        setPadding(dp(4), dp(1), dp(4), dp(1))
-        elevation = dp(2).toFloat()
-        isClickable = false
-        isFocusable = false
-
-        background = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = dp(6).toFloat()
-            setColor(when (rank) {
-                0 -> Color.argb(235, 10, 44, 28)
-                1 -> Color.argb(230, 16, 32, 54)
-                else -> Color.argb(220, 24, 28, 36)
-            })
-            setStroke(dp(1), when (rank) {
-                0 -> green
-                1 -> Color.argb(200, 120, 190, 255)
-                else -> Color.argb(160, 160, 175, 190)
-            })
-        }
+    private fun tileDisplayName(tile: String): String {
+        val honors = mapOf("E" to "东", "S" to "南", "W" to "西", "N" to "北", "P" to "白", "F" to "发", "C" to "中")
+        honors[tile]?.let { return it }
+        if (tile.length < 2) return tile
+        val suit = when (tile[1]) { 'm' -> "万"; 'p' -> "筒"; 's' -> "索"; else -> "" }
+        return (if (tile.endsWith("r")) "赤" else "") + tile[0] + suit
     }
 
     /**
-     * Vertical position: precisely sitting on top of the hand tile upper edge.
-     * In Majsoul, hand tiles start at ~81% of screen height from top.
+     * Vertical position: right above the player's hand tiles.
+     * Hand tiles start at ~85.5% screen height in real gameplay; badge rests directly on top edge.
      */
-    private fun computeTop(screenH: Int) = (screenH * 0.805f).roundToInt() - dp(24)
+    private fun computeTop(screenH: Int) = (screenH * 0.855f).roundToInt() - dp(35)
 
     private fun dp(value: Int) = (value * display.density).roundToInt()
 
