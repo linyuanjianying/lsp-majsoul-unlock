@@ -16,8 +16,8 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * High-visibility solid color badge cards rendered precisely above each recommended hand tile,
- * mirroring the classic mahjong assistant HUD styling (ZizhiAssistant / Akagi).
+ * High-visibility solid color badge cards rendered precisely above each recommended hand tile.
+ * Supports both Hook-based exact pixel coordinates from Unity camera and geometric fallback.
  */
 internal class TileBadgeOverlay(private val context: Context) {
     private data class DiscardHint(
@@ -27,20 +27,29 @@ internal class TileBadgeOverlay(private val context: Context) {
         val handIndex: Int
     )
 
+    private data class HookedTile(
+        val tile: String,
+        val x: Int,
+        val y: Int,
+        val isLast: Boolean
+    )
+
     private val windows = context.getSystemService(WindowManager::class.java)
     private val display = context.resources.displayMetrics
 
-    // Vibrant solid colors matching the reference style (Image 2)
-    private val primaryColor = Color.rgb(255, 140, 0)   // Vivid Deep Orange for top pick
-    private val secondaryColor = Color.rgb(33, 150, 243) // Bright Blue for secondary picks
-    private val subtleColor = Color.rgb(41, 128, 185)    // Muted Blue for minor suggestions
+    // Vibrant solid colors matching the reference style (ZizhiAssistant / Akagi)
+    private val primaryColor = Color.rgb(255, 140, 0)   // Vivid Deep Orange for top recommendation
+    private val secondaryColor = Color.rgb(33, 150, 243) // Bright Blue for secondary recommendations
+    private val subtleColor = Color.rgb(41, 128, 185)    // Muted Steel Blue for minor suggestions
 
     private var root: FrameLayout? = null
     private var hand: List<String> = emptyList()
     private var result: JSONObject? = null
+    private var hookedTiles: List<HookedTile> = emptyList()
 
+    // Full-screen passthrough window allowing badges to be positioned anywhere with exact pixel accuracy
     private val layout = WindowManager.LayoutParams(
-        WindowManager.LayoutParams.MATCH_PARENT, dp(36),
+        WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -50,7 +59,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     ).apply {
         gravity = Gravity.TOP or Gravity.START
         x = 0
-        y = computeTop(display.heightPixels)
+        y = 0
     }
 
     fun show() = render(emptyList())
@@ -69,14 +78,41 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
     }
 
+    /**
+     * Called when the in-game Lua hook reports real-time screen coordinates
+     * computed directly by UnityEngine.Camera.main:WorldToScreenPoint.
+     */
+    fun updateHookedCoords(coords: JSONArray) {
+        val list = ArrayList<HookedTile>(coords.length())
+        for (i in 0 until coords.length()) {
+            val obj = coords.optJSONObject(i) ?: continue
+            val tile = obj.optString("tile")
+            val x = obj.optInt("x")
+            val y = obj.optInt("y")
+            val isLast = obj.optBoolean("last", false)
+            if (tile.isNotBlank()) {
+                list.add(HookedTile(tile, x, y, isLast))
+            }
+        }
+        if (list.isNotEmpty()) {
+            hookedTiles = list
+            // Re-render immediately with the exact hooked coordinates if we have active recommendations
+            val recommendations = result?.optJSONArray("recommendations")
+            val status = result?.optString("status")
+            if ((status == "live" || status == "demo") && recommendations != null && recommendations.length() > 0) {
+                render(parseHints(recommendations))
+            }
+        }
+    }
+
     fun close() {
         result = null
+        hookedTiles = emptyList()
         detach()
     }
 
     fun configurationChanged() {
         detach()
-        layout.y = computeTop(display.heightPixels)
         result?.let { update(it) }
     }
 
@@ -141,27 +177,51 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         frame.removeAllViews()
 
-        val tileCenters = computeTileCenters(hand.size)
-        val badgeViews = ArrayList<Pair<LinearLayout, Int>>()
+        // Match each hint to an exact (X, Y) target position
+        val badgeTargets = ArrayList<Pair<LinearLayout, Pair<Int, Int>>>()
+        val usedHooked = HashSet<Int>()
 
         for ((rank, hint) in hints.withIndex()) {
-            val center = tileCenters.getOrNull(hint.handIndex)
-            if (center != null) {
-                val badgeView = createBadgeCard(hint, rank)
+            val badgeView = createBadgeCard(hint, rank)
+            var targetX: Int? = null
+            var targetY: Int? = null
+
+            // 1. Try Hooked Coordinates first (100% exact from Unity Camera)
+            if (hookedTiles.isNotEmpty()) {
+                for ((idx, ht) in hookedTiles.withIndex()) {
+                    if (idx in usedHooked) continue
+                    val normalizedHt = ht.tile.replace(Regex("^0([mps])$"), "5$1").removeSuffix("r")
+                    if (normalizedHt == hint.tile.removeSuffix("r")) {
+                        targetX = ht.x
+                        // The badge rests directly above the tile
+                        targetY = (ht.y - dp(48)).coerceAtLeast(0)
+                        usedHooked.add(idx)
+                        break
+                    }
+                }
+            }
+
+            // 2. Fallback to Geometric Estimation if Hook coordinates are pending
+            if (targetX == null) {
+                val tileCenters = computeFallbackTileCenters(hand.size)
+                targetX = tileCenters.getOrNull(hint.handIndex)
+                targetY = (display.heightPixels * 0.855f).roundToInt() - dp(35)
+            }
+
+            if (targetX != null && targetY != null) {
                 frame.addView(badgeView, FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT
                 ))
-                badgeViews.add(badgeView to center)
+                badgeTargets.add(badgeView to (targetX to targetY))
             }
         }
 
-        if (badgeViews.isEmpty()) {
+        if (badgeTargets.isEmpty()) {
             detach()
             return
         }
 
-        layout.y = computeTop(display.heightPixels)
         if (root?.parent == null) {
             runCatching { manager.addView(frame, layout) }
         } else {
@@ -169,23 +229,24 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
 
         frame.post {
-            for ((badgeView, centerX) in badgeViews) {
+            for ((badgeView, target) in badgeTargets) {
+                val (centerX, topY) = target
                 val badgeWidth = badgeView.width
+                val badgeHeight = badgeView.height
                 val desiredLeft = (centerX - badgeWidth / 2)
                     .coerceIn(dp(2), (frame.width - badgeWidth - dp(2)).coerceAtLeast(0))
+                val desiredTop = topY.coerceIn(dp(2), (frame.height - badgeHeight - dp(2)).coerceAtLeast(0))
+
                 val lp = badgeView.layoutParams as FrameLayout.LayoutParams
-                if (lp.leftMargin != desiredLeft) {
+                if (lp.leftMargin != desiredLeft || lp.topMargin != desiredTop) {
                     lp.leftMargin = desiredLeft
+                    lp.topMargin = desiredTop
                     badgeView.layoutParams = lp
                 }
             }
         }
     }
 
-    /**
-     * Creates a solid-color two-row badge card (action on top, probability on bottom)
-     * matching the style shown in the reference assistant (Image 2).
-     */
     private fun createBadgeCard(hint: DiscardHint, rank: Int) = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER
@@ -203,14 +264,12 @@ internal class TileBadgeOverlay(private val context: Context) {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = dp(4).toFloat()
             setColor(bgColor)
-            // Delicate white outline for crisp contrast against any game background
-            setStroke(dp(1), Color.argb(120, 255, 255, 255))
+            setStroke(dp(1), Color.argb(130, 255, 255, 255))
         }
 
         val isRiichi = hint.kind == "riichi"
         val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
 
-        // Top line: Action name (e.g. "切西", "切9万", "立·切9索")
         addView(TextView(context).apply {
             text = actionText
             textSize = 10f
@@ -222,7 +281,6 @@ internal class TileBadgeOverlay(private val context: Context) {
             isFocusable = false
         })
 
-        // Bottom line: Percentage (e.g. "94.7%", "73.0%")
         addView(TextView(context).apply {
             text = if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
             textSize = 9.5f
@@ -235,14 +293,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         })
     }
 
-    /**
-     * Compute horizontal center (X) for each hand tile on the screen.
-     * Aligned with actual gameplay screenshot:
-     * - Hand begins at ~18.5% of screen width
-     * - Tile pitch is ~3.95% of screen width
-     * - Drawn tile has ~0.65x pitch gap from the 13th tile
-     */
-    private fun computeTileCenters(handSize: Int): List<Int> {
+    private fun computeFallbackTileCenters(handSize: Int): List<Int> {
         val screenW = display.widthPixels
         val count = if (handSize in 1..14) handSize else 14
 
@@ -266,12 +317,6 @@ internal class TileBadgeOverlay(private val context: Context) {
         val suit = when (tile[1]) { 'm' -> "万"; 'p' -> "筒"; 's' -> "索"; else -> "" }
         return (if (tile.endsWith("r")) "赤" else "") + tile[0] + suit
     }
-
-    /**
-     * Vertical position: right above the player's hand tiles.
-     * Hand tiles start at ~85.5% screen height in real gameplay; badge rests directly on top edge.
-     */
-    private fun computeTop(screenH: Int) = (screenH * 0.855f).roundToInt() - dp(35)
 
     private fun dp(value: Int) = (value * display.density).roundToInt()
 

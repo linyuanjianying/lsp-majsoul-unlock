@@ -159,6 +159,19 @@ class AiOverlayService : Service() {
     }
 
     private fun pollAuto(acks: String?): String {
+        if (acks != null && acks.contains("\"hand_coords\"")) runCatching {
+            val rows = org.json.JSONArray(acks)
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                if (row.optString("state") == "hand_coords") {
+                    val raw = row.optString("reason")
+                    if (raw.isNotBlank()) {
+                        val coords = org.json.JSONArray(raw)
+                        main.post { badges?.updateHookedCoords(coords) }
+                    }
+                }
+            }
+        }
         val command = auto.poll(acks)
         val delay = AutoDelaySettings.read(this)
         val response = if (command != null && !demoMode.get()) JSONObject(command).put("unattended", true)

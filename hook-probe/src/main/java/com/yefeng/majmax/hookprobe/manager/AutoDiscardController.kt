@@ -144,6 +144,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             for (index in 0 until rows.length()) {
                 val ack = rows.getJSONObject(index)
                 when (ack.optString("state")) {
+                    "hand_coords" -> continue
                     "external" -> { if (enabled) suspend("游戏自动操作已完成，等待下一次同步"); continue }
                     "continued" -> { log("ROUND_CONTINUED"); continue }
                     "resync" -> { log("RESYNC_REQUESTED"); continue }
