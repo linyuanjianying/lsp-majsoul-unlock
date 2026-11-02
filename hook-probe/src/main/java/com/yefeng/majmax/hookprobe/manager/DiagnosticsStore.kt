@@ -53,7 +53,7 @@ internal object DiagnosticsStore {
         "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho", "tiles",
         "order", "reds", "behind", "minNx", "maxNx", "minNy", "maxNy", "sample", "views_n",
-        "cam", "cams")
+        "cam", "cams", "pairs")
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
     private fun logFile(context: Context, kind: DiagnosticKind, index: Int = 1) =
@@ -229,7 +229,7 @@ internal object DiagnosticsStore {
                     // Order/coordinate snapshots need separators and room for ~14 tiles.
                     val limit = when (key) {
                         "errorMessage" -> 240
-                        "order", "views", "tiles" -> 512
+                        "order", "views", "tiles", "pairs" -> 512
                         "cams" -> 256
                         else -> 64
                     }

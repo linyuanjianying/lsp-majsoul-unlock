@@ -286,17 +286,20 @@ internal class TileBadgeOverlay(private val context: Context) {
             // normal five happened to appear first in the hand.
             val normalizedTile = canonicalTile(tile)
 
+            // A recommendation whose tile is absent from the protocol hand cannot be
+            // anchored to any on-screen tile: drop it before it reaches positionHints.
+            // The `hand` may be empty only transiently (result without a hand field);
+            // in that case there is no index to pair against either, so skip the hint
+            // rather than carrying a sentinel handIndex=-1 into placement.
             var targetIndex = -1
-            if (hand.isNotEmpty()) {
-                for (hIdx in hand.indices) {
-                    if (hIdx !in usedIndices && canonicalTile(hand[hIdx]) == normalizedTile) {
-                        targetIndex = hIdx
-                        usedIndices.add(hIdx)
-                        break
-                    }
+            for (hIdx in hand.indices) {
+                if (hIdx !in usedIndices && canonicalTile(hand[hIdx]) == normalizedTile) {
+                    targetIndex = hIdx
+                    usedIndices.add(hIdx)
+                    break
                 }
-                if (targetIndex < 0) continue
             }
+            if (targetIndex < 0) continue
 
             val rawWeight = row.optDouble("weight", Double.NaN).takeIf { it.isFinite() }
                 ?: (row.optDouble("policyProbability", 0.0) * 100).takeIf { it.isFinite() } ?: 0.0
@@ -343,31 +346,43 @@ internal class TileBadgeOverlay(private val context: Context) {
         val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
         val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
 
+        // Bounded hint→view pairing trace so a real device can answer "which hint
+        // went missing/ambiguous and why" without guessing. Only the tile keys and
+        // their view counts are recorded — ordinary gameplay state, not credentials.
+        // Format uses only sanitizer-allowed separators (`=` and `:`), e.g.
+        // "9s=9s:0" (missing), "3p=3p:2" (ambiguous), "7s=7s:1" (unique match).
         val viewCounts = hookedTiles.groupingBy { canonicalTile(it.tile) }.eachCount()
         var ambiguous = 0
         var missing = 0
+        val pairingTrace = StringBuilder()
 
         for (hint in hints) {
             val key = canonicalTile(hint.tile)
+            val count = viewCounts[key] ?: 0
             // Ambiguity is only relevant for the tile we actually want to point at.
-            if ((viewCounts[key] ?: 0) > 1) {
+            if (count > 1) {
                 ambiguous++
-                continue
+            } else {
+                val view = hookedTiles.firstOrNull { canonicalTile(it.tile) == key }
+                if (view == null) {
+                    missing++
+                } else {
+                    placed[hint.handIndex] = (view.normX * frameWidth).roundToInt() to
+                        ((view.normY * frameHeight).roundToInt() - lift).coerceAtLeast(0)
+                }
             }
-            val view = hookedTiles.firstOrNull { canonicalTile(it.tile) == key }
-            if (view == null) {
-                missing++
-                continue
+            if (pairingTrace.length < 112) {
+                if (pairingTrace.isNotEmpty()) pairingTrace.append(' ')
+                pairingTrace.append(hint.tile).append('=').append(key).append(':').append(count)
             }
-            placed[hint.handIndex] = (view.normX * frameWidth).roundToInt() to
-                ((view.normY * frameHeight).roundToInt() - lift).coerceAtLeast(0)
         }
 
         if (ambiguous > 0 || missing > 0) {
             GeometryTrace.note(
                 "BADGE_PARTIAL",
                 "ambiguous=$ambiguous;missing=$missing;placed=${placed.size};hand=${hand.size};" +
-                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight"
+                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight" +
+                    if (pairingTrace.isNotEmpty()) ";pairs=${pairingTrace}" else ""
             )
         }
         return placed
@@ -427,8 +442,15 @@ internal class TileBadgeOverlay(private val context: Context) {
             runCatching { manager.updateViewLayout(frame, layout) }
         }
 
+        // Defer only the pixel placement until the frame has a measured size.
+        // Guard against a stale callback racing a subsequent render: if this frame
+        // is no longer the live root, or a badge view has already been removed by a
+        // later removeAllViews(), skip it instead of pinning a dead view's margins
+        // (which previously left a badge stranded on the previous hand's tile).
         frame.post {
+            if (root !== frame) return@post
             for ((badgeView, target) in badgeTargets) {
+                if (badgeView.parent !== frame) continue
                 val (centerX, topY) = target
                 val badgeWidth = badgeView.width
                 val badgeHeight = badgeView.height
