@@ -195,12 +195,12 @@ internal class TileBadgeOverlay(private val context: Context) {
                 }
             }
 
-            // 2. High-precision geometric positioning calibrated directly on real gameplay
+            // 2. Measured geometric fallback, calibrated from a real 2376x1080 screenshot:
+            //    hand row spans x 452..1680, tile tops at y 935, tile pitch ~100.8px.
             if (targetX == null) {
-                val tileCenters = computeTileCenters(hand.size)
-                targetX = tileCenters.getOrNull(hint.handIndex)
-                // Positioned right above the hand tiles upper edge (86.5% screen height)
-                targetY = (display.heightPixels * 0.865f).roundToInt() - dp(34)
+                val geometry = handGeometry(hand.size)
+                targetX = geometry.centers.getOrNull(hint.handIndex)
+                targetY = geometry.top - dp(34)
             }
 
             if (targetX != null && targetY != null) {
@@ -288,40 +288,47 @@ internal class TileBadgeOverlay(private val context: Context) {
         })
     }
 
-    /**
-     * Compute horizontal center (X) for each hand tile on the screen.
-     * Calibrated strictly to the physical device screen (2376x1080) and in-game geometry:
-     * - Hand horizontal center is at 45.61% of screen width (1084px in 2376px)
-     * - Tile pitch is 4.24% of screen width (101px in 2376px)
-     * - Drawn tile gap is 2.0% of screen width (48px in 2376px)
-     */
-    private fun computeTileCenters(handSize: Int): List<Int> {
-        val screenW = display.widthPixels
-        val count = if (handSize in 1..14) handSize else 14
-
-        val tilePitch = (screenW * 0.0424f).roundToInt()
-        val drawnGap = (screenW * 0.020f).roundToInt()
-        val totalHandWidth = (count - 1) * tilePitch + if (count >= 13) drawnGap else 0
-
-        // Hand is anchored at 45.61% screen center
-        val startX = (screenW * 0.4561f - totalHandWidth / 2f).roundToInt()
-
-        return (0 until count).map { i ->
-            if (i < count - 1 || count < 13) {
-                startX + i * tilePitch + tilePitch / 2
-            } else {
-                // The last slot is the drawn tile (separated by drawnGap)
-                startX + (count - 1) * tilePitch + drawnGap + tilePitch / 2
-            }
-        }
-    }
-
     private fun tileDisplayName(tile: String): String {
         val honors = mapOf("E" to "东", "S" to "南", "W" to "西", "N" to "北", "P" to "白", "F" to "发", "C" to "中")
         honors[tile]?.let { return it }
         if (tile.length < 2) return tile
         val suit = when (tile[1]) { 'm' -> "万"; 'p' -> "筒"; 's' -> "索"; else -> "" }
         return (if (tile.endsWith("r")) "赤" else "") + tile[0] + suit
+    }
+
+    private data class HandGeometry(val centers: List<Int>, val top: Int)
+
+    /**
+     * Measured hand layout for the current screen.
+     *
+     * Values come from a real 2376x1080 gameplay screenshot: the hand row spans
+     * x 452..1680 with 12 concealed tiles about 100.8 px wide, tile tops at y 935,
+     * and the drawn tile separated by roughly half a tile.
+     */
+    private fun handGeometry(handSize: Int): HandGeometry {
+        val width = display.widthPixels
+        val height = display.heightPixels
+        // Ratios measured on 2376x1080; recomputed against the live display so that
+        // other resolutions or a resolution override keep the same relative layout.
+        val firstCenter = width * (505.4f / 2376f)
+        val pitch = width * (100.8f / 2376f)
+        val drawnGap = pitch * 0.45f
+        val top = (height * (935f / 1080f)).roundToInt()
+
+        val concealed = when {
+            handSize <= 0 -> 13
+            handSize > 13 -> handSize - 1
+            else -> handSize
+        }
+        val centers = ArrayList<Int>(maxOf(handSize, concealed))
+        for (i in 0 until concealed) {
+            centers.add((firstCenter + i * pitch).roundToInt())
+        }
+        // A 14th slot is the freshly drawn tile, separated from the sorted hand.
+        repeat((handSize - concealed).coerceAtLeast(0)) {
+            centers.add((firstCenter + concealed * pitch + drawnGap).roundToInt())
+        }
+        return HandGeometry(centers, top)
     }
 
     private fun dp(value: Int) = (value * display.density).roundToInt()
