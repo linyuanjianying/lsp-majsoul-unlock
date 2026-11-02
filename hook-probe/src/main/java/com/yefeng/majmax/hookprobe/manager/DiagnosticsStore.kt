@@ -52,7 +52,8 @@ internal object DiagnosticsStore {
         // order/coordinate snapshot needed to validate hand-to-view mapping.
         "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho", "tiles",
-        "order", "reds", "behind", "minNx", "maxNx", "minNy", "maxNy", "sample", "views_n")
+        "order", "reds", "behind", "minNx", "maxNx", "minNy", "maxNy", "sample", "views_n",
+        "cam", "cams")
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
     private fun logFile(context: Context, kind: DiagnosticKind, index: Int = 1) =
@@ -229,10 +230,11 @@ internal object DiagnosticsStore {
                     val limit = when (key) {
                         "errorMessage" -> 240
                         "order", "views", "tiles" -> 512
+                        "cams" -> 256
                         else -> 64
                     }
                     put(key, value.take(limit)
-                        .filter { it.isLetterOrDigit() || it in " _-./()：:@,+" })
+                        .filter { it.isLetterOrDigit() || it in " _-./()：:@,+|" })
                 }
             }
         }

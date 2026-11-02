@@ -488,5 +488,131 @@ test('coordinates behind the camera are counted and excluded',function()
     assert(geom.concealed == 1 and geom.behind == 1 and geom.invalid == 1,
         'one tile behind camera must be counted, not projected')
 end)
+-- Camera selection must pick the camera whose projection actually lands the
+-- concealed hand in the lower viewport, not Camera.main or the first entry. The
+-- real device showed every tile projected to ny ~= 2.0 (off-screen below) because
+-- get3DCamera picked a non-orthographic scene/UI camera and rejected the correct
+-- one; these fixtures reproduce that shape and assert the fix.
+local function multiCamFixture(cams, camNameForMain)
+    __majmax_auto = nil
+    local screenW, screenH = 2376, 1080
+    UnityEngine = {
+        Camera = { main = camNameForMain and cams[camNameForMain] or nil, allCameras = {} },
+        Screen = { width = screenW, height = screenH },
+        Time = { realtimeSinceStartup = 0 },
+    }
+    local list = UnityEngine.Camera.allCameras
+    for name, c in pairs(cams) do list[#list + 1] = c end
+    local acks = {}
+    cjson = { encode = function(v) acks[#acks + 1] = v; return 'ack' end,
+        decode = function() return {} end }
+    package.loaded.cjson = cjson
+    __majmax_auto_command = function() return '' end
+    __majmax_auto_ack = function() end
+    -- The asset's install() gate requires a network manager, so provide a stub so
+    -- reportHandCoords actually runs regardless of test ordering.
+    MJNetMgr = { SendRequest = function() end, Inst = { IsOK = function() return true end } }
+    local function view(tile, x, y, z)
+        local pai = { t = tile, baida = false }
+        function pai:ToString() return self.t end
+        return { pai = pai, valid = true, is_open = false,
+            transform = { position = { wx = x, wy = y, wz = z or 5 } } }
+    end
+    local role = { _handpai = {}, _last_tile = nil }
+    DesktopMgr = { Inst = { gameing = true, current_step = 3, mainrole = role } }
+    dofile(asset)
+    return acks, role, function() __majmax_auto_tick() end, view
+end
+
+-- A camera maps a world position to screen pixels. `z` comes back negative when
+-- the point is behind it; otherwise the caller supplies the screen x/y directly.
+local function cam(name, ortho, project)
+    local c = { name = name, orthographic = ortho, enabled = true }
+    function c:WorldToScreenPoint(p)
+        local sp = project(p)
+        return { x = sp[1], y = sp[2], z = sp[3] or 5 }
+    end
+    return c
+end
+
+local HAND = { { '1m', 0.20, 0.82 }, { '2m', 0.28, 0.82 }, { '3m', 0.36, 0.82 }, { '4m', 0.44, 0.82 } }
+
+test('camera selection prefers the orthographic hand camera over a misaligned Camera.main',function()
+    local screenW, screenH = 2376, 1080
+    local mainCam = cam('UI Camera', false, function(p)
+        -- A UI/scene camera whose projection dumps every tile off-screen below
+        -- (ny ~= 2.0), exactly matching the real-device GAME_GEOMETRY sample.
+        return { p.wx, -screenH, 5 }
+    end)
+    local handCam = cam('GameHand Camera', true, function(p)
+        -- The orthographic camera that actually renders the hand in the lower band.
+        return { (1 - p.wx) * screenW, (1 - p.wy) * screenH, 5 }
+    end)
+    local acks, role, tick, view = multiCamFixture(
+        { ['UI Camera'] = mainCam, ['GameHand Camera'] = handCam }, 'UI Camera')
+    for _, t in ipairs(HAND) do role._handpai[#role._handpai + 1] = view(t[1], t[2], t[3]) end
+    role._last_tile = role._handpai[1]
+    tick()
+    local coords, geom
+    for _, a in ipairs(acks) do
+        if a.state == 'hand_coords' then coords = a end
+        if type(a.handpai) == 'number' and a.screenW then geom = a end
+    end
+    assert(geom and geom.cam == 'GameHand Camera', 'expected the hand camera, got ' .. tostring(geom and geom.cam))
+    assert(geom.ortho == true, 'expected an orthographic hand camera')
+    assert(coords, 'expected hand_coords from the correct camera')
+    -- All tiles must land inside the viewport now.
+    assert(geom.minNx >= 0 and geom.maxNx <= 1 and geom.minNy >= 0 and geom.maxNy <= 1,
+        'projected hand must be inside the viewport')
+end)
+
+test('camera selection rejects an upper-half (mirrored) projection even if in view',function()
+    local screenW, screenH = 2376, 1080
+    local mirror = cam('Mirror Camera', true, function(p)
+        -- Lands tiles "in view" but in the *upper* half: not the hand, a reflection.
+        return { (1 - p.wx) * screenW, p.wy * screenH, 5 }
+    end)
+    local handCam = cam('GameHand Camera', true, function(p)
+        return { (1 - p.wx) * screenW, (1 - p.wy) * screenH, 5 }
+    end)
+    local acks, role, tick, view = multiCamFixture(
+        { ['Mirror Camera'] = mirror, ['GameHand Camera'] = handCam }, 'Mirror Camera')
+    for _, t in ipairs(HAND) do role._handpai[#role._handpai + 1] = view(t[1], t[2], t[3]) end
+    tick()
+    local geom
+    for _, a in ipairs(acks) do if type(a.handpai) == 'number' and a.screenW then geom = a end end
+    assert(geom.cam == 'GameHand Camera', 'must not pick a mirror/effect camera')
+end)
+
+test('camera selection reports per-camera diagnostics and keeps text hint when none cover the hand',function()
+    local screenW, screenH = 2376, 1080
+    local wrong1 = cam('Scene Camera', false, function(p) return { p.wx, -screenH, 5 } end)
+    local wrong2 = cam('Effect Camera', false, function(p) return { p.wx * 3, -screenH, 5 } end)
+    local acks, role, tick, view = multiCamFixture(
+        { ['Scene Camera'] = wrong1, ['Effect Camera'] = wrong2 }, 'Scene Camera')
+    for _, t in ipairs(HAND) do role._handpai[#role._handpai + 1] = view(t[1], t[2], t[3]) end
+    tick()
+    local geom
+    for _, a in ipairs(acks) do if type(a.handpai) == 'number' and a.screenW then geom = a end end
+    assert(geom.cam == '', 'no valid camera means no camera is trusted')
+    assert(geom.concealed == 0, 'no coordinates emitted when no camera covers the hand')
+    assert(type(geom.cams) == 'string' and geom.cams ~= '', 'per-camera diagnostics must be recorded')
+    -- A hand_coords must NOT be sent.
+    for _, a in ipairs(acks) do assert(a.state ~= 'hand_coords', 'must not emit bogus coords') end
+end)
+
+test('camera selection is stable when the same camera renders every tile in view',function()
+    local screenW, screenH = 2376, 1080
+    local handCam = cam('GameHand Camera', false, function(p)
+        return { (1 - p.wx) * screenW, (1 - p.wy) * screenH, 5 }
+    end)
+    local acks, role, tick, view = multiCamFixture({ ['GameHand Camera'] = handCam }, 'GameHand Camera')
+    for _, t in ipairs(HAND) do role._handpai[#role._handpai + 1] = view(t[1], t[2], t[3]) end
+    tick()
+    local geom
+    for _, a in ipairs(acks) do if type(a.handpai) == 'number' and a.screenW then geom = a end end
+    assert(geom.cam == 'GameHand Camera' and geom.concealed == #HAND)
+end)
+
 print(string.format('%d automatic operation checks passed',count))
 

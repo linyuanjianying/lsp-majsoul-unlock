@@ -395,46 +395,135 @@ local function execute(command)
     if not ok then ack(id, claimKind and 'claim_run_exception' or 'game_exception')
     elseif claimKind then claimProbe(id, 'invoked') end
 end
-local function get3DCamera()
+-- Enumerates every enabled camera, projects one sample position through each, and
+-- returns them in a stable, de-duplicated order (main first, then allCameras). This
+-- lets reportHandCoords score cameras by how well they actually land hand tiles in
+-- the viewport instead of trusting Camera.main or index order.
+local function enumerateCameras()
     local Camera = UnityEngine and UnityEngine.Camera
-    if not Camera then return nil end
-    -- Prefer the main perspective camera, which is the one the game renders the
-    -- 3D board through. allCameras is unordered and its first perspective entry
-    -- can be a UI/effect camera whose WorldToScreenPoint result does not land on
-    -- the hand at all, so picking by index order is unsafe.
+    if not Camera then return {} end
+    local out, seen = {}, {}
     local main = Camera.main
-    if main and main.enabled and not main.orthographic then
-        return main
+    if main and main.enabled then
+        out[#out + 1] = main
+        seen[main] = true
     end
     local all = Camera.allCameras
     if all then
+        -- Unity exposes Camera.allCameras as a C# array (0-based, Length) in most
+        -- Lua bindings, but a few bridges convert it to a 1-based Lua table. Detect
+        -- the base by whether index 0 holds an element so both shapes are covered.
         local count = all.Length or (type(all) == 'table' and #all) or 0
-        for i = 0, count - 1 do
+        local base = (all[0] ~= nil) and 0 or 1
+        for i = base, base + count - 1 do
             local c = all[i]
-            if c and c.enabled and not c.orthographic then
-                return c
+            if c and c.enabled and not seen[c] then
+                seen[c] = true
+                out[#out + 1] = c
             end
         end
     end
-    return main
+    return out
+end
+
+-- Projects the concealed hand positions through one camera and returns, for that
+-- camera, the number of tiles that land inside the normalized viewport plus a
+-- bounded bounding box. `z<0` (behind the camera) is counted as outside.
+local function projectThrough(cam, positions, screenW, screenH)
+    local inView, behind, total = 0, 0, 0
+    local minNx, maxNx, minNy, maxNy = 2, -2, 2, -2
+    local sumNy = 0
+    for _, p in ipairs(positions) do
+        total = total + 1
+        local ok, sp = pcall(cam.WorldToScreenPoint, cam, p)
+        if not ok or type(sp) ~= 'table' then
+            -- Projection threw (e.g. a disposed camera); treat as not in view and
+            -- not behind, so it neither inflates behind nor inView.
+        else
+            local z = sp.z or 0
+            local x, y = sp.x or 0, sp.y or 0
+            if z < 0 then
+                behind = behind + 1
+            else
+                local nx = x / screenW
+                local ny = (screenH - y) / screenH
+                if nx < minNx then minNx = nx end
+                if nx > maxNx then maxNx = nx end
+                if ny < minNy then minNy = ny end
+                if ny > maxNy then maxNy = ny end
+                sumNy = sumNy + ny
+                if nx >= 0 and nx <= 1 and ny >= 0 and ny <= 1 then
+                    inView = inView + 1
+                end
+            end
+        end
+    end
+    if total == 0 then return { inView = 0, behind = 0, minNx = 2, maxNx = -2, minNy = 2, maxNy = -2, meanNy = 0, total = 0 } end
+    local projected = total - behind
+    return {
+        inView = inView,
+        behind = behind,
+        minNx = minNx,
+        maxNx = maxNx,
+        minNy = minNy,
+        maxNy = maxNy,
+        meanNy = projected > 0 and (sumNy / projected) or 0,
+        total = total,
+    }
+end
+
+-- Chooses the camera whose projection actually places the concealed hand in the
+-- lower region of the viewport. The hand sits along the bottom edge of the screen,
+-- so a correct projection has most tiles with 0 <= nx <= 1 and ny near 1 (bottom).
+-- A camera whose tiles all land off-screen, or whose tiles sit in the *upper* half
+-- (mean ny < 0.5, the mirror image of a hand), is rejected rather than trusted.
+--
+-- Scoring is purely observational: it never rescales or clamps a coordinate to fake
+-- an in-viewport result. If no camera lands at least half the hand in view, nil is
+-- returned so the caller keeps the text hint and records a bounded reason.
+local function pickCamera(positions, screenW, screenH)
+    local cams = enumerateCameras()
+    if #cams == 0 or #positions == 0 then return nil, nil end
+    local best, bestScore = nil, nil
+    for _, cam in ipairs(cams) do
+        local r = projectThrough(cam, positions, screenW, screenH)
+        if r.total > 0 and r.inView > 0 then
+            -- Require the projected hand to sit in the lower half of the screen;
+            -- an upper-half projection is a mirrored/effect camera, not the hand.
+            if r.meanNy >= 0.5 then
+                -- Primary: number of tiles in view. Tie-break: mean ny closer to the
+                -- bottom (larger), then a more compact horizontal spread.
+                local score = { inView = r.inView, meanNy = r.meanNy, span = -(r.maxNx - r.minNx) }
+                local better = bestScore == nil
+                if not better then
+                    if score.inView ~= bestScore.inView then better = score.inView > bestScore.inView
+                    elseif score.meanNy ~= bestScore.meanNy then better = score.meanNy > bestScore.meanNy
+                    else better = score.span > bestScore.span end
+                end
+                if better then best, bestScore = cam, score end
+            end
+        end
+    end
+    if best == nil then return nil, nil end
+    return best, bestScore
 end
 
 local function reportHandCoords()
     local d = DesktopMgr and DesktopMgr.Inst
     local r = d and d.mainrole
-    local cam = get3DCamera()
     local Screen = UnityEngine and UnityEngine.Screen
     local screenW = Screen and Screen.width
     local screenH = Screen and Screen.height
-    if not d or not d.gameing or not r or not r._handpai or not cam or not screenW or not screenH or screenW <= 0 or screenH <= 0 or not A.json then return end
+    if not d or not d.gameing or not r or not r._handpai or not screenW or not screenH or screenW <= 0 or screenH <= 0 or not A.json then return end
 
     -- Only concealed hand views map one-to-one onto the protocol hand. Melded
     -- (open) views and the baida wildcard sit in _handpai too, but they have no
     -- counterpart in the AI's tehai, so reporting them shifts every later index.
-    local coords = {}
+    -- Collect the concealed, projectable views once, then project them through the
+    -- chosen camera below.
+    local concealedViews, positions = {}, {}
     local step = d.current_step or 0
-    local openCount, baidaCount, invalidCount, behindCount = 0, 0, 0, 0
-    local minNx, maxNx, minNy, maxNy = 2, -2, 2, -2
+    local openCount, baidaCount = 0, 0
     for i, view in ipairs(r._handpai) do
         if view then
             local pai = view.pai
@@ -448,34 +537,51 @@ local function reportHandCoords()
                 local transform = view.transform
                 local position = transform and transform.position
                 if view.valid and pai and position then
-                    local sp = cam:WorldToScreenPoint(position)
-                    -- WorldToScreenPoint returns z<0 when the point is behind the
-                    -- camera; those projections are mirror-imaged and unusable.
-                    if sp.z < 0 then
-                        behindCount = behindCount + 1
-                        invalidCount = invalidCount + 1
-                    else
-                        -- Normalized viewport fractions: the consumer multiplies them
-                        -- back by the overlay's own measured size, so Unity's internal
-                        -- render resolution never drifts against the Android display.
-                        local nx = sp.x / screenW
-                        local ny = (screenH - sp.y) / screenH
-                        coords[#coords + 1] = {
-                            tile = pai:ToString(),
-                            nx = math.floor(nx * 10000 + 0.5) / 10000,
-                            ny = math.floor(ny * 10000 + 0.5) / 10000,
-                            last = (view == r._last_tile)
-                        }
-                        if nx < minNx then minNx = nx end
-                        if nx > maxNx then maxNx = nx end
-                        if ny < minNy then minNy = ny end
-                        if ny > maxNy then maxNy = ny end
-                    end
-                else
-                    invalidCount = invalidCount + 1
+                    concealedViews[#concealedViews + 1] = view
+                    positions[#positions + 1] = position
                 end
             end
         end
+    end
+
+    -- Select the camera by observing where it actually projects the hand, never by
+    -- Camera.main or index order. Fall back to nil (text hint only) when no camera
+    -- places the hand in the lower viewport.
+    local cam = pickCamera(positions, screenW, screenH)
+
+    local coords = {}
+    local invalidCount, behindCount = 0, 0
+    local minNx, maxNx, minNy, maxNy = 2, -2, 2, -2
+    if cam then
+        for i, view in ipairs(concealedViews) do
+            local pai = view.pai
+            local position = view.transform.position
+            local sp = cam:WorldToScreenPoint(position)
+            -- WorldToScreenPoint returns z<0 when the point is behind the camera;
+            -- those projections are mirror-imaged and unusable.
+            if sp.z < 0 then
+                behindCount = behindCount + 1
+                invalidCount = invalidCount + 1
+            else
+                -- Normalized viewport fractions: the consumer multiplies them back by
+                -- the overlay's own measured size, so Unity's internal render
+                -- resolution never drifts against the Android display.
+                local nx = sp.x / screenW
+                local ny = (screenH - sp.y) / screenH
+                coords[#coords + 1] = {
+                    tile = pai:ToString(),
+                    nx = math.floor(nx * 10000 + 0.5) / 10000,
+                    ny = math.floor(ny * 10000 + 0.5) / 10000,
+                    last = (view == r._last_tile)
+                }
+                if nx < minNx then minNx = nx end
+                if nx > maxNx then maxNx = nx end
+                if ny < minNy then minNy = ny end
+                if ny > maxNy then maxNy = ny end
+            end
+        end
+    else
+        invalidCount = #positions
     end
 
     -- Bounded diagnostics: emit once per distinct geometry fingerprint, never per tick.
@@ -494,9 +600,26 @@ local function reportHandCoords()
         maxNx = math.floor(maxNx * 10000 + 0.5) / 10000,
         minNy = math.floor(minNy * 10000 + 0.5) / 10000,
         maxNy = math.floor(maxNy * 10000 + 0.5) / 10000,
-        cam = tostring(cam.name or ''),
-        ortho = cam.orthographic == true,
+        cam = tostring(cam and cam.name or ''),
+        ortho = cam ~= nil and cam.orthographic == true,
     }
+    -- A bounded per-camera projection fingerprint so a real device can be diagnosed
+    -- when no candidate covers the hand. Only the selected camera and at most a
+    -- handful of rejected ones are listed, with name/ortho/bbox only. Fields are
+    -- separated by '|' and cameras by '+'; no ';' is used because the Kotlin side
+    -- splits the detail string on ';' into key=value tokens.
+    if cam == nil then
+        local camRows = {}
+        for _, c in ipairs(enumerateCameras()) do
+            if #camRows < 5 then
+                local rr = projectThrough(c, positions, screenW, screenH)
+                camRows[#camRows + 1] = string.format('%s|%s|%.2f,%.2f,%.2f,%.2f',
+                    tostring(c.name or '?'), c.orthographic and 'ortho' or 'persp',
+                    rr.minNx, rr.maxNx, rr.minNy, rr.maxNy)
+            end
+        end
+        diag.cams = table.concat(camRows, '+')
+    end
 
     if #coords > 0 then
         -- The signature must change whenever the hand's *contents* change, not just
@@ -516,6 +639,7 @@ local function reportHandCoords()
     local diagSig = tostring(screenW) .. ':' .. tostring(screenH) .. ':' .. tostring(#r._handpai) .. ':' .. tostring(#coords)
         .. ':' .. tostring(openCount) .. ':' .. tostring(baidaCount) .. ':' .. tostring(invalidCount)
         .. ':' .. tostring(behindCount) .. ':' .. tostring(diag.ortho) .. ':' .. tostring(diag.cam)
+        .. ':' .. tostring(diag.cams or '')
     if A.lastDiagSig ~= diagSig then
         A.lastDiagSig = diagSig
         diag.tiles = #coords > 0 and table.concat({ coords[1].tile, coords[#coords].tile }, ',') or ''

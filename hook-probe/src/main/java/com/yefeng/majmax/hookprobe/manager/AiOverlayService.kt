@@ -217,6 +217,7 @@ class AiOverlayService : Service() {
                 // share one viewport; unequal values mean the normalized coordinates
                 // are scaled differently. This is a measurement, not an assumption.
                 badges?.describeGeometry()?.let { (ow, oh) ->
+                    val cams = geometry.optString("cams")
                     GeometryTrace.note(
                         "GAME_GEOMETRY",
                         "screenW=${geometry.optInt("screenW")};screenH=${geometry.optInt("screenH")};" +
@@ -228,7 +229,9 @@ class AiOverlayService : Service() {
                             "maxNx=${geometry.optDouble("maxNx", Double.NaN)};" +
                             "minNy=${geometry.optDouble("minNy", Double.NaN)};" +
                             "maxNy=${geometry.optDouble("maxNy", Double.NaN)};" +
-                            "ortho=${if (geometry.optBoolean("ortho")) 1 else 0}"
+                            "ortho=${if (geometry.optBoolean("ortho")) 1 else 0};" +
+                            "cam=${geometry.optString("cam")}" +
+                            (if (cams.isNotBlank()) ";cams=$cams" else "")
                     )
                 }
             }
