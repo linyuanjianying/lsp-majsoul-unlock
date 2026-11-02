@@ -195,12 +195,12 @@ internal class TileBadgeOverlay(private val context: Context) {
                 }
             }
 
-            // 2. Measured geometric fallback, calibrated from a real 2376x1080 screenshot:
-            //    hand row spans x 452..1680, tile tops at y 935, tile pitch ~100.8px.
+            // 2. Measured geometric fallback: 13 tiles at 496..1634 px, pitch 94.83 px,
+            //    tile tops at y=935 on a 2376x1080 display.
             if (targetX == null) {
                 val geometry = handGeometry(hand.size)
                 targetX = geometry.centers.getOrNull(hint.handIndex)
-                targetY = geometry.top - dp(34)
+                targetY = geometry.top - dp(32)
             }
 
             if (targetX != null && targetY != null) {
@@ -301,20 +301,20 @@ internal class TileBadgeOverlay(private val context: Context) {
     /**
      * Measured hand layout for the current screen.
      *
-     * Values come from a real 2376x1080 gameplay screenshot: the hand row spans
-     * x 452..1680 with 12 concealed tiles about 100.8 px wide, tile tops at y 935,
-     * and the drawn tile separated by roughly half a tile.
+     * These ratios were measured from a live 2376x1080 in-game screenshot by
+     * scanning the tile-top row: 13 tiles at centres 496..1634 px, a constant
+     * pitch of 94.83 px, tile tops at y=935. Expressing them as ratios of the
+     * live display keeps other resolutions and the DPI override aligned.
      */
     private fun handGeometry(handSize: Int): HandGeometry {
         val width = display.widthPixels
         val height = display.heightPixels
-        // Ratios measured on 2376x1080; recomputed against the live display so that
-        // other resolutions or a resolution override keep the same relative layout.
-        val firstCenter = width * (505.4f / 2376f)
-        val pitch = width * (100.8f / 2376f)
-        val drawnGap = pitch * 0.45f
-        val top = (height * (935f / 1080f)).roundToInt()
+        val firstCenter = width * 0.208754f
+        val pitch = width * 0.039913f
+        val drawnGap = pitch * 0.55f
+        val top = (height * 0.865741f).roundToInt()
 
+        // The sorted hand never exceeds 13 tiles; anything beyond that is the draw.
         val concealed = when {
             handSize <= 0 -> 13
             handSize > 13 -> handSize - 1
@@ -324,7 +324,6 @@ internal class TileBadgeOverlay(private val context: Context) {
         for (i in 0 until concealed) {
             centers.add((firstCenter + i * pitch).roundToInt())
         }
-        // A 14th slot is the freshly drawn tile, separated from the sorted hand.
         repeat((handSize - concealed).coerceAtLeast(0)) {
             centers.add((firstCenter + concealed * pitch + drawnGap).roundToInt())
         }
