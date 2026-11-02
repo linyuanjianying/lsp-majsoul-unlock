@@ -370,6 +370,41 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.poll(ack("","manual"))
                 check(!gate.isEnabled() && gate.poll(null)==null)
             }
+            // TileBadgeOverlay coordinate filtering is pure; exercise it directly so a
+            // camera/projection fault that sends every tile off-screen is observable.
+            fun coord(tile: String, nx: Double, ny: Double, last: Boolean = false) =
+                JSONObject().put("tile", tile).put("nx", nx).put("ny", ny).put("last", last)
+            test("in-viewport coordinates are all kept") { _, _ ->
+                val coords = JSONArray().put(coord("1m", 0.2, 0.8)).put(coord("2m", 0.3, 0.8))
+                    .put(coord("3m", 0.4, 0.8))
+                val f = TileBadgeOverlay.filterCoords(coords)
+                check(f.kept.size == 3 && f.rejected == 0 && f.sample.isEmpty())
+            }
+            test("out-of-viewport coordinates are rejected with a bounded sample") { _, _ ->
+                val coords = JSONArray().put(coord("1m", -1.5, 0.8)).put(coord("2m", 2.0, 0.8))
+                    .put(coord("3m", 0.5, -0.2)).put(coord("4m", 0.5, 1.7))
+                val f = TileBadgeOverlay.filterCoords(coords)
+                check(f.kept.isEmpty() && f.rejected == 4)
+                check(f.sample.isNotBlank() && f.sample.contains("1m@"))
+            }
+            test("edge-sitting coordinates within tolerance are kept") { _, _ ->
+                val coords = JSONArray().put(coord("1m", 0.0, 0.5)).put(coord("9m", 0.999, 0.5))
+                val f = TileBadgeOverlay.filterCoords(coords)
+                check(f.kept.size == 2 && f.rejected == 0)
+            }
+            test("blank tile and non-finite coordinates are rejected") { _, _ ->
+                // org.json forbids NaN/Infinity, so a missing field (optDouble -> NaN)
+                // is the way a non-finite value reaches the filter in practice.
+                val coords = JSONArray().put(coord("", 0.5, 0.5))
+                    .put(JSONObject().put("tile", "1m").put("ny", 0.5))
+                val f = TileBadgeOverlay.filterCoords(coords)
+                check(f.kept.isEmpty() && f.rejected == 2)
+            }
+            test("mixed capture keeps valid and samples rejected") { _, _ ->
+                val coords = JSONArray().put(coord("1m", 0.2, 0.8)).put(coord("9m", 5.0, 5.0))
+                val f = TileBadgeOverlay.filterCoords(coords)
+                check(f.kept.size == 1 && f.rejected == 1 && f.sample.contains("9m@5.000,5.000"))
+            }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
             ApkUpdateChecks.run(targetContext)

@@ -398,9 +398,16 @@ end
 local function get3DCamera()
     local Camera = UnityEngine and UnityEngine.Camera
     if not Camera then return nil end
+    -- Prefer the main perspective camera, which is the one the game renders the
+    -- 3D board through. allCameras is unordered and its first perspective entry
+    -- can be a UI/effect camera whose WorldToScreenPoint result does not land on
+    -- the hand at all, so picking by index order is unsafe.
+    local main = Camera.main
+    if main and main.enabled and not main.orthographic then
+        return main
+    end
     local all = Camera.allCameras
     if all then
-        -- Find active perspective camera rendering the 3D board
         local count = all.Length or (type(all) == 'table' and #all) or 0
         for i = 0, count - 1 do
             local c = all[i]
@@ -409,7 +416,7 @@ local function get3DCamera()
             end
         end
     end
-    return Camera.main
+    return main
 end
 
 local function reportHandCoords()
@@ -426,7 +433,8 @@ local function reportHandCoords()
     -- counterpart in the AI's tehai, so reporting them shifts every later index.
     local coords = {}
     local step = d.current_step or 0
-    local openCount, baidaCount, invalidCount = 0, 0, 0
+    local openCount, baidaCount, invalidCount, behindCount = 0, 0, 0, 0
+    local minNx, maxNx, minNy, maxNy = 2, -2, 2, -2
     for i, view in ipairs(r._handpai) do
         if view then
             local pai = view.pai
@@ -441,17 +449,28 @@ local function reportHandCoords()
                 local position = transform and transform.position
                 if view.valid and pai and position then
                     local sp = cam:WorldToScreenPoint(position)
-                    -- Normalized viewport fractions: the consumer multiplies them
-                    -- back by the overlay's own measured size, so Unity's internal
-                    -- render resolution never drifts against the Android display.
-                    local nx = sp.x / screenW
-                    local ny = (screenH - sp.y) / screenH
-                    coords[#coords + 1] = {
-                        tile = pai:ToString(),
-                        nx = math.floor(nx * 10000 + 0.5) / 10000,
-                        ny = math.floor(ny * 10000 + 0.5) / 10000,
-                        last = (view == r._last_tile)
-                    }
+                    -- WorldToScreenPoint returns z<0 when the point is behind the
+                    -- camera; those projections are mirror-imaged and unusable.
+                    if sp.z < 0 then
+                        behindCount = behindCount + 1
+                        invalidCount = invalidCount + 1
+                    else
+                        -- Normalized viewport fractions: the consumer multiplies them
+                        -- back by the overlay's own measured size, so Unity's internal
+                        -- render resolution never drifts against the Android display.
+                        local nx = sp.x / screenW
+                        local ny = (screenH - sp.y) / screenH
+                        coords[#coords + 1] = {
+                            tile = pai:ToString(),
+                            nx = math.floor(nx * 10000 + 0.5) / 10000,
+                            ny = math.floor(ny * 10000 + 0.5) / 10000,
+                            last = (view == r._last_tile)
+                        }
+                        if nx < minNx then minNx = nx end
+                        if nx > maxNx then maxNx = nx end
+                        if ny < minNy then minNy = ny end
+                        if ny > maxNy then maxNy = ny end
+                    end
                 else
                     invalidCount = invalidCount + 1
                 end
@@ -460,6 +479,8 @@ local function reportHandCoords()
     end
 
     -- Bounded diagnostics: emit once per distinct geometry fingerprint, never per tick.
+    -- min/max nx/ny are recorded so an out-of-viewport capture is visible in the
+    -- log instead of being silently filtered away on the Kotlin side.
     local diag = {
         screenW = screenW,
         screenH = screenH,
@@ -468,12 +489,24 @@ local function reportHandCoords()
         open = openCount,
         baida = baidaCount,
         invalid = invalidCount,
+        behind = behindCount,
+        minNx = math.floor(minNx * 10000 + 0.5) / 10000,
+        maxNx = math.floor(maxNx * 10000 + 0.5) / 10000,
+        minNy = math.floor(minNy * 10000 + 0.5) / 10000,
+        maxNy = math.floor(maxNy * 10000 + 0.5) / 10000,
         cam = tostring(cam.name or ''),
         ortho = cam.orthographic == true,
     }
 
     if #coords > 0 then
-        local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. tostring(coords[1].nx) .. ':' .. tostring(coords[#coords].nx)
+        -- The signature must change whenever the hand's *contents* change, not just
+        -- its length and the two end coordinates. The step counter alone does not
+        -- advance during a drawn-tile animation, so a same-step reshuffle or draw
+        -- would otherwise reuse stale anchors and never resend. Folding the tile
+        -- sequence into the signature forces a resend exactly when the hand changes.
+        local tiles = {}
+        for _, c in ipairs(coords) do tiles[#tiles + 1] = c.tile end
+        local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. table.concat(tiles, ',')
         if A.lastCoordsSig ~= sig then
             A.lastCoordsSig = sig
             ack('', 'hand_coords', A.json.encode(coords))
@@ -481,7 +514,8 @@ local function reportHandCoords()
     end
 
     local diagSig = tostring(screenW) .. ':' .. tostring(screenH) .. ':' .. tostring(#r._handpai) .. ':' .. tostring(#coords)
-        .. ':' .. tostring(openCount) .. ':' .. tostring(baidaCount) .. ':' .. tostring(invalidCount) .. ':' .. tostring(diag.ortho)
+        .. ':' .. tostring(openCount) .. ':' .. tostring(baidaCount) .. ':' .. tostring(invalidCount)
+        .. ':' .. tostring(behindCount) .. ':' .. tostring(diag.ortho) .. ':' .. tostring(diag.cam)
     if A.lastDiagSig ~= diagSig then
         A.lastDiagSig = diagSig
         diag.tiles = #coords > 0 and table.concat({ coords[1].tile, coords[#coords].tile }, ',') or ''

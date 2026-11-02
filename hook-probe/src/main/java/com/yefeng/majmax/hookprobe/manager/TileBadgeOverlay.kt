@@ -20,18 +20,62 @@ import kotlin.math.roundToInt
  * each recommended hand tile, matching ZizhiAssistant / Akagi in-game HUD.
  */
 internal class TileBadgeOverlay(private val context: Context) {
+    companion object {
+        /** Viewport tolerance so edge-sitting tiles are not dropped by float drift. */
+        private const val EPS = 0.005
+
+        /**
+         * Filters a raw `hand_coords` array into valid in-viewport tiles plus a
+         * bounded textual sample of the rejected ones. Pure and testable: it does
+         * not touch the overlay window, so a camera/projection fault that sends
+         * every coordinate off-screen is observable as `kept=0` with a sample
+         * rather than as an empty overlay.
+         */
+        internal fun filterCoords(coords: JSONArray): FilteredCoords {
+            val kept = ArrayList<HookedTile>(coords.length())
+            var rejected = 0
+            val sample = StringBuilder()
+            for (i in 0 until coords.length()) {
+                val obj = coords.optJSONObject(i) ?: continue
+                val tile = obj.optString("tile")
+                val nx = obj.optDouble("nx", Double.NaN)
+                val ny = obj.optDouble("ny", Double.NaN)
+                val isLast = obj.optBoolean("last", false)
+                if (tile.isNotBlank() && nx.isFinite() && ny.isFinite() &&
+                    nx > -EPS && nx < 1.0 + EPS && ny > -EPS && ny < 1.0 + EPS) {
+                    kept.add(HookedTile(tile, nx, ny, isLast))
+                } else {
+                    rejected++
+                    if (sample.length < 96 && nx.isFinite() && ny.isFinite()) {
+                        if (sample.isNotEmpty()) sample.append(' ')
+                        sample.append(tile.ifBlank { "?" })
+                            .append('@').append(String.format(Locale.ROOT, "%.3f", nx))
+                            .append(',').append(String.format(Locale.ROOT, "%.3f", ny))
+                    }
+                }
+            }
+            return FilteredCoords(kept, rejected, sample.toString())
+        }
+    }
+
+    internal data class FilteredCoords(
+        val kept: List<HookedTile>,
+        val rejected: Int,
+        val sample: String
+    )
+
+    internal data class HookedTile(
+        val tile: String,
+        val normX: Double,
+        val normY: Double,
+        val isLast: Boolean
+    )
+
     private data class DiscardHint(
         val kind: String,
         val tile: String,
         val weight: Double,
         val handIndex: Int
-    )
-
-    private data class HookedTile(
-        val tile: String,
-        val normX: Double,
-        val normY: Double,
-        val isLast: Boolean
     )
 
     private val windows = context.getSystemService(WindowManager::class.java)
@@ -46,9 +90,6 @@ internal class TileBadgeOverlay(private val context: Context) {
     private var hand: List<String> = emptyList()
     private var result: JSONObject? = null
     private var hookedTiles: List<HookedTile> = emptyList()
-
-    /** Changes whenever the protocol hand (round/seat/turn) changes shape. */
-    private var lastHandSignature: String = ""
 
     /** Changes whenever the rendered order snapshot would differ. */
     private var lastOrderSignature: String = ""
@@ -76,17 +117,19 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         // The AI result changes on every poll, but its hand only changes on a
         // discard/draw/meld/round boundary. When it does change, any coordinates
-        // captured for the previous shape are stale, so drop them until the game
-        // side reports a fresh set. This is what previously left old badges on a
-        // new round's tiles.
-        val signature = hand.joinToString(",") + "|" + value.optString("seat") + "|" + value.optString("round")
-        if (signature != lastHandSignature) {
-            if (lastHandSignature.isNotEmpty() && hookedTiles.isNotEmpty()) {
-                // The tile views on screen were captured for the previous hand.
+        // captured for the previous shape are stale. Instead of dropping them on a
+        // seat/round key (which is an AI-side dimension that does not advance in
+        // lock-step with the game-side tile views), compare the on-screen tile
+        // multiset against the protocol hand. Only a genuine tile-set mismatch
+        // clears the anchors, so a coordinate set that arrives right after the
+        // hand changes still pairs correctly.
+        if (hand.isNotEmpty() && hookedTiles.isNotEmpty()) {
+            val handCounts = hand.groupingBy { canonicalTile(it) }.eachCount()
+            val viewCounts = hookedTiles.groupingBy { canonicalTile(it.tile) }.eachCount()
+            if (handCounts != viewCounts) {
                 GeometryTrace.note("HAND_SHAPE", "views=${hookedTiles.size};hand=${hand.size}")
                 hookedTiles = emptyList()
             }
-            lastHandSignature = signature
         }
 
         traceOrders()
@@ -105,33 +148,28 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     fun updateHookedCoords(coords: JSONArray) {
-        val list = ArrayList<HookedTile>(coords.length())
-        var rejected = 0
-        for (i in 0 until coords.length()) {
-            val obj = coords.optJSONObject(i) ?: continue
-            val tile = obj.optString("tile")
-            val nx = obj.optDouble("nx", Double.NaN)
-            val ny = obj.optDouble("ny", Double.NaN)
-            val isLast = obj.optBoolean("last", false)
-            // Reject only values outside the viewport; the old 0.15..0.85 / 0.65..0.98
-            // bounds silently dropped legitimately off-centre hand tiles and sent them
-            // to the guessed geometry instead.
-            if (tile.isNotBlank() && nx > 0.0 && nx < 1.0 && ny > 0.0 && ny < 1.0) {
-                list.add(HookedTile(tile, nx, ny, isLast))
-            } else {
-                rejected++
-            }
-        }
+        val filtered = filterCoords(coords)
+        val list = filtered.kept
         if (list.isNotEmpty()) {
-            if (rejected > 0 || list.size != hookedTiles.size) {
-                GeometryTrace.note("HOOK_COORDS", "kept=${list.size};rejected=$rejected")
+            if (filtered.rejected > 0 || list.size != hookedTiles.size) {
+                GeometryTrace.note(
+                    "HOOK_COORDS",
+                    "kept=${list.size};rejected=${filtered.rejected}" +
+                        if (filtered.sample.isNotEmpty()) ";sample=${filtered.sample}" else ""
+                )
             }
             hookedTiles = list
             traceOrders()
             renderHints()
         } else {
+            // Always record a fully-rejected capture, including its sample, so a
+            // camera/projection fault is visible instead of looking like "no data".
+            GeometryTrace.note(
+                "HOOK_COORDS",
+                "kept=0;rejected=${filtered.rejected}" +
+                    if (filtered.sample.isNotEmpty()) ";sample=${filtered.sample}" else ""
+            )
             // Never keep stale coordinates from the previous round/seat/rotation.
-            if (hookedTiles.isNotEmpty()) GeometryTrace.note("HOOK_COORDS", "reason=cleared_no_valid_coords")
             hookedTiles = emptyList()
             renderHints()
         }
@@ -140,7 +178,6 @@ internal class TileBadgeOverlay(private val context: Context) {
     fun close() {
         result = null
         hookedTiles = emptyList()
-        lastHandSignature = ""
         lastOrderSignature = ""
         GeometryTrace.reset()
         detach()
@@ -149,7 +186,6 @@ internal class TileBadgeOverlay(private val context: Context) {
     fun configurationChanged() {
         // A rotation/resize invalidates every pixel anchor captured before it.
         hookedTiles = emptyList()
-        lastHandSignature = ""
         lastOrderSignature = ""
         detach()
         result?.let { update(it) }

@@ -412,4 +412,81 @@ test('waiting claim diagnostics remain bounded across ticks',function(s)
     for i=1,50 do __majmax_auto_tick() end
     assert(#s.acks==n and #s.sent==0)
 end)
+
+-- Coordinate reporting lives behind the shared __majmax_auto_tick entrypoint, but
+-- the game-side fixtures above never provide a camera, so it is exercised in a
+-- self-contained environment here. It must report a normalized coordinate range
+-- (so an out-of-viewport capture is visible), and it must resend when the hand's
+-- tile *contents* change even if its length and end coordinates do not.
+local function coordFixture()
+    __majmax_auto = nil
+    local screenW, screenH = 2376, 1080
+    local cam = { name='Main Camera', orthographic=false, enabled=true }
+    function cam:WorldToScreenPoint(p)
+        return { x = p.nx * screenW, y = (1 - p.ny) * screenH, z = p.z or 5 }
+    end
+    UnityEngine = {
+        Camera = { main = cam, allCameras = { cam } },
+        Screen = { width = screenW, height = screenH },
+        Time = { realtimeSinceStartup = 0 },
+    }
+    local acks = {}
+    cjson = { encode = function(v) acks[#acks + 1] = v; return 'ack' end,
+        decode = function() return {} end }
+    package.loaded.cjson = cjson
+    __majmax_auto_command = function() return '' end
+    __majmax_auto_ack = function() end
+    local function view(tile, nx, ny)
+        local pai = { t = tile, baida = false }
+        function pai:ToString() return self.t end
+        return { pai = pai, valid = true, is_open = false,
+            transform = { position = { nx = nx, ny = ny, z = 5 } } }
+    end
+    local role = { _handpai = {}, _last_tile = nil }
+    DesktopMgr = { Inst = { gameing = true, current_step = 3, mainrole = role } }
+    dofile(asset)
+    return acks, role, function() __majmax_auto_tick() end, view
+end
+test('hand coordinates report a normalized range and resend on content change',function()
+    local acks, role, tick, view = coordFixture()
+    role._handpai = { view('1m', 0.20, 0.80), view('2m', 0.28, 0.80),
+        view('3m', 0.36, 0.80), view('4m', 0.44, 0.80) }
+    role._last_tile = role._handpai[1]
+    tick()
+    -- The mock encoder stores the raw table passed to it, so the coords array and
+    -- the geometry table both land in acks directly, followed by the wrapped ack.
+    local coordsSeen, geom
+    for _, a in ipairs(acks) do
+        if a.state == 'hand_coords' then coordsSeen = true end
+        if type(a.handpai) == 'number' and a.screenW then geom = a end
+    end
+    assert(coordsSeen, 'expected a hand_coords ack')
+    assert(geom, 'expected a hand_geometry record')
+    assert(geom.handpai == 4 and geom.concealed == 4)
+    assert(math.abs(geom.minNx - 0.2) < 0.001 and math.abs(geom.maxNx - 0.44) < 0.001)
+    assert(math.abs(geom.minNy - 0.8) < 0.001 and math.abs(geom.maxNy - 0.8) < 0.001)
+    assert(geom.behind == 0)
+    local n = #acks
+    tick()  -- identical hand must not resend
+    assert(#acks == n, 'identical hand must not resend hand_coords')
+    -- Same length and same end tiles, but the middle tile changes: must resend.
+    role._handpai[2] = view('5m', 0.28, 0.80)
+    tick()
+    assert(#acks > n, 'content change must resend hand_coords')
+    local resent = false
+    for i = n + 1, #acks do if acks[i].state == 'hand_coords' then resent = true end end
+    assert(resent, 'content change must emit a new hand_coords')
+end)
+test('coordinates behind the camera are counted and excluded',function()
+    local acks, role, tick, view = coordFixture()
+    role._handpai = { view('1m', 0.20, 0.80), view('2m', 0.28, 0.80) }
+    role._handpai[1].transform.position.z = -5  -- behind the camera
+    role._last_tile = role._handpai[2]
+    tick()
+    local geom
+    for _, a in ipairs(acks) do if type(a.handpai) == 'number' and a.screenW then geom = a end end
+    assert(geom.concealed == 1 and geom.behind == 1 and geom.invalid == 1,
+        'one tile behind camera must be counted, not projected')
+end)
 print(string.format('%d automatic operation checks passed',count))
+

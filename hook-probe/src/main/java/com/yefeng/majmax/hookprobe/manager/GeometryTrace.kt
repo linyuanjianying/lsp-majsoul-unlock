@@ -26,6 +26,7 @@ internal object GeometryTrace {
     private val structuredKeys = setOf(
         "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho",
+        "behind", "minNx", "maxNx", "minNy", "maxNy", "sample",
         "tiles", "order", "reds", "views_n",
     )
 

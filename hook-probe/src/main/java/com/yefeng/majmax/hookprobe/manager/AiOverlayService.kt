@@ -160,42 +160,11 @@ class AiOverlayService : Service() {
     }
 
     private fun pollAuto(acks: String?): String {
-        if (acks != null && acks.contains("\"hand_coords\"")) runCatching {
-            val rows = org.json.JSONArray(acks)
-            for (i in 0 until rows.length()) {
-                val row = rows.getJSONObject(i)
-                if (row.optString("state") == "hand_coords") {
-                    val raw = row.optString("reason")
-                    if (raw.isNotBlank()) {
-                        val coords = org.json.JSONArray(raw)
-                        main.post { badges?.updateHookedCoords(coords) }
-                    }
-                }
-            }
+        if (acks != null && acks.contains("\"hand_coords\"")) {
+            parseHandCoords(acks)
         }
-        if (acks != null && acks.contains("\"hand_geometry\"")) runCatching {
-            val rows = org.json.JSONArray(acks)
-            for (i in 0 until rows.length()) {
-                val row = rows.getJSONObject(i)
-                if (row.optString("state") != "hand_geometry") continue
-                val detail = row.optString("reason")
-                if (detail.isBlank()) continue
-                val geometry = org.json.JSONObject(detail)
-                // Record the game's screen size next to the overlay's measured size.
-                // Equal values mean the two share one viewport; unequal values mean
-                // the normalized coordinates are scaled differently. This is a
-                // measurement, not an assumption applied to positioning.
-                badges?.describeGeometry()?.let { (ow, oh) ->
-                    GeometryTrace.note(
-                        "GAME_GEOMETRY",
-                        "screenW=${geometry.optInt("screenW")};screenH=${geometry.optInt("screenH")};" +
-                            "overlayW=$ow;overlayH=$oh;" +
-                            "hand=${geometry.optInt("handpai")};views=${geometry.optInt("concealed")};" +
-                            "open=${geometry.optInt("open")};baida=${geometry.optInt("baida")};" +
-                            "ortho=${if (geometry.optBoolean("ortho")) 1 else 0}"
-                    )
-                }
-            }
+        if (acks != null && acks.contains("\"hand_geometry\"")) {
+            parseHandGeometry(acks)
         }
         val command = auto.poll(acks)
         val delay = AutoDelaySettings.read(this)
@@ -203,6 +172,69 @@ class AiOverlayService : Service() {
         else JSONObject().put("control", "mode").put("enabled", auto.isEnabled() && !demoMode.get())
             .put("resync", auto.needsSync()).put("nonce", SystemClock.elapsedRealtime())
         return response.put("delayMinMs", delay.minTenths * 100).put("delayMaxMs", delay.maxTenths * 100).toString()
+    }
+
+    /**
+     * Decodes the `hand_coords` acknowledgement on this thread and hands the parsed
+     * array to the overlay on the main thread. A decode failure is recorded instead
+     * of being swallowed, so a payload encoding fault is visible rather than looking
+     * like "no coordinates arrived".
+     */
+    private fun parseHandCoords(acks: String) {
+        val coords = try {
+            val rows = org.json.JSONArray(acks)
+            var found: org.json.JSONArray? = null
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                if (row.optString("state") != "hand_coords") continue
+                val raw = row.optString("reason")
+                if (raw.isNotBlank()) found = org.json.JSONArray(raw)
+            }
+            found
+        } catch (t: Throwable) {
+            GeometryTrace.note("HOOK_COORDS", "reason=decode_failed")
+            return
+        }
+        if (coords == null) return
+        main.post {
+            runCatching { badges?.updateHookedCoords(coords) }
+                .onFailure { GeometryTrace.note("HOOK_COORDS", "reason=apply_failed") }
+        }
+    }
+
+    private fun parseHandGeometry(acks: String) {
+        try {
+            val rows = org.json.JSONArray(acks)
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                if (row.optString("state") != "hand_geometry") continue
+                val detail = row.optString("reason")
+                if (detail.isBlank()) continue
+                val geometry = org.json.JSONObject(detail)
+                // Record the game's screen size next to the overlay's measured size,
+                // plus the captured normalized-coordinate range, so an out-of-viewport
+                // capture is visible without guessing. Equal size values mean the two
+                // share one viewport; unequal values mean the normalized coordinates
+                // are scaled differently. This is a measurement, not an assumption.
+                badges?.describeGeometry()?.let { (ow, oh) ->
+                    GeometryTrace.note(
+                        "GAME_GEOMETRY",
+                        "screenW=${geometry.optInt("screenW")};screenH=${geometry.optInt("screenH")};" +
+                            "overlayW=$ow;overlayH=$oh;" +
+                            "hand=${geometry.optInt("handpai")};views=${geometry.optInt("concealed")};" +
+                            "open=${geometry.optInt("open")};baida=${geometry.optInt("baida")};" +
+                            "behind=${geometry.optInt("behind")};" +
+                            "minNx=${geometry.optDouble("minNx", Double.NaN)};" +
+                            "maxNx=${geometry.optDouble("maxNx", Double.NaN)};" +
+                            "minNy=${geometry.optDouble("minNy", Double.NaN)};" +
+                            "maxNy=${geometry.optDouble("maxNy", Double.NaN)};" +
+                            "ortho=${if (geometry.optBoolean("ortho")) 1 else 0}"
+                    )
+                }
+            }
+        } catch (_: Throwable) {
+            // A geometry record must never break command polling; it is observational.
+        }
     }
 
     private fun reset(message: String) {
