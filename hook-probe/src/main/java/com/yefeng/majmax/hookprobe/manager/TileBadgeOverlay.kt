@@ -290,21 +290,21 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     /**
      * Compute horizontal center (X) for each hand tile on the screen.
-     * Calibrated strictly to Majsoul in-game landscape geometry:
-     * - Hand horizontal center is at 47.3% of screen width
-     * - Tile pitch is 3.76% of screen width (102px in 2712px width)
-     * - Drawn tile gap is 2.2% of screen width (60px in 2712px width)
+     * Calibrated strictly to the physical device screen (2376x1080) and in-game geometry:
+     * - Hand horizontal center is at 45.61% of screen width (1084px in 2376px)
+     * - Tile pitch is 4.24% of screen width (101px in 2376px)
+     * - Drawn tile gap is 2.0% of screen width (48px in 2376px)
      */
     private fun computeTileCenters(handSize: Int): List<Int> {
         val screenW = display.widthPixels
         val count = if (handSize in 1..14) handSize else 14
 
-        val tilePitch = (screenW * 0.0376f).roundToInt()
-        val drawnGap = (screenW * 0.022f).roundToInt()
+        val tilePitch = (screenW * 0.0424f).roundToInt()
+        val drawnGap = (screenW * 0.020f).roundToInt()
         val totalHandWidth = (count - 1) * tilePitch + if (count >= 13) drawnGap else 0
 
-        // Hand is anchored at 47.3% screen center
-        val startX = (screenW * 0.473f - totalHandWidth / 2f).roundToInt()
+        // Hand is anchored at 45.61% screen center
+        val startX = (screenW * 0.4561f - totalHandWidth / 2f).roundToInt()
 
         return (0 until count).map { i ->
             if (i < count - 1 || count < 13) {
