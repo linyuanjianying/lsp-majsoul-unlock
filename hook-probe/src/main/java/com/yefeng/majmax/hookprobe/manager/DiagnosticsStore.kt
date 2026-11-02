@@ -40,10 +40,19 @@ internal object DiagnosticsStore {
         "ACTIVITY_HOOK_FAILED", "CONFIG_STARTED", "CONFIGURED", "CONFIG_FAILED",
         "CAPTURE_ENDPOINT_READY", "CAPTURE_ENDPOINT_LOST", "LOG_DROPPED", "HOOK_BATCH_REJECTED",
     )
+    /** Bounded badge-geometry trace codes emitted by the assistant overlay. */
+    private val hintCodes = setOf(
+        "HOOK_COORDS", "HAND_SHAPE", "BADGE_PARTIAL", "BADGE_HIDDEN", "GAME_GEOMETRY", "HINT_ORDER",
+    )
     private val levels = setOf("DEBUG", "INFO", "WARN", "ERROR")
-    private val components = setOf("hook.entry", "hook.native", "hook.capture", "assistant.service", "assistant.model", "assistant.engine", "assistant.autoplay", "manager")
+    private val components = setOf("hook.entry", "hook.native", "hook.capture", "assistant.service", "assistant.model", "assistant.engine", "assistant.autoplay", "assistant.hint", "manager")
     private val allowedFieldNames = setOf("api", "moduleVersion", "count", "reason",
-        "importId", "stage", "format", "bytes", "elapsedMs", "nativeStatus", "errorClass", "errorMessage")
+        "importId", "stage", "format", "bytes", "elapsedMs", "nativeStatus", "errorClass", "errorMessage",
+        // Badge geometry diagnostics: fixed-shape counters, sizes, and the tile
+        // order/coordinate snapshot needed to validate hand-to-view mapping.
+        "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
+        "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho", "tiles",
+        "order", "reds")
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
     private fun logFile(context: Context, kind: DiagnosticKind, index: Int = 1) =
@@ -215,8 +224,16 @@ internal object DiagnosticsStore {
             if (!source.has(key)) continue
             when (val value = source.opt(key)) {
                 is Number -> put(key, value)
-                is String -> put(key, value.take(if (key == "errorMessage") 240 else 64)
-                    .filter { it.isLetterOrDigit() || it in " _-./()：:" })
+                is String -> {
+                    // Order/coordinate snapshots need separators and room for ~14 tiles.
+                    val limit = when (key) {
+                        "errorMessage" -> 240
+                        "order", "views", "tiles" -> 512
+                        else -> 64
+                    }
+                    put(key, value.take(limit)
+                        .filter { it.isLetterOrDigit() || it in " _-./()：:@,+" })
+                }
             }
         }
     }

@@ -421,31 +421,71 @@ local function reportHandCoords()
     local screenH = Screen and Screen.height
     if not d or not d.gameing or not r or not r._handpai or not cam or not screenW or not screenH or screenW <= 0 or screenH <= 0 or not A.json then return end
 
+    -- Only concealed hand views map one-to-one onto the protocol hand. Melded
+    -- (open) views and the baida wildcard sit in _handpai too, but they have no
+    -- counterpart in the AI's tehai, so reporting them shifts every later index.
     local coords = {}
     local step = d.current_step or 0
+    local openCount, baidaCount, invalidCount = 0, 0, 0
     for i, view in ipairs(r._handpai) do
-        if view and view.valid and view.pai and view.transform and view.transform.position then
-            local pos = view.transform.position
-            local sp = cam:WorldToScreenPoint(pos)
-            -- Use normalized viewport fractions (0.0 to 1.0) so Unity internal render resolution
-            -- scaling never drifts against Android physical display resolution.
-            local nx = sp.x / screenW
-            local ny = (screenH - sp.y) / screenH
-            coords[#coords + 1] = {
-                tile = view.pai:ToString(),
-                nx = math.floor(nx * 10000 + 0.5) / 10000,
-                ny = math.floor(ny * 10000 + 0.5) / 10000,
-                last = (view == r._last_tile)
-            }
+        if view then
+            local pai = view.pai
+            local isOpen = view.is_open == true
+            local isBaida = pai and pai.baida == true
+            if isOpen then
+                openCount = openCount + 1
+            elseif isBaida then
+                baidaCount = baidaCount + 1
+            else
+                local transform = view.transform
+                local position = transform and transform.position
+                if view.valid and pai and position then
+                    local sp = cam:WorldToScreenPoint(position)
+                    -- Normalized viewport fractions: the consumer multiplies them
+                    -- back by the overlay's own measured size, so Unity's internal
+                    -- render resolution never drifts against the Android display.
+                    local nx = sp.x / screenW
+                    local ny = (screenH - sp.y) / screenH
+                    coords[#coords + 1] = {
+                        tile = pai:ToString(),
+                        nx = math.floor(nx * 10000 + 0.5) / 10000,
+                        ny = math.floor(ny * 10000 + 0.5) / 10000,
+                        last = (view == r._last_tile)
+                    }
+                else
+                    invalidCount = invalidCount + 1
+                end
+            end
         end
     end
 
+    -- Bounded diagnostics: emit once per distinct geometry fingerprint, never per tick.
+    local diag = {
+        screenW = screenW,
+        screenH = screenH,
+        handpai = #r._handpai,
+        concealed = #coords,
+        open = openCount,
+        baida = baidaCount,
+        invalid = invalidCount,
+        cam = tostring(cam.name or ''),
+        ortho = cam.orthographic == true,
+    }
+
     if #coords > 0 then
-        local sig = tostring(step) .. ":" .. tostring(#coords) .. ":" .. tostring(coords[1].nx) .. ":" .. tostring(coords[#coords].nx)
+        local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. tostring(coords[1].nx) .. ':' .. tostring(coords[#coords].nx)
         if A.lastCoordsSig ~= sig then
             A.lastCoordsSig = sig
             ack('', 'hand_coords', A.json.encode(coords))
         end
+    end
+
+    local diagSig = tostring(screenW) .. ':' .. tostring(screenH) .. ':' .. tostring(#r._handpai) .. ':' .. tostring(#coords)
+        .. ':' .. tostring(openCount) .. ':' .. tostring(baidaCount) .. ':' .. tostring(invalidCount) .. ':' .. tostring(diag.ortho)
+    if A.lastDiagSig ~= diagSig then
+        A.lastDiagSig = diagSig
+        diag.tiles = #coords > 0 and table.concat({ coords[1].tile, coords[#coords].tile }, ',') or ''
+        ack('', 'hand_geometry', A.json.encode(diag))
     end
 end
 

@@ -134,6 +134,7 @@ class AiOverlayService : Service() {
             return
         }
         overlay = AiFloatingWindow(this, { stop(this) }, { auto.toggle() }).also { it.show() }
+        GeometryTrace.bind(this)
         badges = TileBadgeOverlay(this).also { it.show() }
         main.post(autoUiTick)
         worker = Thread({ consume() }, "majmax-ai-engine").also { it.start() }
@@ -169,6 +170,30 @@ class AiOverlayService : Service() {
                         val coords = org.json.JSONArray(raw)
                         main.post { badges?.updateHookedCoords(coords) }
                     }
+                }
+            }
+        }
+        if (acks != null && acks.contains("\"hand_geometry\"")) runCatching {
+            val rows = org.json.JSONArray(acks)
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                if (row.optString("state") != "hand_geometry") continue
+                val detail = row.optString("reason")
+                if (detail.isBlank()) continue
+                val geometry = org.json.JSONObject(detail)
+                // Record the game's screen size next to the overlay's measured size.
+                // Equal values mean the two share one viewport; unequal values mean
+                // the normalized coordinates are scaled differently. This is a
+                // measurement, not an assumption applied to positioning.
+                badges?.describeGeometry()?.let { (ow, oh) ->
+                    GeometryTrace.note(
+                        "GAME_GEOMETRY",
+                        "screenW=${geometry.optInt("screenW")};screenH=${geometry.optInt("screenH")};" +
+                            "overlayW=$ow;overlayH=$oh;" +
+                            "hand=${geometry.optInt("handpai")};views=${geometry.optInt("concealed")};" +
+                            "open=${geometry.optInt("open")};baida=${geometry.optInt("baida")};" +
+                            "ortho=${if (geometry.optBoolean("ortho")) 1 else 0}"
+                    )
                 }
             }
         }

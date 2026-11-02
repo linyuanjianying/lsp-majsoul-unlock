@@ -47,6 +47,12 @@ internal class TileBadgeOverlay(private val context: Context) {
     private var result: JSONObject? = null
     private var hookedTiles: List<HookedTile> = emptyList()
 
+    /** Changes whenever the protocol hand (round/seat/turn) changes shape. */
+    private var lastHandSignature: String = ""
+
+    /** Changes whenever the rendered order snapshot would differ. */
+    private var lastOrderSignature: String = ""
+
     private val layout = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -68,8 +74,29 @@ internal class TileBadgeOverlay(private val context: Context) {
         val currentHand = extractHand(value)
         if (currentHand.isNotEmpty()) hand = currentHand
 
-        val status = value.optString("status")
-        val recommendations = value.optJSONArray("recommendations")
+        // The AI result changes on every poll, but its hand only changes on a
+        // discard/draw/meld/round boundary. When it does change, any coordinates
+        // captured for the previous shape are stale, so drop them until the game
+        // side reports a fresh set. This is what previously left old badges on a
+        // new round's tiles.
+        val signature = hand.joinToString(",") + "|" + value.optString("seat") + "|" + value.optString("round")
+        if (signature != lastHandSignature) {
+            if (lastHandSignature.isNotEmpty() && hookedTiles.isNotEmpty()) {
+                // The tile views on screen were captured for the previous hand.
+                GeometryTrace.note("HAND_SHAPE", "views=${hookedTiles.size};hand=${hand.size}")
+                hookedTiles = emptyList()
+            }
+            lastHandSignature = signature
+        }
+
+        traceOrders()
+        renderHints()
+    }
+
+    /** Re-renders the current recommendation set against the current coordinates. */
+    private fun renderHints() {
+        val status = result?.optString("status")
+        val recommendations = result?.optJSONArray("recommendations")
         if ((status == "live" || status == "demo") && recommendations != null && recommendations.length() > 0) {
             render(parseHints(recommendations))
         } else {
@@ -79,36 +106,92 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     fun updateHookedCoords(coords: JSONArray) {
         val list = ArrayList<HookedTile>(coords.length())
+        var rejected = 0
         for (i in 0 until coords.length()) {
             val obj = coords.optJSONObject(i) ?: continue
             val tile = obj.optString("tile")
             val nx = obj.optDouble("nx", Double.NaN)
             val ny = obj.optDouble("ny", Double.NaN)
             val isLast = obj.optBoolean("last", false)
-            // Filter strictly valid screen viewport bounds to reject invalid 3D camera projections
-            if (tile.isNotBlank() && nx in 0.15..0.85 && ny in 0.65..0.98) {
+            // Reject only values outside the viewport; the old 0.15..0.85 / 0.65..0.98
+            // bounds silently dropped legitimately off-centre hand tiles and sent them
+            // to the guessed geometry instead.
+            if (tile.isNotBlank() && nx > 0.0 && nx < 1.0 && ny > 0.0 && ny < 1.0) {
                 list.add(HookedTile(tile, nx, ny, isLast))
+            } else {
+                rejected++
             }
         }
         if (list.isNotEmpty()) {
-            hookedTiles = list
-            val recommendations = result?.optJSONArray("recommendations")
-            val status = result?.optString("status")
-            if ((status == "live" || status == "demo") && recommendations != null && recommendations.length() > 0) {
-                render(parseHints(recommendations))
+            if (rejected > 0 || list.size != hookedTiles.size) {
+                GeometryTrace.note("HOOK_COORDS", "kept=${list.size};rejected=$rejected")
             }
+            hookedTiles = list
+            traceOrders()
+            renderHints()
+        } else {
+            // Never keep stale coordinates from the previous round/seat/rotation.
+            if (hookedTiles.isNotEmpty()) GeometryTrace.note("HOOK_COORDS", "reason=cleared_no_valid_coords")
+            hookedTiles = emptyList()
+            renderHints()
         }
     }
 
     fun close() {
         result = null
         hookedTiles = emptyList()
+        lastHandSignature = ""
+        lastOrderSignature = ""
+        GeometryTrace.reset()
         detach()
     }
 
     fun configurationChanged() {
+        // A rotation/resize invalidates every pixel anchor captured before it.
+        hookedTiles = emptyList()
+        lastHandSignature = ""
+        lastOrderSignature = ""
         detach()
         result?.let { update(it) }
+    }
+
+    /** Measured overlay size, or the display metrics before the window is laid out. */
+    fun describeGeometry(): Pair<Int, Int> {
+        val frame = root
+        val w = frame?.width?.takeIf { it > 0 } ?: display.widthPixels
+        val h = frame?.height?.takeIf { it > 0 } ?: display.heightPixels
+        return w to h
+    }
+
+    /**
+     * Emits one bounded record per distinct hand shape that contains both orderings
+     * side by side, so the pairing logic can be validated against real rounds:
+     *
+     *  - `order`: protocol hand (AI tehai) tile names, index order;
+     *  - `views`: game view tile names with their normalized coordinates, view order;
+     *  - `reds`:   how many red fives each side reports.
+     *
+     * Tile names and coordinates are plain gameplay state, not credentials, and the
+     * store sanitises them to letters/digits plus a few separators. Emitted only when
+     * the hand shape changes, so a full round produces a handful of lines, not a
+     * per-tick stream. Intended to answer: is view order == protocol order, and is
+     * the red-five encoding consistent between the two sources.
+     */
+    private fun traceOrders() {
+        if (hookedTiles.isEmpty() || hand.isEmpty()) return
+        val signature = hand.joinToString(",") + "#" + hookedTiles.joinToString(",") { "${it.tile}@${it.normX}" }
+        if (signature == lastOrderSignature) return
+        lastOrderSignature = signature
+        val views = hookedTiles.joinToString(" ") {
+            "${canonicalTile(it.tile)}@${String.format(java.util.Locale.ROOT, "%.3f", it.normX)}"
+        }
+        val reds = hand.count { canonicalTile(it).endsWith("r") }.toString() + "/" +
+            hookedTiles.count { canonicalTile(it.tile).endsWith("r") }
+        GeometryTrace.note(
+            "HINT_ORDER",
+            "order=${hand.joinToString(",")};views=$views;reds=$reds;" +
+                "hand=${hand.size};views_n=${hookedTiles.size}"
+        )
     }
 
     private fun parseHints(rows: JSONArray): List<DiscardHint> {
@@ -122,14 +205,16 @@ internal class TileBadgeOverlay(private val context: Context) {
             val tile = row.optString("tile")
             if (kind !in DISCARD_KINDS || tile.isBlank() || tile == "null") continue
 
-            val normalizedTile = tile.replace(Regex("^0([mps])$"), "5$1")
+            // Red fives are distinct tiles: "0m" (protocol) and "5mr" (game view)
+            // both mean the aka five, while "5m" is the ordinary five. Folding them
+            // into one key made a recommendation for the red five match whichever
+            // normal five happened to appear first in the hand.
+            val normalizedTile = canonicalTile(tile)
 
-            // Scan hand in natural left-to-right order so each badge attaches to its exact tile
             var targetIndex = -1
             if (hand.isNotEmpty()) {
                 for (hIdx in hand.indices) {
-                    val hTile = hand[hIdx].replace(Regex("^0([mps])$"), "5$1").removeSuffix("r")
-                    if (hTile == normalizedTile.removeSuffix("r") && hIdx !in usedIndices) {
+                    if (hIdx !in usedIndices && canonicalTile(hand[hIdx]) == normalizedTile) {
                         targetIndex = hIdx
                         usedIndices.add(hIdx)
                         break
@@ -144,6 +229,86 @@ internal class TileBadgeOverlay(private val context: Context) {
             hints.add(DiscardHint(kind, normalizedTile, rawWeight.coerceIn(0.0, 100.0), targetIndex))
         }
         return hints
+    }
+
+    /**
+     * Maps each hinted hand index to an on-screen (x, y) anchor.
+     *
+     * The protocol hand (AI `tehai`) and the game view list (`_handpai`, after the
+     * Lua side drops melds and the wildcard) are two independent orderings. They
+     * are known to carry the same multiset of tiles, but their relative order is
+     * not guaranteed.
+     *
+     * Only the *hinted* tile type needs to be unique. A duplicated tile that is
+     * not being recommended cannot move a badge, so it never suppresses one:
+     * with hand `1m 1m 9s`, a hint on `9s` still lands correctly.
+     *
+     * Without any hook coordinates there is no reliable anchor, so nothing is
+     * drawn. The old calibrated-row fallback silently depended on a guessed pitch
+     * measured on one device and put badges on the wrong tile everywhere else; it
+     * has been removed rather than kept as a wrong-but-plausible default.
+     */
+    private fun positionHints(hints: List<DiscardHint>, frame: FrameLayout): Map<Int, Pair<Int, Int>> {
+        val placed = HashMap<Int, Pair<Int, Int>>(hints.size)
+        if (hints.isEmpty()) return placed
+        if (hookedTiles.isEmpty()) {
+            GeometryTrace.note("BADGE_HIDDEN", "reason=no_coords;hints=${hints.size};hand=${hand.size}")
+            return placed
+        }
+
+        // Normalized coordinates describe a *relative* position in the game's
+        // viewport. Mapping them onto the overlay's own measured size is correct
+        // whenever the two viewports share an aspect ratio and full-screen coverage
+        // (the common case: the overlay is MATCH_PARENT + NO_LIMITS + IN_SCREEN).
+        // It does not require the two pixel sizes to be numerically equal, and it is
+        // not claimed to hold for a letterboxed or non-full-screen viewport; the
+        // recorded screenW/screenH vs overlayW/overlayH values let that be checked
+        // per device rather than assumed here.
+        val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
+        val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
+        val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
+
+        val viewCounts = hookedTiles.groupingBy { canonicalTile(it.tile) }.eachCount()
+        var ambiguous = 0
+        var missing = 0
+
+        for (hint in hints) {
+            val key = canonicalTile(hint.tile)
+            // Ambiguity is only relevant for the tile we actually want to point at.
+            if ((viewCounts[key] ?: 0) > 1) {
+                ambiguous++
+                continue
+            }
+            val view = hookedTiles.firstOrNull { canonicalTile(it.tile) == key }
+            if (view == null) {
+                missing++
+                continue
+            }
+            placed[hint.handIndex] = (view.normX * frameWidth).roundToInt() to
+                ((view.normY * frameHeight).roundToInt() - lift).coerceAtLeast(0)
+        }
+
+        if (ambiguous > 0 || missing > 0) {
+            GeometryTrace.note(
+                "BADGE_PARTIAL",
+                "ambiguous=$ambiguous;missing=$missing;placed=${placed.size};hand=${hand.size};" +
+                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight"
+            )
+        }
+        return placed
+    }
+
+    /**
+     * Canonical tile key that keeps red fives distinct.
+     *
+     * `0m` (protocol encoding) and `5mr` (game view encoding) both denote the aka
+     * five; `5m` denotes the ordinary five. Everything else passes through.
+     */
+    private fun canonicalTile(tile: String): String {
+        val trimmed = tile.trim()
+        if (trimmed.isEmpty() || trimmed == "null" || trimmed == "?") return trimmed
+        val red = trimmed.replace(Regex("^0([mps])$"), "$1r")
+        return if (red.endsWith("r")) "5" + red[0] + "r" else red
     }
 
     private fun extractHand(value: JSONObject): List<String> {
@@ -174,45 +339,22 @@ internal class TileBadgeOverlay(private val context: Context) {
         frame.removeAllViews()
 
         val badgeTargets = ArrayList<Pair<LinearLayout, Pair<Int, Int>>>()
-        val usedHooked = HashSet<Int>()
+        val placement = positionHints(hints, frame)
 
         for ((rank, hint) in hints.withIndex()) {
+            val targetX = placement[hint.handIndex] ?: continue
             val badgeView = createBadgeCard(hint, rank)
-            var targetX: Int? = null
-            var targetY: Int? = null
-
-            // 1. Try valid Hook coordinates if available
-            if (hookedTiles.isNotEmpty()) {
-                for ((idx, ht) in hookedTiles.withIndex()) {
-                    if (idx in usedHooked) continue
-                    val normalizedHt = ht.tile.replace(Regex("^0([mps])$"), "5$1").removeSuffix("r")
-                    if (normalizedHt == hint.tile.removeSuffix("r")) {
-                        targetX = (ht.normX * display.widthPixels).roundToInt()
-                        targetY = ((ht.normY * display.heightPixels).roundToInt() - dp(36)).coerceAtLeast(0)
-                        usedHooked.add(idx)
-                        break
-                    }
-                }
-            }
-
-            // 2. Measured geometric fallback: 13 tiles at 496..1634 px, pitch 94.83 px,
-            //    tile tops at y=935 on a 2376x1080 display.
-            if (targetX == null) {
-                val geometry = handGeometry(hand.size)
-                targetX = geometry.centers.getOrNull(hint.handIndex)
-                targetY = geometry.top - dp(32)
-            }
-
-            if (targetX != null && targetY != null) {
-                frame.addView(badgeView, FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT
-                ))
-                badgeTargets.add(badgeView to (targetX to targetY))
-            }
+            frame.addView(badgeView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ))
+            badgeTargets.add(badgeView to targetX)
         }
 
         if (badgeTargets.isEmpty()) {
+            // No trustworthy tile anchor: show the floating text panel only rather
+            // than drawing a badge over the wrong tile.
+            GeometryTrace.note("BADGE_HIDDEN", "reason=no_anchor;hints=${hints.size};views=${hookedTiles.size}")
             detach()
             return
         }
@@ -296,40 +438,6 @@ internal class TileBadgeOverlay(private val context: Context) {
         return (if (tile.endsWith("r")) "赤" else "") + tile[0] + suit
     }
 
-    private data class HandGeometry(val centers: List<Int>, val top: Int)
-
-    /**
-     * Measured hand layout for the current screen.
-     *
-     * These ratios were measured from a live 2376x1080 in-game screenshot by
-     * scanning the tile-top row: 13 tiles at centres 496..1634 px, a constant
-     * pitch of 94.83 px, tile tops at y=935. Expressing them as ratios of the
-     * live display keeps other resolutions and the DPI override aligned.
-     */
-    private fun handGeometry(handSize: Int): HandGeometry {
-        val width = display.widthPixels
-        val height = display.heightPixels
-        val firstCenter = width * 0.208754f
-        val pitch = width * 0.039913f
-        val drawnGap = pitch * 0.55f
-        val top = (height * 0.865741f).roundToInt()
-
-        // The sorted hand never exceeds 13 tiles; anything beyond that is the draw.
-        val concealed = when {
-            handSize <= 0 -> 13
-            handSize > 13 -> handSize - 1
-            else -> handSize
-        }
-        val centers = ArrayList<Int>(maxOf(handSize, concealed))
-        for (i in 0 until concealed) {
-            centers.add((firstCenter + i * pitch).roundToInt())
-        }
-        repeat((handSize - concealed).coerceAtLeast(0)) {
-            centers.add((firstCenter + concealed * pitch + drawnGap).roundToInt())
-        }
-        return HandGeometry(centers, top)
-    }
-
     private fun dp(value: Int) = (value * display.density).roundToInt()
 
     private fun detach() {
@@ -340,5 +448,7 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     private companion object {
         val DISCARD_KINDS = setOf("discard", "riichi")
+        /** Badge anchor sits this fraction of the overlay height above the tile top. */
+        const val BADGE_LIFT_FRACTION = 0.0333f
     }
 }
