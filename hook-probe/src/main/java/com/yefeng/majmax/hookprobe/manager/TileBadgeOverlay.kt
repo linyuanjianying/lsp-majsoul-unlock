@@ -24,6 +24,12 @@ internal class TileBadgeOverlay(private val context: Context) {
         /** Viewport tolerance so edge-sitting tiles are not dropped by float drift. */
         private const val EPS = 0.005
 
+        /** Discard kinds that get a badge card above their tile. */
+        private val DISCARD_KINDS = setOf("discard", "riichi")
+
+        /** Badge anchor sits this fraction of the overlay height above the tile top. */
+        private const val BADGE_LIFT_FRACTION = 0.0333f
+
         /**
          * Filters a raw `hand_coords` array into valid in-viewport tiles plus a
          * bounded textual sample of the rejected ones. Pure and testable: it does
@@ -480,11 +486,5 @@ internal class TileBadgeOverlay(private val context: Context) {
         val frame = root ?: return
         root = null
         runCatching { windows?.removeView(frame) }
-    }
-
-    private companion object {
-        val DISCARD_KINDS = setOf("discard", "riichi")
-        /** Badge anchor sits this fraction of the overlay height above the tile top. */
-        const val BADGE_LIFT_FRACTION = 0.0333f
     }
 }

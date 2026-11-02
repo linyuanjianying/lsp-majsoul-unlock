@@ -52,7 +52,7 @@ internal object DiagnosticsStore {
         // order/coordinate snapshot needed to validate hand-to-view mapping.
         "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho", "tiles",
-        "order", "reds")
+        "order", "reds", "behind", "minNx", "maxNx", "minNy", "maxNy", "sample", "views_n")
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
     private fun logFile(context: Context, kind: DiagnosticKind, index: Int = 1) =
