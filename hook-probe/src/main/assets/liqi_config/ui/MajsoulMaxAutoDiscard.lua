@@ -627,12 +627,28 @@ local function reportHandCoords()
         -- advance during a drawn-tile animation, so a same-step reshuffle or draw
         -- would otherwise reuse stale anchors and never resend. Folding the tile
         -- sequence into the signature forces a resend exactly when the hand changes.
-        local tiles = {}
-        for _, c in ipairs(coords) do tiles[#tiles + 1] = c.tile end
-        local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. table.concat(tiles, ',')
-        if A.lastCoordsSig ~= sig then
-            A.lastCoordsSig = sig
-            ack('', 'hand_coords', A.json.encode(coords))
+        --
+        -- The game's `_handpai` views are reordered transiently while a draw/discard
+        -- animation is playing: a capture taken mid-animation can report one tile at
+        -- a wrong x (e.g. `6p` where `2z` belongs). That jitter must not be shipped
+        -- to the overlay, because the previous content-only signature would suppress
+        -- the corrected follow-up capture (same tiles, same count) and strand a badge
+        -- on the wrong tile. So we fold the x sequence into the signature *and* hold
+        -- a non-monotonic capture back until the next tick reports a settled hand.
+        local monotonic = true
+        local tiles, xs = {}, {}
+        for i, c in ipairs(coords) do
+            tiles[#tiles + 1] = c.tile
+            xs[#xs + 1] = c.nx
+            if i > 1 and c.nx <= coords[i - 1].nx then monotonic = false end
+        end
+        if monotonic then
+            local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. table.concat(tiles, ',')
+                .. ':' .. table.concat(xs, ',')
+            if A.lastCoordsSig ~= sig then
+                A.lastCoordsSig = sig
+                ack('', 'hand_coords', A.json.encode(coords))
+            end
         end
     end
 

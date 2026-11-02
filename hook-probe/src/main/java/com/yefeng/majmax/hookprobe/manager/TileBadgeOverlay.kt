@@ -189,18 +189,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     fun updateHookedCoords(coords: JSONArray) {
         val filtered = filterCoords(coords)
         val list = filtered.kept
-        if (list.isNotEmpty()) {
-            if (filtered.rejected > 0 || list.size != hookedTiles.size) {
-                GeometryTrace.note(
-                    "HOOK_COORDS",
-                    "kept=${list.size};rejected=${filtered.rejected}" +
-                        if (filtered.sample.isNotEmpty()) ";sample=${filtered.sample}" else ""
-                )
-            }
-            hookedTiles = list
-            traceOrders()
-            renderHints()
-        } else {
+        if (list.isEmpty()) {
             // Always record a fully-rejected capture, including its sample, so a
             // camera/projection fault is visible instead of looking like "no data".
             GeometryTrace.note(
@@ -211,7 +200,55 @@ internal class TileBadgeOverlay(private val context: Context) {
             // Never keep stale coordinates from the previous round/seat/rotation.
             hookedTiles = emptyList()
             renderHints()
+            return
         }
+
+        if (filtered.rejected > 0 || list.size != hookedTiles.size) {
+            GeometryTrace.note(
+                "HOOK_COORDS",
+                "kept=${list.size};rejected=${filtered.rejected}" +
+                    if (filtered.sample.isNotEmpty()) ";sample=${filtered.sample}" else ""
+            )
+        }
+
+        // The Lua side already holds back non-monotonic captures (a draw/discard
+        // animation sliding a tile to a wrong x) and re-sends once the hand settles,
+        // so a capture reaching here is normally already left-to-right. Keep a
+        // defensive monotonicity check as a second line of protection: sort by x so
+        // pairing is position-consistent, and reject a still-non-monotonic capture
+        // rather than anchoring a badge to a wrong coordinate. The previous stable
+        // anchors are kept so an existing badge does not jump or vanish; the next
+        // settled capture from Lua will replace them.
+        val sorted = sortAndValidate(list)
+        if (sorted == null) {
+            GeometryTrace.note(
+                "COORD_UNSTABLE",
+                "kept=${list.size};rejected=${filtered.rejected};hand=${hand.size}"
+            )
+            renderHints()
+            return
+        }
+
+        hookedTiles = sorted
+        traceOrders()
+        renderHints()
+    }
+
+    /**
+     * Sorts a capture by normalized x, but first rejects a capture whose *raw* x
+     * sequence is not strictly increasing. When the game is at rest, `_handpai`
+     * order matches left-to-right, so a non-monotonic raw sequence is the signature
+     * of a draw/discard animation still sliding a tile (one tile reporting a wrong
+     * intermediate x). Rejecting that sample — instead of sorting it into place,
+     * which cannot fix a wrong coordinate value — is what keeps a badge off the
+     * wrong tile. Returns null to signal an unstable capture.
+     */
+    private fun sortAndValidate(list: List<HookedTile>): List<HookedTile>? {
+        if (list.size < 2) return list
+        for (i in 1 until list.size) {
+            if (list[i].normX <= list[i - 1].normX) return null
+        }
+        return list.sortedBy { it.normX }
     }
 
     fun close() {
@@ -355,6 +392,10 @@ internal class TileBadgeOverlay(private val context: Context) {
         var ambiguous = 0
         var missing = 0
         val pairingTrace = StringBuilder()
+        // Consume each view at most once so two identical recommended tiles never
+        // share the same on-screen anchor. hookedTiles is sorted by x, so the first
+        // unused match is the leftmost remaining instance of that tile type.
+        val usedViews = HashSet<Int>()
 
         for (hint in hints) {
             val key = canonicalTile(hint.tile)
@@ -363,10 +404,16 @@ internal class TileBadgeOverlay(private val context: Context) {
             if (count > 1) {
                 ambiguous++
             } else {
-                val view = hookedTiles.firstOrNull { canonicalTile(it.tile) == key }
+                var view: HookedTile? = null
+                var idx = -1
+                for ((i, v) in hookedTiles.withIndex()) {
+                    if (i in usedViews) continue
+                    if (canonicalTile(v.tile) == key) { view = v; idx = i; break }
+                }
                 if (view == null) {
                     missing++
                 } else {
+                    usedViews.add(idx)
                     placed[hint.handIndex] = (view.normX * frameWidth).roundToInt() to
                         ((view.normY * frameHeight).roundToInt() - lift).coerceAtLeast(0)
                 }
@@ -415,7 +462,7 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         frame.removeAllViews()
 
-        val badgeTargets = ArrayList<Pair<LinearLayout, Pair<Int, Int>>>()
+        val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
         val placement = positionHints(hints, frame)
 
         for ((rank, hint) in hints.withIndex()) {
@@ -425,7 +472,7 @@ internal class TileBadgeOverlay(private val context: Context) {
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT
             ))
-            badgeTargets.add(badgeView to targetX)
+            badgeTargets.add(Triple(badgeView, targetX, hint))
         }
 
         if (badgeTargets.isEmpty()) {
@@ -449,7 +496,13 @@ internal class TileBadgeOverlay(private val context: Context) {
         // (which previously left a badge stranded on the previous hand's tile).
         frame.post {
             if (root !== frame) return@post
-            for ((badgeView, target) in badgeTargets) {
+            // One bounded record per render with the *final* pixel target of every
+            // badge plus the hand index and frame bounds it was computed against.
+            // This makes a misplaced badge attributable to a specific tile/handIndex
+            // and to the exact anchor coordinates, instead of leaving the wrong
+            // placement silent. Format uses only sanitizer-allowed separators.
+            val placementTrace = StringBuilder()
+            for ((badgeView, target, _) in badgeTargets) {
                 if (badgeView.parent !== frame) continue
                 val (centerX, topY) = target
                 val badgeWidth = badgeView.width
@@ -464,6 +517,24 @@ internal class TileBadgeOverlay(private val context: Context) {
                     lp.topMargin = desiredTop
                     badgeView.layoutParams = lp
                 }
+            }
+            for ((badgeView, _, hint) in badgeTargets) {
+                if (badgeView.parent !== frame) continue
+                val lp = badgeView.layoutParams as FrameLayout.LayoutParams
+                if (placementTrace.length < 200) {
+                    if (placementTrace.isNotEmpty()) placementTrace.append(' ')
+                    placementTrace.append(hint.tile)
+                        .append('@').append(lp.leftMargin + badgeView.width / 2)
+                        .append(',').append(lp.topMargin)
+                        .append(':').append(hint.handIndex)
+                }
+            }
+            if (placementTrace.isNotEmpty()) {
+                GeometryTrace.note(
+                    "BADGE_PLACED",
+                    "placed=${badgeTargets.size};frame=${frame.width}x${frame.height};" +
+                        "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace}"
+                )
             }
         }
     }

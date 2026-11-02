@@ -43,6 +43,7 @@ internal object DiagnosticsStore {
     /** Bounded badge-geometry trace codes emitted by the assistant overlay. */
     private val hintCodes = setOf(
         "HOOK_COORDS", "HAND_SHAPE", "BADGE_PARTIAL", "BADGE_HIDDEN", "GAME_GEOMETRY", "HINT_ORDER",
+        "COORD_UNSTABLE", "BADGE_PLACED",
     )
     private val levels = setOf("DEBUG", "INFO", "WARN", "ERROR")
     private val components = setOf("hook.entry", "hook.native", "hook.capture", "assistant.service", "assistant.model", "assistant.engine", "assistant.autoplay", "assistant.hint", "manager")
@@ -53,7 +54,7 @@ internal object DiagnosticsStore {
         "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho", "tiles",
         "order", "reds", "behind", "minNx", "maxNx", "minNy", "maxNy", "sample", "views_n",
-        "cam", "cams", "pairs")
+        "cam", "cams", "pairs", "frame", "targets")
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
     private fun logFile(context: Context, kind: DiagnosticKind, index: Int = 1) =
@@ -229,7 +230,7 @@ internal object DiagnosticsStore {
                     // Order/coordinate snapshots need separators and room for ~14 tiles.
                     val limit = when (key) {
                         "errorMessage" -> 240
-                        "order", "views", "tiles", "pairs" -> 512
+                        "order", "views", "tiles", "pairs", "targets" -> 512
                         "cams" -> 256
                         else -> 64
                     }
