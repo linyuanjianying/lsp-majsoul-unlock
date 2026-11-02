@@ -27,6 +27,16 @@ internal class TileBadgeOverlay(private val context: Context) {
         /** Discard kinds that get a badge card above their tile. */
         private val DISCARD_KINDS = setOf("discard", "riichi")
 
+        /**
+         * Honor letters (protocol hand / recommendation) to `1z..7z` (game view).
+         * `P` is the white dragon (白) and `F` the green dragon (發), consistent
+         * with `AutoDiscardController.toGameTile` and Lua `tile()`.
+         */
+        private val HONOR_TO_Z = mapOf(
+            "E" to "1z", "S" to "2z", "W" to "3z", "N" to "4z",
+            "P" to "5z", "F" to "6z", "C" to "7z",
+        )
+
         /** Badge anchor sits this fraction of the overlay height above the tile top. */
         private const val BADGE_LIFT_FRACTION = 0.0333f
 
@@ -61,6 +71,29 @@ internal class TileBadgeOverlay(private val context: Context) {
                 }
             }
             return FilteredCoords(kept, rejected, sample.toString())
+        }
+
+        /**
+         * Canonical tile key shared by the protocol hand, the AI recommendation,
+         * and the game view so a hint can be paired with the on-screen tile it
+         * points at.
+         *
+         * Two independent encodings must be folded into one key:
+         *
+         *  - Honors: the protocol hand and recommendations spell them as single
+         *    letters (`E S W N P F C`) while the game view reports `1z..7z`. `P` is
+         *    the white dragon (白) and `F` the green dragon (發), matching Lua
+         *    `tile()`.
+         *  - Red fives: `0m/0p/0s` (zero encoding) and `5mr/5pr/5sr` (r-suffix)
+         *    are the same aka five; the r-suffix form is the canonical output and
+         *    must not be rebuilt into a corrupt `55r` key.
+         */
+        internal fun canonicalTile(tile: String): String {
+            val trimmed = tile.trim()
+            if (trimmed.isEmpty() || trimmed == "null" || trimmed == "?") return trimmed
+            HONOR_TO_Z[trimmed]?.let { return it }
+            if (trimmed.matches(Regex("^0([mps])$"))) return "5" + trimmed[1] + "r"
+            return trimmed
         }
     }
 
@@ -340,19 +373,6 @@ internal class TileBadgeOverlay(private val context: Context) {
         return placed
     }
 
-    /**
-     * Canonical tile key that keeps red fives distinct.
-     *
-     * `0m` (protocol encoding) and `5mr` (game view encoding) both denote the aka
-     * five; `5m` denotes the ordinary five. Everything else passes through.
-     */
-    private fun canonicalTile(tile: String): String {
-        val trimmed = tile.trim()
-        if (trimmed.isEmpty() || trimmed == "null" || trimmed == "?") return trimmed
-        val red = trimmed.replace(Regex("^0([mps])$"), "$1r")
-        return if (red.endsWith("r")) "5" + red[0] + "r" else red
-    }
-
     private fun extractHand(value: JSONObject): List<String> {
         value.optJSONArray("hand")?.let(::parseTiles)?.takeIf { it.isNotEmpty() }?.let { return it }
         val analysis = value.optJSONObject("analysis") ?: return emptyList()
@@ -473,7 +493,12 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     private fun tileDisplayName(tile: String): String {
-        val honors = mapOf("E" to "东", "S" to "南", "W" to "西", "N" to "北", "P" to "白", "F" to "发", "C" to "中")
+        // `tile` arrives already canonicalised: honor letters become `1z..7z`.
+        val honors = mapOf(
+            "1z" to "东", "2z" to "南", "3z" to "西", "4z" to "北",
+            "5z" to "白", "6z" to "发", "7z" to "中",
+            "E" to "东", "S" to "南", "W" to "西", "N" to "北", "P" to "白", "F" to "发", "C" to "中",
+        )
         honors[tile]?.let { return it }
         if (tile.length < 2) return tile
         val suit = when (tile[1]) { 'm' -> "万"; 'p' -> "筒"; 's' -> "索"; else -> "" }

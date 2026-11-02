@@ -405,6 +405,27 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val f = TileBadgeOverlay.filterCoords(coords)
                 check(f.kept.size == 1 && f.rejected == 1 && f.sample.contains("9m@5.000,5.000"))
             }
+            // canonicalTile must fold protocol honor letters and zero-red-fives onto
+            // the game-view encodings so a hint can actually pair with an on-screen
+            // tile. Without this, a `W`/`P`/`F` recommendation never matched `3z/5z/6z`
+            // and the honor badges stayed "missing".
+            fun canon(t: String) = TileBadgeOverlay.canonicalTile(t)
+            test("canonicalTile folds honor letters onto z-form") { _, _ ->
+                check(canon("E") == "1z" && canon("S") == "2z" && canon("W") == "3z" && canon("N") == "4z")
+                check(canon("P") == "5z" && canon("F") == "6z" && canon("C") == "7z")
+                // z-form is already canonical and passes through unchanged.
+                check(canon("3z") == "3z" && canon("5z") == "5z" && canon("6z") == "6z")
+            }
+            test("canonicalTile keeps red five distinct from normal five") { _, _ ->
+                check(canon("0m") == "5mr" && canon("0p") == "5pr" && canon("0s") == "5sr")
+                // r-suffix form must NOT be rebuilt into a corrupt "55r"/"55r" key.
+                check(canon("5mr") == "5mr" && canon("5sr") == "5sr" && canon("5pr") == "5pr")
+                check(canon("5m") == "5m" && canon("5s") == "5s")
+                check(canon("1p") == "1p" && canon("9s") == "9s")
+            }
+            test("canonicalTile trims and guards sentinels") { _, _ ->
+                check(canon(" W ") == "3z" && canon("") == "" && canon("null") == "null" && canon("?") == "?")
+            }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
             ApkUpdateChecks.run(targetContext)
