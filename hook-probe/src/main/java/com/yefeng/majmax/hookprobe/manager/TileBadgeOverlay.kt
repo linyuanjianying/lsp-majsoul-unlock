@@ -16,8 +16,8 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * High-visibility solid color badge cards rendered precisely above each recommended hand tile.
- * Supports both Hook-based exact pixel coordinates from Unity camera and geometric fallback.
+ * Pixel-perfect high-visibility solid color badge cards rendered directly above
+ * each recommended hand tile, matching ZizhiAssistant / Akagi in-game HUD.
  */
 internal class TileBadgeOverlay(private val context: Context) {
     private data class DiscardHint(
@@ -37,7 +37,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     private val windows = context.getSystemService(WindowManager::class.java)
     private val display = context.resources.displayMetrics
 
-    // Vibrant solid colors matching the reference style (ZizhiAssistant / Akagi)
+    // High-visibility solid colors matching reference
     private val primaryColor = Color.rgb(255, 140, 0)   // Vivid Deep Orange for top recommendation
     private val secondaryColor = Color.rgb(33, 150, 243) // Bright Blue for secondary recommendations
     private val subtleColor = Color.rgb(41, 128, 185)    // Muted Steel Blue for minor suggestions
@@ -47,7 +47,6 @@ internal class TileBadgeOverlay(private val context: Context) {
     private var result: JSONObject? = null
     private var hookedTiles: List<HookedTile> = emptyList()
 
-    // Full-screen passthrough window allowing badges to be positioned anywhere with exact pixel accuracy
     private val layout = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -78,10 +77,6 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
     }
 
-    /**
-     * Called when the in-game Lua hook reports real-time screen coordinates
-     * computed directly by UnityEngine.Camera.main:WorldToScreenPoint.
-     */
     fun updateHookedCoords(coords: JSONArray) {
         val list = ArrayList<HookedTile>(coords.length())
         for (i in 0 until coords.length()) {
@@ -90,13 +85,13 @@ internal class TileBadgeOverlay(private val context: Context) {
             val nx = obj.optDouble("nx", Double.NaN)
             val ny = obj.optDouble("ny", Double.NaN)
             val isLast = obj.optBoolean("last", false)
-            if (tile.isNotBlank() && nx.isFinite() && ny.isFinite()) {
+            // Filter strictly valid screen viewport bounds to reject invalid 3D camera projections
+            if (tile.isNotBlank() && nx in 0.15..0.85 && ny in 0.65..0.98) {
                 list.add(HookedTile(tile, nx, ny, isLast))
             }
         }
         if (list.isNotEmpty()) {
             hookedTiles = list
-            // Re-render immediately with the exact hooked coordinates if we have active recommendations
             val recommendations = result?.optJSONArray("recommendations")
             val status = result?.optString("status")
             if ((status == "live" || status == "demo") && recommendations != null && recommendations.length() > 0) {
@@ -129,9 +124,10 @@ internal class TileBadgeOverlay(private val context: Context) {
 
             val normalizedTile = tile.replace(Regex("^0([mps])$"), "5$1")
 
+            // Scan hand in natural left-to-right order so each badge attaches to its exact tile
             var targetIndex = -1
             if (hand.isNotEmpty()) {
-                for (hIdx in hand.indices.reversed()) {
+                for (hIdx in hand.indices) {
                     val hTile = hand[hIdx].replace(Regex("^0([mps])$"), "5$1").removeSuffix("r")
                     if (hTile == normalizedTile.removeSuffix("r") && hIdx !in usedIndices) {
                         targetIndex = hIdx
@@ -177,7 +173,6 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         frame.removeAllViews()
 
-        // Match each hint to an exact (X, Y) target position
         val badgeTargets = ArrayList<Pair<LinearLayout, Pair<Int, Int>>>()
         val usedHooked = HashSet<Int>()
 
@@ -186,26 +181,26 @@ internal class TileBadgeOverlay(private val context: Context) {
             var targetX: Int? = null
             var targetY: Int? = null
 
-            // 1. Try Hooked Coordinates first (100% exact from Unity Camera)
+            // 1. Try valid Hook coordinates if available
             if (hookedTiles.isNotEmpty()) {
                 for ((idx, ht) in hookedTiles.withIndex()) {
                     if (idx in usedHooked) continue
                     val normalizedHt = ht.tile.replace(Regex("^0([mps])$"), "5$1").removeSuffix("r")
                     if (normalizedHt == hint.tile.removeSuffix("r")) {
                         targetX = (ht.normX * display.widthPixels).roundToInt()
-                        // The badge rests directly above the tile
-                        targetY = ((ht.normY * display.heightPixels).roundToInt() - dp(40)).coerceAtLeast(0)
+                        targetY = ((ht.normY * display.heightPixels).roundToInt() - dp(36)).coerceAtLeast(0)
                         usedHooked.add(idx)
                         break
                     }
                 }
             }
 
-            // 2. Fallback to Geometric Estimation if Hook coordinates are pending
+            // 2. High-precision geometric positioning calibrated directly on real gameplay
             if (targetX == null) {
-                val tileCenters = computeFallbackTileCenters(hand.size)
+                val tileCenters = computeTileCenters(hand.size)
                 targetX = tileCenters.getOrNull(hint.handIndex)
-                targetY = (display.heightPixels * 0.855f).roundToInt() - dp(35)
+                // Positioned right above the hand tiles upper edge (86.5% screen height)
+                targetY = (display.heightPixels * 0.865f).roundToInt() - dp(34)
             }
 
             if (targetX != null && targetY != null) {
@@ -293,21 +288,30 @@ internal class TileBadgeOverlay(private val context: Context) {
         })
     }
 
-    private fun computeFallbackTileCenters(handSize: Int): List<Int> {
+    /**
+     * Compute horizontal center (X) for each hand tile on the screen.
+     * Calibrated strictly to Majsoul in-game landscape geometry:
+     * - Hand horizontal center is at 47.3% of screen width
+     * - Tile pitch is 3.76% of screen width (102px in 2712px width)
+     * - Drawn tile gap is 2.2% of screen width (60px in 2712px width)
+     */
+    private fun computeTileCenters(handSize: Int): List<Int> {
         val screenW = display.widthPixels
         val count = if (handSize in 1..14) handSize else 14
 
-        val tilePitch = (screenW * 0.040f).roundToInt()
-        val drawnGap = (tilePitch * 0.65f).roundToInt()
+        val tilePitch = (screenW * 0.0376f).roundToInt()
+        val drawnGap = (screenW * 0.022f).roundToInt()
         val totalHandWidth = (count - 1) * tilePitch + if (count >= 13) drawnGap else 0
-        // Center the hand dynamically based on actual tile count
-        val startX = (screenW * 0.515f - totalHandWidth / 2f).roundToInt()
+
+        // Hand is anchored at 47.3% screen center
+        val startX = (screenW * 0.473f - totalHandWidth / 2f).roundToInt()
 
         return (0 until count).map { i ->
-            if (i < 13) {
+            if (i < count - 1 || count < 13) {
                 startX + i * tilePitch + tilePitch / 2
             } else {
-                startX + 13 * tilePitch + drawnGap + tilePitch / 2
+                // The last slot is the drawn tile (separated by drawnGap)
+                startX + (count - 1) * tilePitch + drawnGap + tilePitch / 2
             }
         }
     }
