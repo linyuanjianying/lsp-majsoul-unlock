@@ -395,12 +395,31 @@ local function execute(command)
     if not ok then ack(id, claimKind and 'claim_run_exception' or 'game_exception')
     elseif claimKind then claimProbe(id, 'invoked') end
 end
+local function get3DCamera()
+    local Camera = UnityEngine and UnityEngine.Camera
+    if not Camera then return nil end
+    local all = Camera.allCameras
+    if all then
+        -- Find active perspective camera rendering the 3D board
+        local count = all.Length or (type(all) == 'table' and #all) or 0
+        for i = 0, count - 1 do
+            local c = all[i]
+            if c and c.enabled and not c.orthographic then
+                return c
+            end
+        end
+    end
+    return Camera.main
+end
+
 local function reportHandCoords()
     local d = DesktopMgr and DesktopMgr.Inst
     local r = d and d.mainrole
-    local cam = UnityEngine and UnityEngine.Camera and UnityEngine.Camera.main
-    local screenH = UnityEngine and UnityEngine.Screen and UnityEngine.Screen.height
-    if not d or not d.gameing or not r or not r._handpai or not cam or not screenH or not A.json then return end
+    local cam = get3DCamera()
+    local Screen = UnityEngine and UnityEngine.Screen
+    local screenW = Screen and Screen.width
+    local screenH = Screen and Screen.height
+    if not d or not d.gameing or not r or not r._handpai or not cam or not screenW or not screenH or screenW <= 0 or screenH <= 0 or not A.json then return end
 
     local coords = {}
     local step = d.current_step or 0
@@ -408,19 +427,21 @@ local function reportHandCoords()
         if view and view.valid and view.pai and view.transform and view.transform.position then
             local pos = view.transform.position
             local sp = cam:WorldToScreenPoint(pos)
-            local ax = math.floor(sp.x + 0.5)
-            local ay = math.floor(screenH - sp.y + 0.5)
+            -- Use normalized viewport fractions (0.0 to 1.0) so Unity internal render resolution
+            -- scaling never drifts against Android physical display resolution.
+            local nx = sp.x / screenW
+            local ny = (screenH - sp.y) / screenH
             coords[#coords + 1] = {
                 tile = view.pai:ToString(),
-                x = ax,
-                y = ay,
+                nx = math.floor(nx * 10000 + 0.5) / 10000,
+                ny = math.floor(ny * 10000 + 0.5) / 10000,
                 last = (view == r._last_tile)
             }
         end
     end
 
     if #coords > 0 then
-        local sig = tostring(step) .. ":" .. tostring(#coords) .. ":" .. tostring(coords[1].x) .. ":" .. tostring(coords[#coords].x)
+        local sig = tostring(step) .. ":" .. tostring(#coords) .. ":" .. tostring(coords[1].nx) .. ":" .. tostring(coords[#coords].nx)
         if A.lastCoordsSig ~= sig then
             A.lastCoordsSig = sig
             ack('', 'hand_coords', A.json.encode(coords))

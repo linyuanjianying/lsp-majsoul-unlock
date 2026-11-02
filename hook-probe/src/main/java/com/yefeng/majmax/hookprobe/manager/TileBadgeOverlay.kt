@@ -29,8 +29,8 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     private data class HookedTile(
         val tile: String,
-        val x: Int,
-        val y: Int,
+        val normX: Double,
+        val normY: Double,
         val isLast: Boolean
     )
 
@@ -87,11 +87,11 @@ internal class TileBadgeOverlay(private val context: Context) {
         for (i in 0 until coords.length()) {
             val obj = coords.optJSONObject(i) ?: continue
             val tile = obj.optString("tile")
-            val x = obj.optInt("x")
-            val y = obj.optInt("y")
+            val nx = obj.optDouble("nx", Double.NaN)
+            val ny = obj.optDouble("ny", Double.NaN)
             val isLast = obj.optBoolean("last", false)
-            if (tile.isNotBlank()) {
-                list.add(HookedTile(tile, x, y, isLast))
+            if (tile.isNotBlank() && nx.isFinite() && ny.isFinite()) {
+                list.add(HookedTile(tile, nx, ny, isLast))
             }
         }
         if (list.isNotEmpty()) {
@@ -192,9 +192,9 @@ internal class TileBadgeOverlay(private val context: Context) {
                     if (idx in usedHooked) continue
                     val normalizedHt = ht.tile.replace(Regex("^0([mps])$"), "5$1").removeSuffix("r")
                     if (normalizedHt == hint.tile.removeSuffix("r")) {
-                        targetX = ht.x
+                        targetX = (ht.normX * display.widthPixels).roundToInt()
                         // The badge rests directly above the tile
-                        targetY = (ht.y - dp(48)).coerceAtLeast(0)
+                        targetY = ((ht.normY * display.heightPixels).roundToInt() - dp(40)).coerceAtLeast(0)
                         usedHooked.add(idx)
                         break
                     }
@@ -297,9 +297,11 @@ internal class TileBadgeOverlay(private val context: Context) {
         val screenW = display.widthPixels
         val count = if (handSize in 1..14) handSize else 14
 
-        val startX = (screenW * 0.185f).roundToInt()
-        val tilePitch = (screenW * 0.0395f).roundToInt()
+        val tilePitch = (screenW * 0.040f).roundToInt()
         val drawnGap = (tilePitch * 0.65f).roundToInt()
+        val totalHandWidth = (count - 1) * tilePitch + if (count >= 13) drawnGap else 0
+        // Center the hand dynamically based on actual tile count
+        val startX = (screenW * 0.515f - totalHandWidth / 2f).roundToInt()
 
         return (0 until count).map { i ->
             if (i < 13) {
