@@ -32,6 +32,13 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Record build revision
+        env:
+          BUILD_REF: ${{ github.ref }}
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          printf 'Source ref: %s\nSource commit: %s\n' "$BUILD_REF" "$BUILD_SHA" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check release notes
         if: startsWith(github.ref, 'refs/tags/v')
         env:
