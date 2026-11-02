@@ -663,7 +663,16 @@ local function reportHandCoords()
                 .. ':' .. table.concat(xs, ',')
             if A.lastCoordsSig ~= sig then
                 A.lastCoordsSig = sig
-                ack('', 'hand_coords', A.json.encode(coords))
+                -- Wrap the coordinate array with the Unity source viewport it was
+                -- normalized against, so the overlay can map normalized fractions
+                -- back to the *source* surface and then to its own content frame.
+                -- The wrapper object keeps the parser able to read the bare array
+                -- (legacy) while carrying the source dimensions per capture.
+                ack('', 'hand_coords', A.json.encode({
+                    screenW = screenW,
+                    screenH = screenH,
+                    coords = coords,
+                }))
             end
         end
     end

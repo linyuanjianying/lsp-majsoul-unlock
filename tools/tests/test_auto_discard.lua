@@ -453,12 +453,15 @@ test('hand coordinates report a normalized range and resend on content change',f
         view('3m', 0.36, 0.80), view('4m', 0.44, 0.80) }
     role._last_tile = role._handpai[1]
     tick()
-    -- The mock encoder stores the raw table passed to it, so the coords array and
+    -- The mock encoder stores the raw table passed to it, so the coords wrapper and
     -- the geometry table both land in acks directly, followed by the wrapped ack.
-    local coordsSeen, geom
+    local coordsSeen, geom, coordsPayload
     for _, a in ipairs(acks) do
         if a.state == 'hand_coords' then coordsSeen = true end
         if type(a.handpai) == 'number' and a.screenW then geom = a end
+        if type(a.coords) == 'table' and type(a.screenW) == 'number' and a.state == nil then
+            coordsPayload = a
+        end
     end
     assert(coordsSeen, 'expected a hand_coords ack')
     assert(geom, 'expected a hand_geometry record')
@@ -466,6 +469,12 @@ test('hand coordinates report a normalized range and resend on content change',f
     assert(math.abs(geom.minNx - 0.2) < 0.001 and math.abs(geom.maxNx - 0.44) < 0.001)
     assert(math.abs(geom.minNy - 0.8) < 0.001 and math.abs(geom.maxNy - 0.8) < 0.001)
     assert(geom.behind == 0)
+    -- The hand_coords payload must carry the Unity source viewport alongside the
+    -- normalized coordinate array, so the overlay can map back to source pixels.
+    assert(coordsPayload, 'expected the coords wrapper carrying sourceW/sourceH')
+    assert(coordsPayload.screenW == 2376 and coordsPayload.screenH == 1080,
+        'source viewport must be recorded, got ' .. tostring(coordsPayload and coordsPayload.screenW) .. 'x' .. tostring(coordsPayload and coordsPayload.screenH))
+    assert(#coordsPayload.coords == 4, 'coords array must hold all four tiles')
     local n = #acks
     tick()  -- identical hand must not resend
     assert(#acks == n, 'identical hand must not resend hand_coords')

@@ -179,8 +179,15 @@ class AiOverlayService : Service() {
      * array to the overlay on the main thread. A decode failure is recorded instead
      * of being swallowed, so a payload encoding fault is visible rather than looking
      * like "no coordinates arrived".
+     *
+     * The payload is a wrapper object `{screenW, screenH, coords:[...]}` carrying the
+     * Unity source viewport the coordinates were normalized against; a bare array is
+     * still accepted for backward compatibility (source dims then remain unset, so the
+     * overlay keeps its last established values or withholds the badge).
      */
     private fun parseHandCoords(acks: String) {
+        var sourceW = 0
+        var sourceH = 0
         val coords = try {
             val rows = org.json.JSONArray(acks)
             var found: org.json.JSONArray? = null
@@ -188,7 +195,16 @@ class AiOverlayService : Service() {
                 val row = rows.getJSONObject(i)
                 if (row.optString("state") != "hand_coords") continue
                 val raw = row.optString("reason")
-                if (raw.isNotBlank()) found = org.json.JSONArray(raw)
+                if (raw.isBlank()) continue
+                // Wrapper object carries the source viewport; bare array is legacy.
+                val obj = runCatching { org.json.JSONObject(raw) }.getOrNull()
+                if (obj != null) {
+                    sourceW = obj.optInt("screenW", 0)
+                    sourceH = obj.optInt("screenH", 0)
+                    found = obj.optJSONArray("coords")
+                } else {
+                    found = org.json.JSONArray(raw)
+                }
             }
             found
         } catch (t: Throwable) {
@@ -196,8 +212,10 @@ class AiOverlayService : Service() {
             return
         }
         if (coords == null) return
+        val sw = sourceW
+        val sh = sourceH
         main.post {
-            runCatching { badges?.updateHookedCoords(coords) }
+            runCatching { badges?.updateHookedCoords(coords, sw, sh) }
                 .onFailure { GeometryTrace.note("HOOK_COORDS", "reason=apply_failed") }
         }
     }

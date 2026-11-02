@@ -130,6 +130,10 @@ internal class TileBadgeOverlay(private val context: Context) {
     private var result: JSONObject? = null
     private var hookedTiles: List<HookedTile> = emptyList()
 
+    /** Unity source viewport (Screen.width/height) the coords were normalized against. */
+    private var sourceW: Int = 0
+    private var sourceH: Int = 0
+
     /** Changes whenever the rendered order snapshot would differ. */
     private var lastOrderSignature: String = ""
 
@@ -187,6 +191,20 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     fun updateHookedCoords(coords: JSONArray) {
+        updateHookedCoords(coords, 0, 0)
+    }
+
+    /**
+     * Stores a captured coordinate set plus the Unity source viewport it was
+     * normalized against. `sourceW`/`sourceH` come from the hand_geometry payload
+     * (Unity Screen.width/height); when they are absent the overlay keeps the last
+     * established values so a transient geometry record does not wipe the mapping.
+     */
+    fun updateHookedCoords(coords: JSONArray, sourceW: Int, sourceH: Int) {
+        if (sourceW > 0 && sourceH > 0) {
+            this.sourceW = sourceW
+            this.sourceH = sourceH
+        }
         val filtered = filterCoords(coords)
         val list = filtered.kept
         if (list.isEmpty()) {
@@ -274,6 +292,8 @@ internal class TileBadgeOverlay(private val context: Context) {
         // A rotation/resize invalidates every pixel anchor captured before it.
         hookedTiles = emptyList()
         lastOrderSignature = ""
+        sourceW = 0
+        sourceH = 0
         detach()
         result?.let { update(it) }
     }
@@ -382,14 +402,22 @@ internal class TileBadgeOverlay(private val context: Context) {
             return placed
         }
 
-        // Normalized coordinates describe a *relative* position in the game's
-        // viewport. Mapping them onto the overlay's own measured size is correct
-        // whenever the two viewports share an aspect ratio and full-screen coverage
-        // (the common case: the overlay is MATCH_PARENT + NO_LIMITS + IN_SCREEN).
-        // It does not require the two pixel sizes to be numerically equal, and it is
-        // not claimed to hold for a letterboxed or non-full-screen viewport; the
-        // recorded screenW/screenH vs overlayW/overlayH values let that be checked
-        // per device rather than assumed here.
+        // Establish the coordinate mapping from *measured* geometry: the Unity
+        // source viewport (from the payload), the game viewport's on-screen rect
+        // (the overlay window's full physical bounds), and the overlay content
+        // frame's on-screen origin. When any of these cannot be measured there is
+        // no trustworthy transform, so no badge is drawn rather than placing one at
+        // a guessed position.
+        val mapping = measureMapping(frame)
+        if (mapping == null || !HandCoordinateMapper.isUsable(mapping)) {
+            GeometryTrace.note(
+                "BADGE_HIDDEN",
+                "reason=no_origin;hints=${hints.size};views=${hookedTiles.size};" +
+                    "sourceW=$sourceW;sourceH=$sourceH;frame=${frame.width}x${frame.height}"
+            )
+            return placed
+        }
+
         val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
         val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
         val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
@@ -425,8 +453,15 @@ internal class TileBadgeOverlay(private val context: Context) {
                     missing++
                 } else {
                     usedViews.add(idx)
-                    placed[hint.handIndex] = (view.normX * frameWidth).roundToInt() to
-                        ((view.normY * frameHeight).roundToInt() - lift).coerceAtLeast(0)
+                    // Map the Unity-normalized coordinate through the measured
+                    // source viewport -> display -> overlay-local transform. A null
+                    // result means the coordinate cannot be trusted for this shape.
+                    val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
+                    if (local != null) {
+                        placed[hint.handIndex] = local.first to (local.second - lift).coerceAtLeast(0)
+                    } else {
+                        missing++
+                    }
                 }
             }
             if (pairingTrace.length < 112) {
@@ -439,11 +474,50 @@ internal class TileBadgeOverlay(private val context: Context) {
             GeometryTrace.note(
                 "BADGE_PARTIAL",
                 "ambiguous=$ambiguous;missing=$missing;placed=${placed.size};hand=${hand.size};" +
-                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight" +
+                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight;" +
+                    "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
+                    "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY}" +
                     if (pairingTrace.isNotEmpty()) ";pairs=${pairingTrace}" else ""
             )
         }
         return placed
+    }
+
+    /**
+     * Builds the [HandCoordinateMapper.Mapping] from measured geometry. The source
+     * viewport comes from the payload; the game viewport is the overlay window's
+     * full physical bounds (full-bleed match to Unity's render surface); the frame
+     * origin is the overlay content's on-screen location. Returns null when the
+     * frame has not been laid out yet or its origin cannot be measured.
+     */
+    private fun measureMapping(frame: FrameLayout): HandCoordinateMapper.Mapping? {
+        if (sourceW <= 0 || sourceH <= 0) return null
+        if (frame.width <= 0 || frame.height <= 0) return null
+        val loc = IntArray(2)
+        frame.getLocationOnScreen(loc)
+        val frameOriginX = loc[0]
+        val frameOriginY = loc[1]
+
+        // Prefer the window's current metrics (physical px, API 30+): the bounds of
+        // a MATCH_PARENT + NO_LIMITS + IN_SCREEN overlay equal the full display, i.e.
+        // the game's full-bleed viewport. Fall back to the frame itself extended by
+        // its origin so a cutout inset is still accounted for on older APIs.
+        val bounds = runCatching { windows.currentWindowMetrics.bounds }.getOrNull()
+        val viewportLeft = bounds?.left ?: 0
+        val viewportTop = bounds?.top ?: 0
+        val viewportW = bounds?.width() ?: (frameOriginX + frame.width)
+        val viewportH = bounds?.height() ?: (frameOriginY + frame.height)
+
+        return HandCoordinateMapper.Mapping(
+            sourceW = sourceW,
+            sourceH = sourceH,
+            viewportLeft = viewportLeft,
+            viewportTop = viewportTop,
+            viewportW = viewportW,
+            viewportH = viewportH,
+            frameOriginX = frameOriginX,
+            frameOriginY = frameOriginY,
+        )
     }
 
     private fun extractHand(value: JSONObject): List<String> {
@@ -505,6 +579,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         // is no longer the live root, or a badge view has already been removed by a
         // later removeAllViews(), skip it instead of pinning a dead view's margins
         // (which previously left a badge stranded on the previous hand's tile).
+        val mapping = measureMapping(frame)
         frame.post {
             if (root !== frame) return@post
             // One bounded record per render with the *final* pixel target of every
@@ -544,7 +619,11 @@ internal class TileBadgeOverlay(private val context: Context) {
                 GeometryTrace.note(
                     "BADGE_PLACED",
                     "placed=${badgeTargets.size};frame=${frame.width}x${frame.height};" +
-                        "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace}"
+                        "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace};" +
+                        "sourceW=${mapping?.sourceW ?: 0};sourceH=${mapping?.sourceH ?: 0};" +
+                        "frameOrigin=${mapping?.frameOriginX ?: 0},${mapping?.frameOriginY ?: 0};" +
+                        "viewport=${mapping?.viewportW ?: 0}x${mapping?.viewportH ?: 0}" +
+                        "@${mapping?.viewportLeft ?: 0},${mapping?.viewportTop ?: 0}"
                 )
             }
         }

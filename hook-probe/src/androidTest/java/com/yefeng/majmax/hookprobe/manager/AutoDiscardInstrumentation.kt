@@ -426,6 +426,59 @@ class AutoDiscardInstrumentation : Instrumentation() {
             test("canonicalTile trims and guards sentinels") { _, _ ->
                 check(canon(" W ") == "3z" && canon("") == "" && canon("null") == "null" && canon("?") == "?")
             }
+            // HandCoordinateMapper must map Unity-normalized coords through the
+            // *source* viewport, not the overlay's compressed content frame, and must
+            // subtract the overlay's measured on-screen origin. The real device runs
+            // Unity at 2376x1080 (landscape) while the overlay content frame is only
+            // 2256 wide because of the 120px cutout inset; mapping nx*2256 put every
+            // badge ~60-120px off. These pure cases pin the source-width transform.
+            fun mapping(sourceW: Int, sourceH: Int, viewportLeft: Int = 0, viewportTop: Int = 0,
+                        viewportW: Int = sourceW, viewportH: Int = sourceH,
+                        frameOriginX: Int = 0, frameOriginY: Int = 0) =
+                HandCoordinateMapper.Mapping(sourceW, sourceH, viewportLeft, viewportTop,
+                    viewportW, viewportH, frameOriginX, frameOriginY)
+            test("mapper scales by source width, not overlay width") { _, _ ->
+                // 2376-wide source, overlay content frame 2256 wide, cutout on the left
+                // (frame origin x=120). nx=0.568 must land at 0.568*2376 - 120 = 1349,
+                // matching the real-device global x for view 9s@0.568.
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                val px = HandCoordinateMapper.toLocalPx(0.568, 0.5, m)!!
+                check(px.first == 1349) { "expected x=1349, got ${px.first}" }
+            }
+            test("mapper subtracts frame origin so the whole row shifts correctly") { _, _ ->
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                // nx=0 (leftmost tile) must land at -120 locally (off the left of the
+                // clipped frame), NOT at 0 — proving the origin is accounted for.
+                val left = HandCoordinateMapper.toLocalPx(0.0, 0.5, m)!!
+                check(left.first == -120) { "expected x=-120, got ${left.first}" }
+            }
+            test("mapper letterbox scales source into a smaller viewport") { _, _ ->
+                // A letterboxed 2376x1080 render inside a 1920x1080 window (scale ~0.808)
+                // with no left inset: nx=0.5 -> 1188*scale -> 960.
+                val m = mapping(2376, 1080, viewportW = 1920, viewportH = 1080)
+                val px = HandCoordinateMapper.toLocalPx(0.5, 0.5, m)!!
+                check(px.first == 960) { "expected x=960, got ${px.first}" }
+            }
+            test("mapper rotates source into a portrait viewport") { _, _ ->
+                // Screen rotated: source 1080x2376 (portrait) into 1080x2376 viewport.
+                val m = mapping(1080, 2376, viewportW = 1080, viewportH = 2376)
+                val px = HandCoordinateMapper.toLocalPx(0.5, 0.5, m)!!
+                check(px.first == 540 && px.second == 1188) { "expected 540,1188 got ${px.first},${px.second}" }
+            }
+            test("mapper returns null when dimensions are unusable") { _, _ ->
+                check(HandCoordinateMapper.toLocalPx(0.5, 0.5, mapping(0, 1080)) == null)
+                check(HandCoordinateMapper.toLocalPx(0.5, 0.5, mapping(2376, 0)) == null)
+                check(HandCoordinateMapper.toLocalPx(0.5, 0.5, mapping(2376, 1080, viewportW = 0)) == null)
+                check(!HandCoordinateMapper.isUsable(mapping(0, 1080)))
+                check(HandCoordinateMapper.isUsable(mapping(2376, 1080)))
+            }
+            test("mapper does not clamp out-of-source coordinates") { _, _ ->
+                // A coordinate beyond the source (e.g. a fault) must stay beyond the
+                // frame, not be clamped into [0,1] — surfacing the fault instead.
+                val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
+                val px = HandCoordinateMapper.toLocalPx(1.5, 0.5, m)!!
+                check(px.first == 3564) { "expected x=3564 (unclamped), got ${px.first}" }
+            }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
             ApkUpdateChecks.run(targetContext)
