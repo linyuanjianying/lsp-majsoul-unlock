@@ -635,12 +635,28 @@ local function reportHandCoords()
         -- the corrected follow-up capture (same tiles, same count) and strand a badge
         -- on the wrong tile. So we fold the x sequence into the signature *and* hold
         -- a non-monotonic capture back until the next tick reports a settled hand.
+        --
+        -- The orthographic hand camera mirrors the world x, so a *settled* hand can be
+        -- strictly increasing or strictly decreasing in x depending on the camera that
+        -- actually renders it. A jittered frame is the only case where the direction
+        -- flips mid-sequence (one tile reporting a wrong intermediate x), so we accept
+        -- a single consistent direction and reject a capture that changes direction.
         local monotonic = true
+        local dir = nil
         local tiles, xs = {}, {}
         for i, c in ipairs(coords) do
             tiles[#tiles + 1] = c.tile
             xs[#xs + 1] = c.nx
-            if i > 1 and c.nx <= coords[i - 1].nx then monotonic = false end
+            if i > 1 then
+                local d = c.nx - coords[i - 1].nx
+                if d == 0 then
+                    monotonic = false
+                elseif dir == nil then
+                    dir = d > 0
+                elseif (d > 0) ~= dir then
+                    monotonic = false
+                end
+            end
         end
         if monotonic then
             local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. table.concat(tiles, ',')

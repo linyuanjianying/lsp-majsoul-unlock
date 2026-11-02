@@ -213,7 +213,7 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         // The Lua side already holds back non-monotonic captures (a draw/discard
         // animation sliding a tile to a wrong x) and re-sends once the hand settles,
-        // so a capture reaching here is normally already left-to-right. Keep a
+        // so a capture reaching here is normally already uniformly ordered. Keep a
         // defensive monotonicity check as a second line of protection: sort by x so
         // pairing is position-consistent, and reject a still-non-monotonic capture
         // rather than anchoring a badge to a wrong coordinate. The previous stable
@@ -236,17 +236,28 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     /**
      * Sorts a capture by normalized x, but first rejects a capture whose *raw* x
-     * sequence is not strictly increasing. When the game is at rest, `_handpai`
-     * order matches left-to-right, so a non-monotonic raw sequence is the signature
-     * of a draw/discard animation still sliding a tile (one tile reporting a wrong
-     * intermediate x). Rejecting that sample — instead of sorting it into place,
-     * which cannot fix a wrong coordinate value — is what keeps a badge off the
-     * wrong tile. Returns null to signal an unstable capture.
+     * sequence is not strictly monotonic. When the game is at rest, `_handpai`
+     * order matches left-to-right *or* right-to-left depending on the hand camera
+     * that actually rendered the hand (the orthographic hand camera mirrors the
+     * world x), so a settled hand is strictly increasing or strictly decreasing in
+     * x. A raw sequence that flips direction is the signature of a draw/discard
+     * animation still sliding a tile (one tile reporting a wrong intermediate x).
+     * Rejecting that sample — instead of sorting it into place, which cannot fix a
+     * wrong coordinate value — is what keeps a badge off the wrong tile. Returns
+     * null to signal an unstable capture.
      */
     private fun sortAndValidate(list: List<HookedTile>): List<HookedTile>? {
         if (list.size < 2) return list
+        var ascending: Boolean? = null
         for (i in 1 until list.size) {
-            if (list[i].normX <= list[i - 1].normX) return null
+            val delta = list[i].normX - list[i - 1].normX
+            if (delta == 0.0) return null
+            val up = delta > 0.0
+            if (ascending == null) {
+                ascending = up
+            } else if (up != ascending) {
+                return null
+            }
         }
         return list.sortedBy { it.normX }
     }
