@@ -27,6 +27,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!--
+            Token-guarded hand-off used only when Android 12+ refuses a background
+            foreground-service start requested by the in-game control. The game is a
+            different UID, so this entry point has to be exported; it never shows UI,
+            starts nothing without the single-use token that the UID-checked
+            AiEndpointProvider issued moments earlier, and closes itself immediately.
+        -->
+        <activity
+            android:name=".GameTopControl$AssistLaunchActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <provider
             android:name=".manager.AiEndpointProvider"
             android:authorities="com.yefeng.majmax.hookprobe.ai"
@@ -64,7 +77,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="User-started local mahjong analysis with a persistent floating overlay" />
+                android:value="User-started local mahjong analysis with in-game controls" />
         </service>
     </application>
 </manifest>

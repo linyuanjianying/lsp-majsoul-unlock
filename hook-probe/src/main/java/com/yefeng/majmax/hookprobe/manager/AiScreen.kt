@@ -46,7 +46,8 @@ import kotlin.math.roundToInt
 internal fun AiScreen(padding: PaddingValues) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    var allowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    var displayMode by remember { mutableStateOf(AssistantDisplayModeSettings.read(context)) }
     var showLicense by remember { mutableStateOf(false) }
     var autoDelay by remember { mutableStateOf(AutoDelaySettings.read(context)) }
     var fourModel by remember { mutableStateOf(OnnxModelStore.info(context, 4)) }
@@ -71,28 +72,28 @@ internal fun AiScreen(padding: PaddingValues) {
     }
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) allowed = Settings.canDrawOverlays(context)
+            if (event == Lifecycle.Event.ON_RESUME) {
+                overlayAllowed = Settings.canDrawOverlays(context)
+                displayMode = AssistantDisplayModeSettings.read(context)
+                AiOverlayService.refreshDisplayMode()
+            }
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
     }
     fun start(demo: Boolean) {
-        if (!Settings.canDrawOverlays(context)) {
-            context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
-            return
-        }
         AiOverlayService.start(context, demo)
         if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
     ManagerPage(padding) {
         Text("本地牌局助手", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-        Text("实时推荐切牌，展示听牌后的和牌率估计与放铳风险。AI 和牌局分析均在手机内完成。",
+        Text("在手机本地分析牌局并提供无人值守控制。",
             style = MaterialTheme.typography.bodyMedium)
         ManagerCard {
             Text(if (status.running) "助手已开启" else "助手未开启", style = MaterialTheme.typography.titleMedium)
             Text(status.message)
-            Text(if (allowed) "悬浮窗权限已允许" else "首次使用需允许“显示在其他应用上层”", style = MaterialTheme.typography.bodySmall)
-            ManagerButton(onClick = { start(false) }) { Text(if (allowed) "开启实时悬浮助手" else "允许悬浮窗权限") }
+            Text("启动助手后进入雀魂，点击屏幕顶部的把手打开控制菜单。", style = MaterialTheme.typography.bodySmall)
+            ManagerButton(onClick = { start(false) }) { Text("开启实时助手") }
             ManagerActions(
                 first = { ManagerOutlinedButton(onClick = { start(true) }, modifier = it) { Text("本地模型自检") } },
                 second = { ManagerOutlinedButton(onClick = { AiOverlayService.stop(context) }, modifier = it,
@@ -123,7 +124,7 @@ internal fun AiScreen(padding: PaddingValues) {
                 style = MaterialTheme.typography.bodySmall)
             Text("首次默认关闭；开启状态会保存。按 AI 首选操作，结算后继续下一局；断线或游戏退出后尝试恢复，取得完整牌局后继续。所有操作按上方范围等待。手动出牌或停止助手会关闭此模式。",
                 style = MaterialTheme.typography.bodySmall)
-            Text("关闭模式后可正常退出游戏；收纳后点击“停”浮标会先关闭无人值守模式。整场结束后不会自动创建新对局。", style = MaterialTheme.typography.bodySmall)
+            Text("关闭模式后可正常退出游戏；也可通过游戏内顶部菜单直接关闭，关闭时本应用服务不会停止。整场结束后不会自动创建新对局。", style = MaterialTheme.typography.bodySmall)
         }
         Text("实验性 Mortal v4 支持四麻和三麻，可手动开启无人值守；特征含近似计算，尚未完成与上游的完整一致性验证。", style = MaterialTheme.typography.bodySmall)
         Text("策略模型", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
@@ -185,9 +186,47 @@ internal fun AiScreen(padding: PaddingValues) {
         )
         Text(modelMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         ManagerCard {
-            Text("悬浮窗操作", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("拖动标题栏移动窗口。点“调节”设置透明度和宽度，点“收纳”变成 AI 小浮标，点浮标再次展开。位置和显示设置会自动保存。")
-            Text("先开启助手，再进入雀魂对局。更新模块后请重启游戏；中途开启或丢失消息时，重新进入牌局以恢复完整状态。")
+            Text("显示与控制模式", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("提示和无人值守控制共用同一个显示位置，两种模式二选一，避免重复显示。", style = MaterialTheme.typography.bodySmall)
+            ManagerActions(
+                first = {
+                    ManagerOutlinedButton(onClick = {
+                        displayMode = AssistantDisplayMode.HOOK
+                        AssistantDisplayModeSettings.save(context, displayMode)
+                        AiOverlayService.refreshDisplayMode()
+                    }, modifier = it) {
+                        Text(if (displayMode == AssistantDisplayMode.HOOK) "已选：游戏内 Hook" else "游戏内 Hook")
+                    }
+                },
+                second = {
+                    ManagerOutlinedButton(onClick = {
+                        displayMode = AssistantDisplayMode.OVERLAY
+                        AssistantDisplayModeSettings.save(context, displayMode)
+                        AiOverlayService.refreshDisplayMode()
+                    }, modifier = it) {
+                        Text(if (displayMode == AssistantDisplayMode.OVERLAY) "已选：系统悬浮窗" else "系统悬浮窗")
+                    }
+                },
+            )
+            when (displayMode) {
+                AssistantDisplayMode.HOOK -> {
+                    Text("游戏内 Hook（默认）：控制把手、胶囊菜单和牌面提示都画在游戏窗口内，不需要悬浮窗权限。")
+                }
+                AssistantDisplayMode.OVERLAY -> {
+                    Text("系统悬浮窗：使用独立的悬浮窗和牌面提示浮层，需要悬浮窗权限。")
+                    if (overlayAllowed) {
+                        Text("已获得悬浮窗权限，助手开启后悬浮窗即可显示。")
+                    } else {
+                        Text("尚未获得悬浮窗权限；授权前会继续使用游戏内 Hook 方式，不会强制跳转。")
+                        ManagerTextButton(onClick = {
+                            context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${context.packageName}")))
+                        }) { Text("授权悬浮窗权限") }
+                    }
+                }
+            }
+            Text("进入雀魂后，游戏内模式点屏幕顶部把手展开胶囊，再点胶囊打开菜单：菜单里可直接开启或关闭无人值守。关闭无人值守不会停止本应用；前台通知仍保留。", style = MaterialTheme.typography.bodySmall)
+            Text("可直接进入雀魂，在游戏内开启助手；更新模块后请重启游戏。中途开启或丢失消息时，可能需要重新进入牌局恢复完整状态。", style = MaterialTheme.typography.bodySmall)
             ManagerTextButton(onClick = {
                 context.packageManager.getLaunchIntentForPackage(AiOverlayService.GAME)?.let(context::startActivity)
             }) { Text("打开雀魂") }

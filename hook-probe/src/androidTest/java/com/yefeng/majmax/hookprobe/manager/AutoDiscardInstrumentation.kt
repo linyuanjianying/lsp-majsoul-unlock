@@ -593,11 +593,8 @@ class AutoDiscardInstrumentation : Instrumentation() {
             // Device evidence: anchorY = 0.9228 * 1080 = 997 px, tile top ~922 px
             // (75 px anchor->tile-top), badge height 70..80 px. Data payload gave
             // tileTop 922 / badgeH 70 / top 852 / bottom 922.
-            // Card-sized badges: the hint box must match the card it points at — one
-            // card wide (resting pitch) and one card tall (visible face) — because the
-            // previous shrink-wrapped box (~111x81 px at 1080p) looked like a label,
-            // not like a tile.
-            test("deriveBadgeSizePx sizes a badge like one hand card at 1080p") { _, _ ->
+            // Compact labels retain the card-top anchor while reducing width and height.
+            test("deriveBadgeSizePx sizes a compact label at 1080p") { _, _ ->
                 val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
                 // Live projection: adjacent standard tiles differ by nx ≈ 0.0399.
                 val views = listOf(
@@ -607,10 +604,10 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2256, 1080)
                     ?: error("expected a derived card size")
                 // 0.0398 * 2376 = 94.6 px pitch (screenshot: 94-95 px).
-                check(size.width in 94..96) { "expected a 94-96 px card width, got ${size.width}" }
-                // Screenshot card face: y 922..1074 => ~152 px of the 1080 px frame.
-                check(size.height in 150..154) {
-                    "expected a ~152 px card height, got ${size.height}"
+                check(size.width in 65..68) { "expected a 65-68 px label width, got ${size.width}" }
+                // Reference label height: 5% of a 1080 px frame.
+                check(size.height in 52..56) {
+                    "expected a ~54 px label height, got ${size.height}"
                 }
                 check(size.source == "pitch") { "expected pitch sizing, got ${size.source}" }
             }
@@ -625,25 +622,24 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 )
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2376, 1080)
                     ?: error("expected a derived card size")
-                check(size.width in 94..96) {
+                check(size.width in 65..68) {
                     "drawn-tile step leaked into the width: ${size.width}"
                 }
             }
             test("deriveBadgeSizePx falls back to a card-width pitch without a sample") { _, _ ->
                 // One anchored hint: no neighbour, so no pitch can be measured. The
-                // badge still gets card proportions (4% of the frame width) instead of
-                // shrinking back to the text box.
+                // label remains 70% of a hand tile pitch.
                 val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
                 val single = listOf(view("1m", 0.5, 0.92))
                 val fallback = TileBadgeOverlay.deriveBadgeSizePx(single, m, 2376, 1080)
                     ?: error("expected the normalized fallback")
                 check(fallback.source == "fallback") { "expected fallback, got ${fallback.source}" }
-                check(fallback.width in 94..96) { "expected ~95 px, got ${fallback.width}" }
-                check(fallback.height in 150..154) { "expected ~152 px, got ${fallback.height}" }
-                // No mapping at all (unmeasured frame): still card-sized, never text-sized.
+                check(fallback.width in 65..68) { "expected ~67 px, got ${fallback.width}" }
+                check(fallback.height in 52..56) { "expected ~54 px, got ${fallback.height}" }
+                // No mapping: use the same compact fallback.
                 val noMapping = TileBadgeOverlay.deriveBadgeSizePx(single, null, 2376, 1080)
                     ?: error("expected a size even without a mapping")
-                check(noMapping.width in 94..96 && noMapping.height in 150..154)
+                check(noMapping.width in 65..68 && noMapping.height in 52..56)
             }
             test("deriveBadgeSizePx clamps a distorted or single-tile hand") { _, _ ->
                 val m = mapping(2000, 1000, viewportW = 2000, viewportH = 1000)
@@ -651,19 +647,18 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val wide = listOf(view("1m", 0.10, 0.9), view("2m", 0.40, 0.9))
                 val clamped = TileBadgeOverlay.deriveBadgeSizePx(wide, m, 2000, 1000)
                     ?: error("expected a size")
-                check(clamped.width == (0.055 * 2000).toInt()) {
-                    "expected the max pitch clamp 110, got ${clamped.width}"
+                check(clamped.width == (0.055 * 2000 * 0.70).toInt()) {
+                    "expected the scaled max pitch clamp, got ${clamped.width}"
                 }
                 // A near-zero step cannot become a sliver either.
                 val tiny = listOf(view("1m", 0.10, 0.9), view("2m", 0.1005, 0.9))
                 val sliver = TileBadgeOverlay.deriveBadgeSizePx(tiny, m, 2000, 1000)!!
-                check(sliver.width == (0.03 * 2000).toInt()) {
-                    "expected the min pitch clamp 60, got ${sliver.width}"
+                check(sliver.width == (0.03 * 2000 * 0.70).toInt()) {
+                    "expected the scaled min pitch clamp, got ${sliver.width}"
                 }
             }
             test("deriveBadgeSizePx scales with the frame height") { _, _ ->
-                // 1440p: the card face keeps its fraction (0.1407 * 1440 = 202.6) and the
-                // width keeps the card pitch (0.04 * 3168 = 127).
+                // 1440p: label height ~72 px; width ~89 px at 70% tile pitch.
                 val m = mapping(3168, 1440, viewportW = 3168, viewportH = 1440)
                 val views = listOf(
                     view("1p", 0.20, 0.92), view("2p", 0.2399, 0.92),
@@ -671,12 +666,12 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 )
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 3168, 1440)
                     ?: error("expected a size")
-                check(size.width in 125..130) { "expected ~127 px, got ${size.width}" }
-                check(size.height in 201..204) { "expected ~203 px, got ${size.height}" }
+                check(size.width in 87..90) { "expected ~89 px, got ${size.width}" }
+                check(size.height in 70..74) { "expected ~72 px, got ${size.height}" }
                 // Degenerate frame: no card size, the caller keeps the text measurement.
                 check(TileBadgeOverlay.deriveBadgeSizePx(views, m, 0, 0) == null)
             }
-            test("a card-sized badge still sits flush above its tile") { _, _ ->
+            test("a compact badge still sits flush above its tile") { _, _ ->
                 val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
                 val views = listOf(
                     view("1p", 0.2091, 0.9228), view("2p", 0.2489, 0.9228),
@@ -692,10 +687,10 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     anchorY, offset, size.height, 0, 1080
                 ) ?: error("expected a vertical placement")
                 // Bottom on the tile top, whole card above it: the badge never covers
-                // the tile it points at, and it does not shrink (152 px fits above 922).
+                // the tile it points at (54 px fits above 922).
                 check(vertical.top + vertical.height == anchorY - offset)
                 check(vertical.height == size.height)
-                check(vertical.top >= 0) { "card-sized badge left the frame: ${vertical.top}" }
+                check(vertical.top >= 0) { "compact badge left the frame: ${vertical.top}" }
                 check(vertical.top >= 700) { "badge grew into unrelated UI: ${vertical.top}" }
             }
             test("computeBadgeTop puts the badge bottom on the tile top edge") { _, _ ->
@@ -801,12 +796,80 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     check(v.top < anchorY - 70) { "badge must be fully above the tile" }
                 }
             }
+            // Button-recommendation mapping is pure: it folds each action kind onto a
+            // button key and gates on the buttons the game actually reports visible.
+            fun btnRec(kind: String, prob: Double) =
+                JSONObject().put("kind", kind).put("policyProbability", prob)
+            test("resolveButtonHints maps action kinds onto visible buttons") { _, _ ->
+                val rows = JSONArray().put(btnRec("pon", 0.9)).put(btnRec("chi", 0.7))
+                    .put(btnRec("pass", 0.3))
+                val hints = TileBadgeOverlay.resolveButtonHints(rows, setOf("pon", "chi", "pass", "kan"))
+                check(hints.size == 3)
+                check(hints[0].key == "pon" && hints[0].displayName == "碰")
+                check(hints[1].key == "chi" && hints[1].displayName == "吃")
+                check(hints[2].key == "pass" && hints[2].displayName == "跳过")
+                check(hints[0].weight == 90.0) { "expected 90%, got ${hints[0].weight}" }
+            }
+            test("resolveButtonHints drops kinds whose button is not visible") { _, _ ->
+                val rows = JSONArray().put(btnRec("pon", 0.9)).put(btnRec("hora", 0.8))
+                // Only the pon button is visible; hora has no anchor and must vanish.
+                val hints = TileBadgeOverlay.resolveButtonHints(rows, setOf("pon"))
+                check(hints.size == 1 && hints[0].key == "pon")
+            }
+            test("resolveButtonHints collapses multiple combinations of one kind") { _, _ ->
+                // Two candidate chi combinations (different tiles) collapse to one
+                // button label on the first (highest-ranked) entry.
+                val rows = JSONArray().put(btnRec("chi", 0.8)).put(btnRec("chi", 0.2))
+                val hints = TileBadgeOverlay.resolveButtonHints(rows, setOf("chi"))
+                check(hints.size == 1 && hints[0].weight == 80.0)
+            }
+            test("resolveButtonHints ignores discard kinds and empty rows") { _, _ ->
+                val rows = JSONArray().put(btnRec("discard", 0.9)).put(btnRec("riichi", 0.8))
+                check(TileBadgeOverlay.resolveButtonHints(rows, setOf("pon")).isEmpty())
+                check(TileBadgeOverlay.resolveButtonHints(JSONArray(), setOf("pon")).isEmpty())
+            }
+            test("resolveButtonHints caps the output at four button labels") { _, _ ->
+                val rows = JSONArray().put(btnRec("pon", 0.9)).put(btnRec("chi", 0.8))
+                    .put(btnRec("kan", 0.7)).put(btnRec("kita", 0.6)).put(btnRec("hora", 0.5))
+                val hints = TileBadgeOverlay.resolveButtonHints(
+                    rows, setOf("pon", "chi", "kan", "kita", "hora"))
+                check(hints.size == 4)
+            }
+            // System-overlay mode-switch and configuration-change replay: the floating
+            // window must recover the *full* result (with `analysis`) while the badge
+            // overlay and in-game layer only ever get the trimmed hint.
+            fun fullResult() = JSONObject("""
+                {"status":"live","canAct":true,"inputPending":false,"message":"可操作",
+                 "round":"E1","players":4,
+                 "hand":["1m","2m","3m"],"recommendations":[{"kind":"discard","tile":"1m"}],
+                 "legalOperations":[{"type":1}],
+                 "analysis":{"hand13":{"tiles":["1m","2m","3m"]}}}
+            """.trimIndent())
+            test("trimHint keeps hint fields and drops the floating-window-only analysis") { _, _ ->
+                val trimmed = AiOverlayService.trimHint(fullResult())
+                check(trimmed.has("status") && trimmed.has("canAct") && trimmed.has("inputPending"))
+                check(trimmed.has("hand") && trimmed.has("recommendations") && trimmed.has("legalOperations"))
+                check(!trimmed.has("analysis")) { "badge hint must not carry analysis" }
+                check(!trimmed.has("message") && !trimmed.has("round") && !trimmed.has("players")) {
+                    "badge hint must not carry floating-window chrome"
+                }
+            }
+            test("full result keeps analysis so the floating window can re-render it") { _, _ ->
+                // The floating window's re-render reads `analysis`, `round` and
+                // `players`; the replay cache stores the untouched result string, so
+                // those keys must survive a string round-trip.
+                val roundTrip = JSONObject(fullResult().toString())
+                check(roundTrip.has("analysis") && roundTrip.has("round") && roundTrip.has("players"))
+                check(roundTrip.getJSONObject("analysis").has("hand13"))
+            }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
             ApkUpdateChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS APK update identity, integrity, routing and cancellation checks\n") })
             CatalogChecks.run(targetContext, context)
             sendStatus(0, Bundle().apply { putString("stream", "PASS unlock catalog update, recovery and GitHub routes\n") })
+            DisplayModeChecks.run(targetContext)
+            sendStatus(0, Bundle().apply { putString("stream", "PASS assistant display-mode switch (overlay vs in-game Hook) and provider broadcast\n") })
             if (!controllerOnly) {
                 ModelContractChecks.run(targetContext, context)
                 sendStatus(0, Bundle().apply { putString("stream", "PASS ONNX/JNI contracts: four-player and sanma, bool/float masks and crossed-pair rejection\n") })

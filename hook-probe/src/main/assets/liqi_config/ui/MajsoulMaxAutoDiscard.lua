@@ -524,6 +524,132 @@ local function hashSignature(values)
     return string.format('%x', h)
 end
 
+-- Enumerates the action buttons currently shown in the two operation UIs and, for
+-- each, projects its on-screen centre through the same camera that reportHandCoords
+-- selected. Only the button *coordinates* travel: the consumer (the in-game badge
+-- overlay) pairs them with the AI recommendation by kind, so a button is located by
+-- the game's own transform rather than a guessed pixel. Every entry is bounded and
+-- carries a stable key so the overlay can drop it the moment the button disappears.
+--
+-- The two UIs never overlap in practice (UI_ChiPengHu covers the claim window,
+-- UI_LiqiZimo covers the player's own turn), but each button is reported with its
+-- owning UI so a button that exists on both can still be told apart.
+local function reportButtonCoords()
+    local d = DesktopMgr and DesktopMgr.Inst
+    local r = d and d.mainrole
+    local Screen = UnityEngine and UnityEngine.Screen
+    local screenW = Screen and Screen.width
+    local screenH = Screen and Screen.height
+    if not d or not d.gameing or not r or not screenW or not screenH or screenW <= 0 or screenH <= 0
+            or not A.json then return end
+
+    -- A button is reported only when its owning UI, its container, and the button's
+    -- own GameObject are all active and its transform has a position to project.
+    -- `active`/`seconds` are defined above; the button list below mirrors execute()'s
+    -- button(name, method) lookups so the labels can never point at a button the
+    -- autoplayer itself would not consider pressable.
+    local claim = UI_ChiPengHu and UI_ChiPengHu.Inst
+    local own = UI_LiqiZimo and UI_LiqiZimo.Inst
+    local screens = {}
+    local function collect(ui, buttons)
+        if not ui then return end
+        local container = ui.container_btns
+        local rootActive = active(ui) and container and active(container)
+        if not rootActive then return end
+        for _, spec in ipairs(buttons) do
+            local name, key = spec[1], spec[2]
+            local btn = container[name]
+            if btn and active(btn) and btn.transform and btn.transform.position then
+                screens[#screens + 1] = { key = key, pos = btn.transform.position }
+            end
+        end
+    end
+    collect(claim, {
+        {'btn_gang', 'kan'}, {'btn_cancel', 'pass'}, {'btn_hu', 'hora'},
+        {'btn_peng', 'pon'}, {'btn_chi', 'chi'},
+    })
+    collect(own, {
+        {'btn_lizhi', 'riichi'}, {'btn_zimo', 'hora'}, {'btn_babei', 'kita'},
+        {'btn_jiuzhongjiupai', 'abort'},
+    })
+
+    if #screens == 0 then
+        -- No buttons visible: report an empty set so a previously-shown button badge
+        -- is removed immediately instead of lingering over a vanished control.
+        if A.lastButtonSig ~= 'empty' then
+            A.lastButtonSig = 'empty'
+            -- cjson encodes an empty Lua table as {}, not []. Use an explicit
+            -- array so Android consumes the disappearance rather than retaining it.
+            ack('', 'button_coords', string.format('{"screenW":%d,"screenH":%d,"buttons":[]}', screenW, screenH))
+        end
+        return
+    end
+
+    -- Buttons live in the game's UI layer, not the hand row, so the hand's
+    -- lower-viewport camera heuristic (pickCamera) does not apply. Prefer the first
+    -- camera whose projection lands the buttons inside the viewport: the UI is
+    -- rendered by Camera.main or an equivalent orthographic UI camera, which is
+    -- simply the first enabled camera that projects every button in-view. No
+    -- lower-half assumption is made, because a button can sit anywhere on screen.
+    local positions = {}
+    for _, item in ipairs(screens) do positions[#positions + 1] = item.pos end
+    local cam, bestScore
+    for _, c in ipairs(enumerateCameras()) do
+        local r = projectThrough(c, positions, screenW, screenH)
+        -- A few UI buttons may be clipped/offscreen during animation. Select the
+        -- camera that sees the most controls instead of requiring every one in view.
+        if r.total > 0 and r.inView > 0 then
+            local score = r.inView * 1000 + r.meanNy * 10 - r.behind
+            if not bestScore or score > bestScore then cam, bestScore = c, score end
+        end
+    end
+
+    local buttons = {}
+    for _, item in ipairs(screens) do
+        local sp
+        if cam then
+            local ok, projected = pcall(cam.WorldToScreenPoint, cam, item.pos)
+            if ok and type(projected) == 'table' and (projected.z or 0) >= 0 then
+                sp = projected
+            end
+        end
+        if not sp then
+            -- Screen Space Overlay canvases already store UI transforms in screen
+            -- pixel coordinates; camera projection can fail or put them behind every
+            -- world camera. Use the raw position only when it is plausibly a pixel
+            -- location inside Unity's screen, never as an unbounded guessed anchor.
+            local p = item.pos
+            if p and type(p.x) == 'number' and type(p.y) == 'number'
+                    and p.x >= 0 and p.x <= screenW and p.y >= 0 and p.y <= screenH then
+                sp = { x = p.x, y = p.y, z = 1 }
+            end
+        end
+        if sp then
+            buttons[#buttons + 1] = {
+                key = item.key,
+                nx = math.floor((sp.x / screenW) * 10000 + 0.5) / 10000,
+                ny = math.floor(((screenH - sp.y) / screenH) * 10000 + 0.5) / 10000,
+            }
+        end
+    end
+
+    -- Include projected positions, not just button names: controls can animate or
+    -- move while the same set remains visible. Report whatever this camera can project;
+    -- a single clipped or unsupported control must not suppress the visible buttons.
+    local sigParts = { tostring(cam and cam.name or '') }
+    for _, item in ipairs(buttons) do
+        sigParts[#sigParts + 1] = item.key .. ':' .. tostring(item.nx) .. ':' .. tostring(item.ny)
+    end
+    table.sort(sigParts)
+    local sig = table.concat(sigParts, ',')
+    if #buttons > 0 and A.lastButtonSig ~= sig then
+        A.lastButtonSig = sig
+        ack('', 'button_coords', A.json.encode({
+            screenW = screenW, screenH = screenH, buttons = buttons,
+        }))
+    end
+end
+
 local function reportHandCoords()
     local d = DesktopMgr and DesktopMgr.Inst
     local r = d and d.mainrole
@@ -714,6 +840,7 @@ function __majmax_auto_tick()
     local ok = pcall(function()
         if not install() then return end
         pcall(reportHandCoords)
+        pcall(reportButtonCoords)
         if type(__majmax_auto_command) ~= 'function' then return end
         local text = __majmax_auto_command()
         if not text or text == '' then A.armed = false; A.continuation = nil; A.resyncDue = nil; return end

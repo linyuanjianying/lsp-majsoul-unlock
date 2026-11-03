@@ -65,6 +65,16 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
         if (state?.optString("status") == "live" && !state.optBoolean("modelFallback")) offer(state)
     }
 
+    /**
+     * The in-game switch. Idempotent because the capsule repeats the request while it
+     * polls for progress, and it never touches the service lifetime: closing the mode
+     * keeps the foreground service (and its notification) alive.
+     */
+    @Synchronized fun setEnabled(value: Boolean) {
+        if (enabled == value) return
+        if (value) toggle() else pause("已在游戏内关闭无人值守模式")
+    }
+
     @Synchronized fun observe(result: JSONObject) {
         latest = JSONObject(result.toString())
         if (!enabled) return

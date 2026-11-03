@@ -35,13 +35,55 @@ internal enum class FrameFailure(val reason: String) {
  * Pixel-perfect high-visibility solid color badge cards rendered directly above
  * each recommended hand tile, matching ZizhiAssistant / Akagi in-game HUD.
  */
-internal class TileBadgeOverlay(private val context: Context) {
+internal class TileBadgeOverlay(private val context: Context, private val host: android.view.ViewGroup? = null) {
     companion object {
         /** Viewport tolerance so edge-sitting tiles are not dropped by float drift. */
         private const val EPS = 0.005
 
         /** Discard kinds that get a badge card above their tile. */
         private val DISCARD_KINDS = setOf("discard", "riichi")
+
+        /**
+         * Action kinds that map onto an on-screen operation button (吃/杠/碰/跳过/
+         * 拔北/和/流局/立直). Each is paired with the button `key` the Lua side
+         * reports from the game's `container_btns`, so the badge is anchored to the
+         * button's real transform instead of a guessed pixel. Kinds absent here
+         * (`discard`, `ankan`, `kakan`) have no dedicated button: `discard` is the
+         * hand-tile badge above, and `ankan`/`kakan` share no single clickable
+         * control (they go through `OnClickDetail`), so they fall back to no badge.
+         */
+        private val BUTTON_KINDS = setOf(
+            "chi", "pon", "kan", "riichi", "hora", "abort", "kita", "pass"
+        )
+
+        /** Recommendation kind -> button key reported by the game's container_btns. */
+        private val KIND_TO_BUTTON_KEY = mapOf(
+            "chi" to "chi",
+            "pon" to "pon",
+            "kan" to "kan",
+            "riichi" to "riichi",
+            "hora" to "hora",
+            "abort" to "abort",
+            "kita" to "kita",
+            "pass" to "pass",
+        )
+
+        /** Short on-button label per action kind, matching the tile badge's compact style. */
+        private val KIND_DISPLAY_NAME = mapOf(
+            "chi" to "吃",
+            "pon" to "碰",
+            "kan" to "杠",
+            "riichi" to "立",
+            "hora" to "和",
+            "abort" to "流局",
+            "kita" to "拔北",
+            "pass" to "跳过",
+        )
+
+        private val BUTTON_NEUTRAL_NAME = mapOf(
+            "chi" to "吃", "pon" to "碰", "kan" to "杠", "riichi" to "立直",
+            "hora" to "和了", "abort" to "流局", "kita" to "拔北", "pass" to "跳过",
+        )
 
         /**
          * Honor letters (protocol hand / recommendation) to `1z..7z` (game view).
@@ -88,17 +130,9 @@ internal class TileBadgeOverlay(private val context: Context) {
         /** Small air gap between the badge's bottom edge and the tile's top edge. */
         private const val BADGE_GAP_DP = 1
 
-        /**
-         * Reference card geometry measured on the 2376x1080 screenshot: a resting
-         * hand tile is ~94-95 px wide and its visible face spans y 922..1074 (~152 px
-         * high), i.e. ~14.1 % of the frame height.
-         *
-         * A badge is drawn *one card per hint*, so it is sized like the card it points
-         * at instead of using a shrink-wrapped text card (~111x81 px on the reference
-         * frame). Both figures are frame-height normalized so the badge keeps the same
-         * visual proportion on other resolutions.
-         */
-        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.1407f
+        /** Compact two-line label above the tile, sized relative to the hand pitch. */
+        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.0500f
+        private const val BADGE_WIDTH_TO_TILE_PITCH = 0.70f
 
         /**
          * Card pitch fallbacks, as a fraction of the frame *width*, used only when the
@@ -117,17 +151,13 @@ internal class TileBadgeOverlay(private val context: Context) {
         private const val MIN_TILE_PITCH_OF_FRAME_WIDTH = 0.0300f
         private const val MAX_TILE_PITCH_OF_FRAME_WIDTH = 0.0550f
 
-        /** Clamps for the derived badge *height* (card-face height), as frame fractions. */
-        private const val BADGE_HEIGHT_MIN_OF_FRAME = 0.09f
-        private const val BADGE_HEIGHT_MAX_OF_FRAME = 0.20f
+        /** Height bounds for compact labels on unusual aspect ratios. */
+        private const val BADGE_HEIGHT_MIN_OF_FRAME = 0.035f
+        private const val BADGE_HEIGHT_MAX_OF_FRAME = 0.065f
 
-        /**
-         * Text sizes (sp, density-independent) for the fits-inside-the-card badge. The
-         * two lines share the card height via weights, so these only need to stay below
-         * half of a card face: ~14 sp / ~12 sp against the ~152 px card at 1080p.
-         */
-        private const val BADGE_ACTION_TEXT_SP = 13f
-        private const val BADGE_WEIGHT_TEXT_SP = 11.5f
+        /** Maximum text sizes; each label also fits its measured pixel box. */
+        private const val BADGE_ACTION_TEXT_SP = 10f
+        private const val BADGE_WEIGHT_TEXT_SP = 9f
 
         /**
          * Typographic hand-card aspect ratio for a tile (height / width ≈ 1.36).
@@ -199,6 +229,41 @@ internal class TileBadgeOverlay(private val context: Context) {
             HONOR_TO_Z[trimmed]?.let { return it }
             if (trimmed.matches(Regex("^0([mps])$"))) return "5" + trimmed[1] + "r"
             return trimmed
+        }
+
+        /**
+         * Pure, testable extraction of action-button recommendations. Given the raw
+         * `recommendations` rows and the set of button keys the game currently reports
+         * as visible, it returns the button hints in recommendation order, collapsing
+         * multiple combinations of the same kind to the first (highest-ranked) entry
+         * and dropping any kind whose button is not visible — so a vanished control
+         * never gets a label. It touches no overlay state, which is what lets the
+         * mapping and the visibility gating be exercised without a window.
+         */
+        internal fun resolveButtonHints(rows: JSONArray, visibleKeys: Set<String>): List<ButtonHint> {
+            val hints = ArrayList<ButtonHint>(4)
+            val seenKinds = HashSet<String>()
+            for (i in 0 until rows.length()) {
+                if (hints.size >= 4) break
+                val row = rows.optJSONObject(i) ?: continue
+                val kind = row.optString("kind")
+                if (kind !in BUTTON_KINDS || !seenKinds.add(kind)) continue
+                val key = KIND_TO_BUTTON_KEY[kind] ?: continue
+                // Only a button the game actually reports as visible can be labelled;
+                // otherwise the recommendation has no trustworthy anchor and is dropped.
+                if (key !in visibleKeys) continue
+                val rawWeight = row.optDouble("weight", Double.NaN).takeIf { it.isFinite() }
+                    ?: (row.optDouble("policyProbability", 0.0) * 100).takeIf { it.isFinite() } ?: 0.0
+                hints.add(
+                    ButtonHint(
+                        kind = kind,
+                        key = key,
+                        weight = rawWeight.coerceIn(0.0, 100.0),
+                        displayName = KIND_DISPLAY_NAME[kind] ?: kind,
+                    )
+                )
+            }
+            return hints
         }
 
         internal data class BadgePlacement(
@@ -327,31 +392,7 @@ internal class TileBadgeOverlay(private val context: Context) {
             return if (pitch > 0f) pitch to kept.size else null
         }
 
-        /**
-         * Full badge geometry for one render pass: *card sized*, not text sized.
-         *
-         * Width: the resting card pitch from the coordinate sample
-         * ([deriveTilePitchSourcePx]) when it is usable, otherwise the tile's own frame
-         * fraction. Both are clamped to a plausible card-pitch band so a distorted
-         * sample (sanma hand, zoomed camera, drawn tile) cannot produce a sliver or a
-         * banner.
-         *
-         * The pitch is a *normalized* nx difference, exactly like the mapping: the
-         * overlay already spans the viewport one-to-one, so it is converted with the
-         * frame width only. Multiplying by the source width as well (raw source px)
-         * would size the badge at the camera's logical resolution instead of the
-         * screen — the first attempt of this change produced 71 px badges instead of
-         * 95 px that way.
-         *
-         * Height: the visible card face ([TILE_FACE_HEIGHT_OF_FRAME] of the frame
-         * height), scaled with the frame; a sample-derived estimate is only used to
-         * sanity-band the result on unusual vertical resolutions. The badge keeps its
-         * bottom edge on the tile top ([computeBadgeTop]) and grows *upwards*, so this
-         * never changes the camera mapping or the tile pairing.
-         *
-         * Returns null only for a degenerate frame, in which case the caller keeps the
-         * shrink-wrapped measurement.
-         */
+        /** Derives a compact label from the measured tile pitch and frame height. */
         internal fun deriveBadgeSizePx(
             views: List<HookedTile>,
             mapping: HandCoordinateMapper.Mapping?,
@@ -373,10 +414,10 @@ internal class TileBadgeOverlay(private val context: Context) {
                 // only corrects a frame whose width drifted from the mapped viewport.
                 val viewportCorrection = mapping!!.viewportW.toFloat() / frameWidth
                 width = (derived.first * frameWidth * viewportCorrection.coerceIn(0.5f, 2f))
-                    .coerceIn(minPitch, maxPitch)
+                    .coerceIn(minPitch, maxPitch) * BADGE_WIDTH_TO_TILE_PITCH
                 source = if (derived.second >= 2) "pitch" else "mixed"
             } else {
-                width = TILE_PITCH_OF_FRAME_WIDTH * frameWidth
+                width = TILE_PITCH_OF_FRAME_WIDTH * frameWidth * BADGE_WIDTH_TO_TILE_PITCH
                 source = "fallback"
             }
 
@@ -581,6 +622,19 @@ internal class TileBadgeOverlay(private val context: Context) {
         val handIndex: Int
     )
 
+    internal data class HookedButton(
+        val key: String,
+        val normX: Double,
+        val normY: Double
+    )
+
+    internal data class ButtonHint(
+        val kind: String,
+        val key: String,
+        val weight: Double,
+        val displayName: String
+    )
+
     private val windows = context.getSystemService(WindowManager::class.java)
     private val display = context.resources.displayMetrics
 
@@ -593,6 +647,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     private var hand: List<String> = emptyList()
     private var result: JSONObject? = null
     private var hookedTiles: List<HookedTile> = emptyList()
+    private var hookedButtons: Map<String, HookedButton> = emptyMap()
 
     /** Unity source viewport (Screen.width/height) the coords were normalized against. */
     private var sourceW: Int = 0
@@ -609,6 +664,9 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     /** Hints of the newest render, replayed when a layout wait completes. */
     private var pendingHints: List<DiscardHint> = emptyList()
+
+    /** Button hints of the newest render, kept so a layout wait replays them too. */
+    private var pendingButtonHints: List<ButtonHint> = emptyList()
 
     /** Exactly one layout wait may be armed at a time; [cancelAwait] clears it. */
     private var pendingAwaitingLayout: Boolean = false
@@ -664,12 +722,35 @@ internal class TileBadgeOverlay(private val context: Context) {
     private fun renderHints() {
         val status = result?.optString("status")
         val recommendations = result?.optJSONArray("recommendations")
-        if ((status == "live" || status == "demo") && recommendations != null && recommendations.length() > 0) {
-            render(parseHints(recommendations))
-        } else {
-            render(emptyList())
-        }
+        val (tileHints, recommendedButtonHints) =
+            if ((status == "live" || status == "demo") && recommendations != null && recommendations.length() > 0) {
+                parseHints(recommendations) to parseButtonHints(recommendations)
+            } else {
+                emptyList<DiscardHint>() to emptyList<ButtonHint>()
+            }
+        val recommendedKeys = recommendedButtonHints.mapTo(HashSet()) { it.key }
+        val actionable = (status == "live" || status == "demo") &&
+            result?.optBoolean("canAct") == true && result?.optBoolean("inputPending") != true
+        val neutralButtons = hookedButtons.keys
+            .filter { actionable && it !in recommendedKeys }
+            .mapNotNull { key ->
+                val kind = KIND_TO_BUTTON_KEY.entries.firstOrNull { it.value == key }?.key ?: return@mapNotNull null
+                ButtonHint(kind, key, 0.0, BUTTON_NEUTRAL_NAME[kind] ?: kind)
+            }
+        render(tileHints, recommendedButtonHints + neutralButtons)
     }
+
+    /**
+     * Extracts the action-button recommendations (吃/杠/碰/跳过/拔北/和/流局/立直)
+     * that map onto an on-screen control. A button hint is only kept when its kind
+     * has a dedicated button key and that button is currently visible (present in
+     * [hookedButtons]), so a vanished control drops its badge immediately. Weight
+     * comes from the policy probability, exactly like the tile badge, and multiple
+     * candidate combinations are collapsed by kind: the first (highest-ranked) entry
+     * of each kind wins, since a single button corresponds to one recommendation row.
+     */
+    private fun parseButtonHints(rows: JSONArray): List<ButtonHint> =
+        resolveButtonHints(rows, hookedButtons.keys)
 
     fun updateHookedCoords(coords: JSONArray) {
         updateHookedCoords(coords, 0, 0)
@@ -751,6 +832,45 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     /**
+     * Stores the visible operation buttons' projected centers plus the Unity source
+     * viewport they were normalized against. Each entry is `{key, nx, ny}` where
+     * `key` is one of the [KIND_TO_BUTTON_KEY] values the Lua side reads from the
+     * game's `container_btns`. An empty array means no button is visible and clears
+     * every button badge immediately, so a vanished control never leaves a stale
+     * label over the wrong spot. Coordinates are never guessed: they arrive from the
+     * game's own transforms, projected through the same camera as the hand.
+     */
+    fun updateHookedButtons(buttons: JSONArray, sourceW: Int, sourceH: Int) {
+        if (sourceW > 0 && sourceH > 0) {
+            // Button coordinates share the hand's Unity render surface, so they reuse
+            // the same source viewport; only store when a real value arrives so a
+            // transient empty payload never wipes the established mapping.
+            this.sourceW = sourceW
+            this.sourceH = sourceH
+        }
+        val parsed = HashMap<String, HookedButton>(buttons.length())
+        for (i in 0 until buttons.length()) {
+            val obj = buttons.optJSONObject(i) ?: continue
+            val key = obj.optString("key")
+            val nx = obj.optDouble("nx", Double.NaN)
+            val ny = obj.optDouble("ny", Double.NaN)
+            if (key.isBlank() || !nx.isFinite() || !ny.isFinite()) continue
+            if (nx < -EPS || nx > 1.0 + EPS || ny < -EPS || ny > 1.0 + EPS) continue
+            parsed[key] = HookedButton(key, nx, ny)
+        }
+        if (parsed.isEmpty()) {
+            GeometryTrace.note("BUTTON_COORDS", "kept=0;cleared=${hookedButtons.isNotEmpty()}")
+        } else if (parsed != hookedButtons) {
+            GeometryTrace.note(
+                "BUTTON_COORDS",
+                "kept=${parsed.size};keys=${parsed.keys.sorted().joinToString(",")}"
+            )
+        }
+        hookedButtons = parsed
+        renderHints()
+    }
+
+    /**
      * Sorts a capture by normalized x, but first rejects a capture whose *raw* x
      * sequence is not strictly monotonic. When the game is at rest, `_handpai`
      * order matches left-to-right *or* right-to-left depending on the hand camera
@@ -781,6 +901,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     fun close() {
         result = null
         hookedTiles = emptyList()
+        hookedButtons = emptyMap()
         lastOrderSignature = ""
         GeometryTrace.reset()
         detach()
@@ -789,6 +910,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     fun configurationChanged() {
         // A rotation/resize invalidates every pixel anchor captured before it.
         hookedTiles = emptyList()
+        hookedButtons = emptyMap()
         lastOrderSignature = ""
         sourceW = 0
         sourceH = 0
@@ -909,11 +1031,11 @@ internal class TileBadgeOverlay(private val context: Context) {
         // a MATCH_PARENT + NO_LIMITS + IN_SCREEN overlay equal the full display, i.e.
         // the game's full-bleed viewport. Fall back to the frame itself extended by
         // its origin so a cutout inset is still accounted for on older APIs.
-        val bounds = runCatching { windows?.currentWindowMetrics?.bounds }.getOrNull()
-        val viewportLeft = bounds?.left ?: 0
-        val viewportTop = bounds?.top ?: 0
-        val viewportW = bounds?.width() ?: (frameOriginX + frame.width)
-        val viewportH = bounds?.height() ?: (frameOriginY + frame.height)
+        val bounds = if (host == null) runCatching { windows?.currentWindowMetrics?.bounds }.getOrNull() else null
+        val viewportLeft = if (host != null) frameOriginX else bounds?.left ?: 0
+        val viewportTop = if (host != null) frameOriginY else bounds?.top ?: 0
+        val viewportW = if (host != null) frame.width else bounds?.width() ?: (frameOriginX + frame.width)
+        val viewportH = if (host != null) frame.height else bounds?.height() ?: (frameOriginY + frame.height)
 
         return buildMapping(
             sourceW = sourceW,
@@ -943,18 +1065,24 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
     }
 
-    private fun render(hints: List<DiscardHint>) {
-        if (hints.isEmpty()) {
+    private fun render(hints: List<DiscardHint>) = render(hints, pendingButtonHints)
+
+    private fun render(hints: List<DiscardHint>, buttonHints: List<ButtonHint>) {
+        if (hints.isEmpty() && buttonHints.isEmpty()) {
             // No hints: cancel the pending placement attempt (if any) by bumping the
             // generation, then tear the window down. No layout listener survives.
             renderGeneration++
             pendingHints = emptyList()
+            pendingButtonHints = emptyList()
             detach()
             return
         }
         pendingHints = hints
-        val manager = windows ?: return
-        val frame = root ?: FrameLayout(context).apply {
+        pendingButtonHints = buttonHints
+        if (host == null && windows == null) return
+        val frame = root ?: object : FrameLayout(context) {
+            override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean = false
+        }.apply {
             isClickable = false
             isFocusable = false
         }.also { root = it }
@@ -979,15 +1107,17 @@ internal class TileBadgeOverlay(private val context: Context) {
         // always retries with the newest hints, so an attempt can no longer be
         // orphaned by its own render.
         if (root?.parent == null) {
-            runCatching { manager.addView(frame, layout) }
-        } else {
-            runCatching { manager.updateViewLayout(frame, layout) }
+            if (host != null) host.addView(frame, android.widget.FrameLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+            else runCatching { windows?.addView(frame, layout) }
+        } else if (host == null) {
+            runCatching { windows?.updateViewLayout(frame, layout) }
         }
 
         if (!isMeasured(frame)) {
             awaitLayout(frame)
         }
-        schedulePlacement(frame, hints)
+        schedulePlacement(frame, hints, buttonHints)
     }
 
     /**
@@ -995,7 +1125,7 @@ internal class TileBadgeOverlay(private val context: Context) {
      * from [render] and from a layout listener; it is a no-op for a superseded
      * generation, so a stale listener can never pin margins on a newer render.
      */
-    private fun schedulePlacement(frame: FrameLayout, hints: List<DiscardHint>) {
+    private fun schedulePlacement(frame: FrameLayout, hints: List<DiscardHint>, buttonHints: List<ButtonHint>) {
         val gen = renderGeneration
         if (root !== frame) return
 
@@ -1004,7 +1134,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         // that its own render could cancel, and no layout listener left behind.
         if (isMeasured(frame)) {
             cancelAwait()
-            if (placeBadges(frame, hints, gen)) return
+            if (placeBadges(frame, hints, buttonHints, gen)) return
         }
         // Nothing measured yet (first attach / rotation / window re-create) or the
         // mapping is transiently incomplete: make sure a layout wait is armed so the
@@ -1034,7 +1164,7 @@ internal class TileBadgeOverlay(private val context: Context) {
                 }
                 if (!isMeasured(frame)) return true
                 cancelAwait()
-                placeBadges(frame, pendingHints, gen)
+                placeBadges(frame, pendingHints, pendingButtonHints, gen)
                 return true
             }
         }
@@ -1042,7 +1172,7 @@ internal class TileBadgeOverlay(private val context: Context) {
             override fun onGlobalLayout() {
                 if (root !== frame || gen != renderGeneration || !isMeasured(frame)) return
                 cancelAwait()
-                placeBadges(frame, pendingHints, gen)
+                placeBadges(frame, pendingHints, pendingButtonHints, gen)
             }
         }
         val observer = frame.viewTreeObserver
@@ -1076,7 +1206,7 @@ internal class TileBadgeOverlay(private val context: Context) {
      * `metrics_invalid` (WindowManager bounds + fallback both unusable). The overlay
      * text panel stays up in all cases; nothing detaches here.
      */
-    private fun placeBadges(frame: FrameLayout, hints: List<DiscardHint>, gen: Long): Boolean {
+    private fun placeBadges(frame: FrameLayout, hints: List<DiscardHint>, buttonHints: List<ButtonHint>, gen: Long): Boolean {
         if (root !== frame || gen != renderGeneration) return true
         val result = measureMapping(frame)
         val mapping = result.mapping
@@ -1098,6 +1228,7 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
         val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
+        placeButtonBadges(frame, buttonHints, mapping, frameWidth, frameHeight)
 
         val placement = if (hookedTiles.isEmpty()) {
             BadgePlacement(emptyMap(), 0, 0, "")
@@ -1132,14 +1263,12 @@ internal class TileBadgeOverlay(private val context: Context) {
         // instead of a `post`-style second pass that a newer render could cancel.
         val widthSpec = View.MeasureSpec.makeMeasureSpec(frameWidth, View.MeasureSpec.AT_MOST)
         val heightSpec = View.MeasureSpec.makeMeasureSpec(frameHeight, View.MeasureSpec.AT_MOST)
-        // One card-sized badge per hint: the size is derived once for the render (the
-        // hand is one row of equal cards) and every badge is drawn at that size instead
-        // of shrinking to its text. Null only for a degenerate frame.
+        // One compact label per hint; null only for a degenerate frame.
         val badgeSize = deriveBadgeSizePx(hookedTiles, mapping, frameWidth, frameHeight)
         var textOverflow = 0
         for ((rank, hint) in hints.withIndex()) {
             val target = placement.placed[hint.handIndex] ?: continue
-            val badgeView = createBadgeCard(hint, rank)
+            val badgeView = createBadgeCard(hint, rank, badgeSize)
             if (badgeSize != null) {
                 val cardW = badgeSize.width
                 val cardH = badgeSize.height
@@ -1297,19 +1426,126 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     /**
-     * One hint badge, drawn as a **card-sized** box (see [deriveBadgeSizePx]) rather
-     * than a shrink-wrapped text bubble.
-     *
-     * The card box comes from the layout pass; this view only fits its two lines of
-     * text into it, so the badge can never grow past the card it hints:
-     *  - the two lines are weighted equally and the frame clips the overflow when the
-     *    derived card is short, so a long probability never spills out of the badge;
-     *  - text sizes scale with the card height (a 152 px card at 1080p gets ~14 sp),
-     *    so the hint stays legible on other resolutions;
-     *  - long tile names (`立·赤5筒`) are single-line truncated; the card is ~95 px
-     *    wide, so nothing wraps onto a second unexpected line.
+     * Places one compact label per action-button recommendation. Each button's
+     * reported center (`nx`, `ny`) is mapped to overlay-local pixels via the same
+     * [HandCoordinateMapper.Mapping] as the hand, so the label sits exactly above the
+     * button the game actually rendered — never a guessed position. The label is
+     * drawn by the non-touchable overlay frame, so it can never intercept the tap
+     * that the unattended controller (or the user) sends to the button underneath.
      */
-    private fun createBadgeCard(hint: DiscardHint, rank: Int) = LinearLayout(context).apply {
+    private fun placeButtonBadges(
+        frame: FrameLayout,
+        buttonHints: List<ButtonHint>,
+        mapping: HandCoordinateMapper.Mapping,
+        frameWidth: Int,
+        frameHeight: Int,
+    ) {
+        val gap = dp(BADGE_GAP_DP)
+        val edgeInset = pxFromReference(EDGE_INSET_REF, frameHeight)
+        // Buttons have no tile-pitch reference, so size the label from the frame
+        // height like the tile badge's fallback, keeping the same compact style.
+        val labelH = (TILE_FACE_HEIGHT_OF_FRAME * frameHeight).roundToInt()
+            .coerceIn(pxFromReference(MIN_BADGE_HEIGHT_REF, frameHeight), (BADGE_HEIGHT_MAX_OF_FRAME * frameHeight).roundToInt())
+        val density = context.resources.displayMetrics.scaledDensity
+
+        var placed = 0
+        for ((rank, hint) in buttonHints.withIndex()) {
+            val button = hookedButtons[hint.key] ?: continue
+            val local = HandCoordinateMapper.toLocalPx(button.normX, button.normY, mapping) ?: continue
+            val (centerX, centerY) = local
+
+            val actionText = hint.displayName
+            val weightText =
+                if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
+
+            val card = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                isClickable = false
+                isFocusable = false
+                clipChildren = true
+                clipToPadding = true
+                setPadding(dp(2), dp(1), dp(2), dp(1))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(4).toFloat()
+                    setColor(
+                        when {
+                            hint.weight <= 0.0 -> subtleColor
+                            rank == 0 -> primaryColor
+                            rank == 1 -> secondaryColor
+                            else -> subtleColor
+                        }
+                    )
+                    setStroke(dp(1), Color.argb(130, 255, 255, 255))
+                }
+            }
+            val heightLimit = (labelH / (2.45f * density)).coerceAtLeast(5f)
+            val actionSp = minOf(BADGE_ACTION_TEXT_SP, heightLimit).coerceAtLeast(5f)
+            val weightSp = minOf(BADGE_WEIGHT_TEXT_SP, heightLimit, actionSp).coerceAtLeast(5f)
+
+            card.addView(TextView(context).apply {
+                text = actionText
+                textSize = actionSp
+                setTextColor(Color.WHITE)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                includeFontPadding = false
+                gravity = Gravity.CENTER
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                )
+            })
+            card.addView(TextView(context).apply {
+                text = weightText
+                textSize = weightSp
+                setTextColor(Color.WHITE)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                includeFontPadding = false
+                gravity = Gravity.CENTER
+                isSingleLine = true
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                )
+            })
+
+            // Measure with a reasonable width bound so the label stays compact and
+            // never wider than a small multiple of the button it annotates.
+            card.measure(
+                View.MeasureSpec.makeMeasureSpec((frameWidth * 0.22f).roundToInt(), View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.makeMeasureSpec(labelH, View.MeasureSpec.EXACTLY),
+            )
+            val cardW = card.measuredWidth.coerceAtLeast(1)
+            val cardH = card.measuredHeight.coerceAtLeast(1)
+
+            // The label sits above the button's center, lifted by half the button's
+            // estimated height so its bottom edge clears the button face. Without the
+            // button's own height, use a frame-normalized lift so it never covers the
+            // control it annotates and never leaves the frame.
+            val lift = (frameHeight * 0.06f).roundToInt()
+            val desiredTop = (centerY - cardH - lift).coerceIn(0, (frameHeight - cardH).coerceAtLeast(0))
+            val desiredLeft = (centerX - cardW / 2)
+                .coerceIn(edgeInset, (frameWidth - cardW - edgeInset).coerceAtLeast(0))
+
+            val params = FrameLayout.LayoutParams(cardW, cardH)
+            params.leftMargin = desiredLeft
+            params.topMargin = desiredTop
+            frame.addView(card, params)
+            placed++
+        }
+        if (placed > 0) {
+            GeometryTrace.note(
+                "BUTTON_BADGE_PLACED",
+                "placed=$placed;hints=${buttonHints.size};frame=${frameWidth}x${frameHeight}"
+            )
+        }
+    }
+
+    /** A two-line badge fitted inside a short label above its tile. */
+    private fun createBadgeCard(hint: DiscardHint, rank: Int, size: BadgeSize?) = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER
         isClickable = false
@@ -1335,10 +1571,17 @@ internal class TileBadgeOverlay(private val context: Context) {
         val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
         val weightText =
             if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
+        val density = context.resources.displayMetrics.scaledDensity
+        val widthLimit = if (size == null) BADGE_ACTION_TEXT_SP else
+            (size.width - dp(4)).coerceAtLeast(1) / (actionText.length * 0.85f * density)
+        val heightLimit = if (size == null) BADGE_ACTION_TEXT_SP else
+            size.height / (2.45f * density)
+        val actionSp = minOf(BADGE_ACTION_TEXT_SP, widthLimit, heightLimit).coerceAtLeast(5f)
+        val weightSp = minOf(BADGE_WEIGHT_TEXT_SP, heightLimit, actionSp).coerceAtLeast(5f)
 
         addView(TextView(context).apply {
             text = actionText
-            textSize = BADGE_ACTION_TEXT_SP
+            textSize = actionSp
             setTextColor(Color.WHITE)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             includeFontPadding = false
@@ -1355,7 +1598,7 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         addView(TextView(context).apply {
             text = weightText
-            textSize = BADGE_WEIGHT_TEXT_SP
+            textSize = weightSp
             setTextColor(Color.WHITE)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             includeFontPadding = false
@@ -1403,6 +1646,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         // Remove the layout listeners *before* the view leaves the window, so no
         // observer callback can fire against a detached frame and nothing leaks.
         cancelAwait()
-        runCatching { windows?.removeView(frame) }
+        if (host != null) runCatching { (frame.parent as? android.view.ViewGroup)?.removeView(frame) }
+        else runCatching { windows?.removeView(frame) }
     }
 }

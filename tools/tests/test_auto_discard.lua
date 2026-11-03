@@ -623,5 +623,101 @@ test('camera selection is stable when the same camera renders every tile in view
     assert(geom.cam == 'GameHand Camera' and geom.concealed == #HAND)
 end)
 
+-- Button coordinates are reported from the game's own container_btns transforms and
+-- projected through the same camera as the hand; a button is never positioned by a
+-- guessed pixel. The fixture mirrors coordFixture but adds the two operation UIs.
+local function buttonCoordFixture()
+    __majmax_auto = nil
+    local screenW, screenH = 2376, 1080
+    local cam = { name = 'Main Camera', orthographic = false, enabled = true }
+    function cam:WorldToScreenPoint(p)
+        return { x = p.nx * screenW, y = (1 - p.ny) * screenH, z = p.z or 5 }
+    end
+    UnityEngine = {
+        Camera = { main = cam, allCameras = { cam } },
+        Screen = { width = screenW, height = screenH },
+        Time = { realtimeSinceStartup = 0 },
+    }
+    local acks = {}
+    cjson = { encode = function(v) acks[#acks + 1] = v; return 'ack' end,
+        decode = function() return {} end }
+    package.loaded.cjson = cjson
+    __majmax_auto_command = function() return '' end
+    __majmax_auto_ack = function() end
+    local function btn(nx, ny)
+        return { transform = { gameObject = { activeInHierarchy = true },
+            position = { nx = nx, ny = ny, z = 5 } } }
+    end
+    local function ui()
+        return { transform = { gameObject = { activeInHierarchy = true } },
+            container_btns = { transform = { gameObject = { activeInHierarchy = true } } } }
+    end
+    local claim = ui()
+    claim.container_btns.btn_gang = btn(0.60, 0.40)
+    claim.container_btns.btn_cancel = btn(0.70, 0.40)
+    UI_ChiPengHu = { Inst = claim }
+    local own = ui()
+    own.container_btns.btn_lizhi = btn(0.30, 0.45)
+    own.container_btns.btn_babei = btn(0.50, 0.45)
+    UI_LiqiZimo = { Inst = own }
+    local role = { _handpai = {}, _last_tile = nil }
+    DesktopMgr = { Inst = { gameing = true, current_step = 3, mainrole = role } }
+    MJNetMgr = { SendRequest = function() end, Inst = { IsOK = function() return true end } }
+    dofile(asset)
+    return acks, role, function() __majmax_auto_tick() end, claim, own, btn
+end
+
+test('button coordinates are reported from container_btns transforms', function()
+    local acks, role, tick = buttonCoordFixture()
+    role._handpai = { { pai = { ToString = function() return '1m' end, baida = false },
+        valid = true, is_open = false,
+        transform = { position = { nx = 0.20, ny = 0.80, z = 5 } } } }
+    tick()
+    local payload
+    for _, a in ipairs(acks) do
+        if a.state == 'button_coords' then
+            -- The mock encoder stores the raw table; the wrapped ack carries the
+            -- payload table directly (same shape as hand_coords).
+        end
+        if type(a.buttons) == 'table' and type(a.screenW) == 'number' and a.state == nil then
+            payload = a
+        end
+    end
+    assert(payload, 'expected a button_coords payload')
+    assert(payload.screenW == 2376 and payload.screenH == 1080)
+    -- Four visible buttons: kan/pass (claim) + riichi/kita (own).
+    assert(#payload.buttons == 4, 'expected four buttons, got ' .. tostring(#payload.buttons))
+    local keys = {}
+    for _, b in ipairs(payload.buttons) do keys[b.key] = true end
+    assert(keys.kan and keys.pass and keys.riichi and keys.kita, 'all four button keys must be present')
+    -- Coordinates are normalized and inside the viewport.
+    for _, b in ipairs(payload.buttons) do
+        assert(b.nx >= 0 and b.nx <= 1 and b.ny >= 0 and b.ny <= 1, 'button must be in-viewport')
+    end
+end)
+
+test('a vanished button reports an empty set so its label is removed', function()
+    local acks, role, tick, claim, own = buttonCoordFixture()
+    role._handpai = { { pai = { ToString = function() return '1m' end, baida = false },
+        valid = true, is_open = false,
+        transform = { position = { nx = 0.20, ny = 0.80, z = 5 } } } }
+    tick()
+    -- Hide every button: the next tick must emit an empty button_coords so a stale
+    -- label over a vanished control is dropped immediately.
+    claim.transform.gameObject.activeInHierarchy = false
+    own.transform.gameObject.activeInHierarchy = false
+    local n = #acks
+    tick()
+    local empty
+    for i = n + 1, #acks do
+        if acks[i].state == 'button_coords' then
+            assert(type(acks[i].reason) == 'string' and acks[i].reason:find('"buttons":%[%]'),
+                'disappearance must encode a JSON array [], never an empty object {}')
+            empty = true
+        end
+    end
+    assert(empty, 'expected an empty button_coords after the buttons disappear')
+end)
+
 print(string.format('%d automatic operation checks passed',count))
 

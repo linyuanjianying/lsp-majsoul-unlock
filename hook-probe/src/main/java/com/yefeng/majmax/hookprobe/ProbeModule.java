@@ -35,38 +35,19 @@ public final class ProbeModule extends XposedModule {
             "ui/MajsoulMaxSettings.lua", "ui/MajsoulMaxAutoDiscard.lua"
     };
 
-    /**
-     * Version stamp for the bundled Lua UI. It is derived from the shipped file
-     * lengths so that *any* edit to a versioned asset changes the stamp and forces a
-     * refresh of the cached copy under the game's files dir. A hand-maintained
-     * string was the actual root of the hand-hint regression: the wrapper
-     * `{screenW, screenH, coords}` payload shipped while this stamp stayed at
-     * `0.12.0-hint5`, so the installed (older, bare-array) script was never
-     * replaced and the overlay never received source dimensions.
-     */
-    private static final String ASSET_VERSION = assetVersion();
-
-    private static String assetVersion() {
-        StringBuilder stamp = new StringBuilder("0.12.0-hint6");
+    /** Read shipped bytes from the APK, not LSPosed's asset-blind class loader. */
+    private static String assetVersion(ZipFile apk) throws Exception {
+        StringBuilder hashes = new StringBuilder();
         for (String name : VERSIONED_ASSETS) {
-            stamp.append('-').append(name.substring(name.lastIndexOf('/') + 1)).append(':')
-                    .append(assetLength(name));
+            ZipEntry entry = apk.getEntry("assets/liqi_config/" + name);
+            if (entry == null) throw new IOException("Module asset is missing: " + name);
+            try (InputStream input = apk.getInputStream(entry)) {
+                hashes.append(UnlockCatalogData.sha256(
+                        UnlockCatalogData.readBounded(input, 1024 * 1024)));
+            }
         }
-        return stamp.toString();
-    }
-
-    private static long assetLength(String name) {
-        try (java.io.InputStream stream = ProbeModule.class.getClassLoader()
-                .getResourceAsStream("assets/" + name)) {
-            if (stream == null) return -1;
-            long total = 0;
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = stream.read(buffer)) > 0) total += read;
-            return total;
-        } catch (java.io.IOException error) {
-            return -1;
-        }
+        return "lua7-" + UnlockCatalogData.sha256(
+                hashes.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
     private static final String[] USER_ASSETS = {"settings.mod.json"};
@@ -81,6 +62,7 @@ public final class ProbeModule extends XposedModule {
     private static volatile int aiEndpointPort;
     private static volatile byte[] aiEndpointToken = new byte[0];
     private boolean targetProcess;
+    private static final AtomicBoolean TOP_CONTROL_REGISTERED = new AtomicBoolean();
 
     private static native int nativeConfigure(String configDir);
     private static native void nativeCaptureEndpoint(int port, byte[] token);
@@ -118,7 +100,14 @@ public final class ProbeModule extends XposedModule {
             Method onCreate = activity.getDeclaredMethod("onCreate", Bundle.class);
             hook(onCreate).intercept(chain -> {
                 Object receiver = chain.getThisObject();
-                if (receiver instanceof Context context) configure(context);
+                if (receiver instanceof Context context) {
+                    configure(context);
+                    if (context.getApplicationContext() instanceof android.app.Application app
+                            && TOP_CONTROL_REGISTERED.compareAndSet(false, true)) {
+                        new GameTopControl().register(app);
+                        HookDiagnostics.event("INFO", "hook.entry", "TOP_CONTROL_READY", new JSONObject());
+                    }
+                }
                 return chain.proceed();
             });
             HookDiagnostics.event("INFO", "hook.entry", "ACTIVITY_HOOK_INSTALLED", new JSONObject());
@@ -139,13 +128,15 @@ public final class ProbeModule extends XposedModule {
                 throw new IOException("Cannot create " + configDir);
             }
             UnlockCatalogData.Snapshot catalog = null;
+            String shippedAssetVersion;
             try (ZipFile moduleApk = new ZipFile(getModuleApplicationInfo().sourceDir)) {
+                shippedAssetVersion = assetVersion(moduleApk);
                 File stamp = new File(configDir, ".asset-version");
                 String installed = stamp.isFile()
                         ? readUtf8(stamp).trim() : "";
-                if (!ASSET_VERSION.equals(installed)) {
+                if (!shippedAssetVersion.equals(installed)) {
                     for (String name : VERSIONED_ASSETS) copyAsset(moduleApk, name, configDir, true);
-                    writeUtf8(stamp, ASSET_VERSION);
+                    writeUtf8(stamp, shippedAssetVersion);
                 }
                 for (String name : USER_ASSETS) copyAsset(moduleApk, name, configDir, false);
                 // A UI asset upgrade must never replace a newer downloaded unlock list.
@@ -159,8 +150,9 @@ public final class ProbeModule extends XposedModule {
             if (result != 0) throw new IOException("nativeConfigure returned " + result);
             if (catalog != null) reportCatalogApplied(gameContext, configDir, catalog);
             startAiEndpointDiscovery(gameContext.getApplicationContext());
+            followHostQuietly(gameContext.getApplicationContext());
             HookDiagnostics.event("INFO", "hook.entry", "CONFIGURED",
-                    HookDiagnostics.fields("assetVersion", ASSET_VERSION));
+                    HookDiagnostics.fields("assetVersion", shippedAssetVersion));
             log(Log.INFO, TAG, "Rust Modder configured at " + configDir);
         } catch (Throwable error) {
             CONFIGURED.set(false);
@@ -209,6 +201,28 @@ public final class ProbeModule extends XposedModule {
             report.putLong("version", catalog.version); report.putString("sha256", hash);
             context.getContentResolver().call(AI_ENDPOINT_URI, "catalogApplied", null, report);
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * Quiet host-follow hand-off. Fired exactly once, right after the game's own
+     * MainActivity is created, so the manager can bring its assistant service up in
+     * step with the host. This is intentionally fire-and-forget and silent: it never
+     * opens the manager UI and never blocks the game's main thread. The reply is only
+     * used for diagnostics, so a refused/blocked start (Android 12+ background FGS
+     * restriction, manager not installed, etc.) is logged and otherwise ignored.
+     */
+    private static void followHostQuietly(Context context) {
+        AI_ENDPOINT_EXECUTOR.execute(() -> {
+            try {
+                Bundle reply = context.getContentResolver().call(
+                        AI_ENDPOINT_URI, "assistFollowHost", null, null);
+                String state = reply == null ? "unreachable" : reply.getString("state", "");
+                HookDiagnostics.event("INFO", "hook.entry", "HOST_FOLLOW_ATTEMPTED",
+                        HookDiagnostics.fields("state", state == null ? "unreachable" : state));
+            } catch (Throwable ignored) {
+                // Manager missing, disabled, or revoked its URI grant: stay silent.
+            }
+        });
     }
 
     private static void startAiEndpointDiscovery(Context gameContext) {

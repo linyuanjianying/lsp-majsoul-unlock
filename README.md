@@ -2,7 +2,7 @@
 
 雀魂 Max Hook 是面向安卓版雀魂的 LSPosed 模块，仓库对应的应用包名为 `com.yefeng.majmax.hookprobe`。它在游戏进程中处理雀魂的 WebSocket 消息，提供游戏内 MOD 设置；同一个 APK 也包含独立的管理界面、本地牌局助手和可收纳的半透明悬浮窗。支持 LSPosed 加载及实验性的 LSPatch 嵌入打包，不需要安装代理证书。
 
-当前正式版本为 **0.12.0**，提供 **ARM64 版**和 **Universal 通用版**，新增应用内下载安装更新、日志清理，统一管理界面布局，并调整 PyTorch 模型导入兼容性与诊断日志。安装包和更新元数据发布在 [GitHub Releases](https://github.com/YeFeng233/lsp-majsoul-unlock/releases/latest)，详细说明见 [0.12.0 更新日志](release-notes/v0.12.0.md)。应用的正式更新检查以本仓库 Release 为准。
+当前正式版本为 **0.13.0**，提供 **ARM64 版**和 **Universal 通用版**。本次美化了界面，新增游戏内绘制与悬浮窗绘制两种模式，提示和控制开关可随模式切换，用户可自由选择。详细说明见 [0.13.0 更新日志](release-notes/v0.13.0.md)。
 
 | 版本 | 包含的 Android ABI | 适用环境 |
 | --- | --- | --- |
