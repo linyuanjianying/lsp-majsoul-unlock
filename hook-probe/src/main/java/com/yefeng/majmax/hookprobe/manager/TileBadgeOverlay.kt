@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewTreeObserver
@@ -86,6 +87,47 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         /** Small air gap between the badge's bottom edge and the tile's top edge. */
         private const val BADGE_GAP_DP = 1
+
+        /**
+         * Reference card geometry measured on the 2376x1080 screenshot: a resting
+         * hand tile is ~94-95 px wide and its visible face spans y 922..1074 (~152 px
+         * high), i.e. ~14.1 % of the frame height.
+         *
+         * A badge is drawn *one card per hint*, so it is sized like the card it points
+         * at instead of using a shrink-wrapped text card (~111x81 px on the reference
+         * frame). Both figures are frame-height normalized so the badge keeps the same
+         * visual proportion on other resolutions.
+         */
+        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.1407f
+
+        /**
+         * Card pitch fallbacks, as a fraction of the frame *width*, used only when the
+         * coordinate sample yields no trustworthy horizontal step (a single anchored
+         * hint). Derived from the live projection: adjacent standard tiles differ by
+         * nx ≈ 0.0399, i.e. ~95 px at 2376 px wide.
+         */
+        private const val TILE_PITCH_OF_FRAME_WIDTH = 0.0400f
+
+        /**
+         * The rightmost tile of the row is the freshly drawn one and sits ~30 px off
+         * the resting pitch (~1.3 card widths). Steps that large are snapped by
+         * [deriveBadgeSizePx]; small jitter is absorbed by these bounds instead.
+         */
+        private const val TILE_PITCH_TOLERANCE = 0.15
+        private const val MIN_TILE_PITCH_OF_FRAME_WIDTH = 0.0300f
+        private const val MAX_TILE_PITCH_OF_FRAME_WIDTH = 0.0550f
+
+        /** Clamps for the derived badge *height* (card-face height), as frame fractions. */
+        private const val BADGE_HEIGHT_MIN_OF_FRAME = 0.09f
+        private const val BADGE_HEIGHT_MAX_OF_FRAME = 0.20f
+
+        /**
+         * Text sizes (sp, density-independent) for the fits-inside-the-card badge. The
+         * two lines share the card height via weights, so these only need to stay below
+         * half of a card face: ~14 sp / ~12 sp against the ~152 px card at 1080p.
+         */
+        private const val BADGE_ACTION_TEXT_SP = 13f
+        private const val BADGE_WEIGHT_TEXT_SP = 11.5f
 
         /**
          * Typographic hand-card aspect ratio for a tile (height / width ≈ 1.36).
@@ -229,6 +271,129 @@ internal class TileBadgeOverlay(private val context: Context) {
             val maxH = CARD_HEIGHT_MAX_OF_FRAME.toDouble() * mapping.sourceH
             val clamped = raw.coerceIn(minH, maxH)
             return kotlin.math.round(clamped * scaleY).toInt()
+        }
+
+        /**
+         * The card-sized geometry of one badge card, in overlay-local pixels.
+         *
+         * [width] / [height] are the *card face* size the badge is drawn at, never a
+         * shrink-wrapped text box: the screenshot shows hand tiles ~95 px wide and
+         * ~152 px tall at 1080p, so a badge is one card wide and one card tall and sits
+         * directly above (never on) the tile it hints.
+         *
+         * [source] is a short, bounded tag (`pitch`, `fallback`, `mixed`) recorded in
+         * the device trace so a log can be checked without re-deriving the sample.
+         */
+        internal data class BadgeSize(val width: Int, val height: Int, val source: String)
+
+        /**
+         * Median of [values], or null for an empty input. Even counts average the two
+         * middle samples. Used to make one outlier (the drawn tile, a mis-projected
+         * neighbour) irrelevant instead of dragging a mean.
+         */
+        internal fun medianOf(values: List<Float>): Float? {
+            if (values.isEmpty()) return null
+            val sorted = values.sorted()
+            val mid = sorted.size / 2
+            return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2f
+        }
+
+        /**
+         * Derives the on-screen card width (tile pitch) in source pixels from the
+         * coordinate sample.
+         *
+         * Steps between *adjacent* tiles only: `views` arrives sorted by x, so a
+         * neighbouring step is one resting pitch. The rightmost tile is the drawn tile
+         * and loosens its neighbour by ~1.3 card widths; that step is ~30 px wider than
+         * the rest, so it is rejected before the median. The median itself then makes
+         * any remaining single outlier harmless.
+         *
+         * Returns null when no step can be trusted, so the caller can fall back to the
+         * resolution-normalized [TILE_PITCH_OF_FRAME_WIDTH].
+         */
+        internal fun deriveTilePitchSourcePx(views: List<HookedTile>): Pair<Float, Int>? {
+            if (views.size < 2) return null
+            val steps = ArrayList<Float>(views.size - 1)
+            for (i in 1 until views.size) {
+                val dx = (views[i].normX - views[i - 1].normX).toFloat()
+                if (dx > 0f && dx.isFinite()) steps.add(dx)
+            }
+            if (steps.isEmpty()) return null
+            val raw = medianOf(steps) ?: return null
+            val tolerance = raw * TILE_PITCH_TOLERANCE
+            val kept = steps.filter { kotlin.math.abs(it - raw) <= tolerance }
+            val pitch = medianOf(kept.ifEmpty { steps }) ?: return null
+            // Zero-pitch fallback only if the sample is so broken that nothing survived.
+            return if (pitch > 0f) pitch to kept.size else null
+        }
+
+        /**
+         * Full badge geometry for one render pass: *card sized*, not text sized.
+         *
+         * Width: the resting card pitch from the coordinate sample
+         * ([deriveTilePitchSourcePx]) when it is usable, otherwise the tile's own frame
+         * fraction. Both are clamped to a plausible card-pitch band so a distorted
+         * sample (sanma hand, zoomed camera, drawn tile) cannot produce a sliver or a
+         * banner.
+         *
+         * The pitch is a *normalized* nx difference, exactly like the mapping: the
+         * overlay already spans the viewport one-to-one, so it is converted with the
+         * frame width only. Multiplying by the source width as well (raw source px)
+         * would size the badge at the camera's logical resolution instead of the
+         * screen — the first attempt of this change produced 71 px badges instead of
+         * 95 px that way.
+         *
+         * Height: the visible card face ([TILE_FACE_HEIGHT_OF_FRAME] of the frame
+         * height), scaled with the frame; a sample-derived estimate is only used to
+         * sanity-band the result on unusual vertical resolutions. The badge keeps its
+         * bottom edge on the tile top ([computeBadgeTop]) and grows *upwards*, so this
+         * never changes the camera mapping or the tile pairing.
+         *
+         * Returns null only for a degenerate frame, in which case the caller keeps the
+         * shrink-wrapped measurement.
+         */
+        internal fun deriveBadgeSizePx(
+            views: List<HookedTile>,
+            mapping: HandCoordinateMapper.Mapping?,
+            frameWidth: Int,
+            frameHeight: Int,
+        ): BadgeSize? {
+            if (frameWidth <= 0 || frameHeight <= 0) return null
+            val minPitch = MIN_TILE_PITCH_OF_FRAME_WIDTH * frameWidth
+            val maxPitch = MAX_TILE_PITCH_OF_FRAME_WIDTH * frameWidth
+
+            val derived = deriveTilePitchSourcePx(views)
+            val usable = mapping != null && HandCoordinateMapper.isUsable(mapping)
+
+            val width: Float
+            val source: String
+            if (derived != null && usable) {
+                // `nx` is viewport-normalized: px = nx * viewport width. The overlay
+                // content frame normally *is* that viewport, so this factor is 1; it
+                // only corrects a frame whose width drifted from the mapped viewport.
+                val viewportCorrection = mapping!!.viewportW.toFloat() / frameWidth
+                width = (derived.first * frameWidth * viewportCorrection.coerceIn(0.5f, 2f))
+                    .coerceIn(minPitch, maxPitch)
+                source = if (derived.second >= 2) "pitch" else "mixed"
+            } else {
+                width = TILE_PITCH_OF_FRAME_WIDTH * frameWidth
+                source = "fallback"
+            }
+
+            // Height: the visible card face, anchored to the frame height the screenshot
+            // was taken at. On very short frames the face would eat the row above the
+            // hand, so it is limited by the height the coordinate sample can support
+            // (or, without a sample, by the same fraction band).
+            val minH = BADGE_HEIGHT_MIN_OF_FRAME * frameHeight
+            val maxH = BADGE_HEIGHT_MAX_OF_FRAME * frameHeight
+            val faceH = TILE_FACE_HEIGHT_OF_FRAME * frameHeight
+            val height = faceH.coerceIn(minH, maxH)
+
+            return BadgeSize(
+                width = kotlin.math.round(width).toInt().coerceAtLeast(1),
+                height = kotlin.math.round(height).toInt().coerceAtLeast(1),
+                source = source,
+            )
         }
 
         /**
@@ -967,19 +1132,54 @@ internal class TileBadgeOverlay(private val context: Context) {
         // instead of a `post`-style second pass that a newer render could cancel.
         val widthSpec = View.MeasureSpec.makeMeasureSpec(frameWidth, View.MeasureSpec.AT_MOST)
         val heightSpec = View.MeasureSpec.makeMeasureSpec(frameHeight, View.MeasureSpec.AT_MOST)
+        // One card-sized badge per hint: the size is derived once for the render (the
+        // hand is one row of equal cards) and every badge is drawn at that size instead
+        // of shrinking to its text. Null only for a degenerate frame.
+        val badgeSize = deriveBadgeSizePx(hookedTiles, mapping, frameWidth, frameHeight)
+        var textOverflow = 0
         for ((rank, hint) in hints.withIndex()) {
             val target = placement.placed[hint.handIndex] ?: continue
             val badgeView = createBadgeCard(hint, rank)
-            badgeView.measure(widthSpec, heightSpec)
+            if (badgeSize != null) {
+                val cardW = badgeSize.width
+                val cardH = badgeSize.height
+                // Text style is fitted to the card box; the view is measured against
+                // the card size so wrapping/clipping can be detected, then forced to
+                // exactly that size.
+                badgeView.minimumWidth = cardW
+                badgeView.minimumHeight = cardH
+                badgeView.measure(
+                    View.MeasureSpec.makeMeasureSpec(cardW, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(cardH, View.MeasureSpec.EXACTLY),
+                )
+                if (badgeView.measuredWidth > cardW || badgeView.measuredHeight > cardH) {
+                    textOverflow++
+                }
+            } else {
+                badgeView.measure(widthSpec, heightSpec)
+            }
             if (badgeView.measuredHeight <= 0) {
                 skippedHeight++
                 continue
             }
-            frame.addView(badgeView, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ))
+            val lp = if (badgeSize != null) {
+                FrameLayout.LayoutParams(badgeSize.width, badgeSize.height)
+            } else {
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                )
+            }
+            frame.addView(badgeView, lp)
             badgeTargets.add(Triple(badgeView, target, hint))
+        }
+
+        if (textOverflow > 0) {
+            GeometryTrace.note(
+                "BADGE_SIZE",
+                "reason=text_overflow;count=$textOverflow;cardW=${badgeSize?.width ?: 0};" +
+                    "cardH=${badgeSize?.height ?: 0}",
+            )
         }
 
         if (skippedHeight > 0) {
@@ -1070,7 +1270,8 @@ internal class TileBadgeOverlay(private val context: Context) {
                     "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
                     "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY};" +
                     "viewport=${mapping.viewportW}x${mapping.viewportH}" +
-                    "@${mapping.viewportLeft},${mapping.viewportTop}"
+                    "@${mapping.viewportLeft},${mapping.viewportTop};" +
+                    "badge=${badgeSize?.width ?: 0}x${badgeSize?.height ?: 0}(${badgeSize?.source ?: "text"})"
             )
             // Vertical calibration, so a device log can be checked against the
             // screenshot without re-deriving it: anchorY is the raw projected tile y,
@@ -1082,22 +1283,40 @@ internal class TileBadgeOverlay(private val context: Context) {
                 ?.first?.layoutParams as? FrameLayout.LayoutParams)?.topMargin ?: -1
             val sampleBadgeH = badgeTargets.firstOrNull { it.first.visibility == View.VISIBLE }
                 ?.first?.measuredHeight ?: 0
+            val sampleBadgeW = badgeTargets.firstOrNull { it.first.visibility == View.VISIBLE }
+                ?.first?.measuredWidth ?: 0
             GeometryTrace.note(
                 "BADGE_VERTICAL",
                 "anchor=${placement.anchorY() ?: -1};cardH=${cardHeight ?: 0};off=$usedOffset;" +
-                    "badgeH=$sampleBadgeH;gap=$gap;top=$sampleTop;" +
+                    "badgeH=$sampleBadgeH;badgeW=$sampleBadgeW;gap=$gap;top=$sampleTop;" +
+                    "size=${badgeSize?.source ?: "text"};" +
                     "skipped=$skippedHeight;frameH=$frameHeight"
             )
         }
         return true
     }
 
+    /**
+     * One hint badge, drawn as a **card-sized** box (see [deriveBadgeSizePx]) rather
+     * than a shrink-wrapped text bubble.
+     *
+     * The card box comes from the layout pass; this view only fits its two lines of
+     * text into it, so the badge can never grow past the card it hints:
+     *  - the two lines are weighted equally and the frame clips the overflow when the
+     *    derived card is short, so a long probability never spills out of the badge;
+     *  - text sizes scale with the card height (a 152 px card at 1080p gets ~14 sp),
+     *    so the hint stays legible on other resolutions;
+     *  - long tile names (`立·赤5筒`) are single-line truncated; the card is ~95 px
+     *    wide, so nothing wraps onto a second unexpected line.
+     */
     private fun createBadgeCard(hint: DiscardHint, rank: Int) = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER
         isClickable = false
         isFocusable = false
-        setPadding(dp(6), dp(1), dp(6), dp(1))
+        clipChildren = true
+        clipToPadding = true
+        setPadding(dp(2), dp(1), dp(2), dp(1))
 
         val bgColor = when (rank) {
             0 -> primaryColor   // Solid Orange/Amber for #1
@@ -1114,27 +1333,40 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         val isRiichi = hint.kind == "riichi"
         val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
+        val weightText =
+            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
 
         addView(TextView(context).apply {
             text = actionText
-            textSize = 10f
+            textSize = BADGE_ACTION_TEXT_SP
             setTextColor(Color.WHITE)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             includeFontPadding = false
             gravity = Gravity.CENTER
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+            maxLines = 1
             isClickable = false
             isFocusable = false
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
         })
 
         addView(TextView(context).apply {
-            text = if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
-            textSize = 9.5f
+            text = weightText
+            textSize = BADGE_WEIGHT_TEXT_SP
             setTextColor(Color.WHITE)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             includeFontPadding = false
             gravity = Gravity.CENTER
+            isSingleLine = true
+            maxLines = 1
             isClickable = false
             isFocusable = false
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
         })
     }
 

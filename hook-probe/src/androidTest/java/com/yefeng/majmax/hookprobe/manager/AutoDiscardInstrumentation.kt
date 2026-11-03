@@ -593,6 +593,111 @@ class AutoDiscardInstrumentation : Instrumentation() {
             // Device evidence: anchorY = 0.9228 * 1080 = 997 px, tile top ~922 px
             // (75 px anchor->tile-top), badge height 70..80 px. Data payload gave
             // tileTop 922 / badgeH 70 / top 852 / bottom 922.
+            // Card-sized badges: the hint box must match the card it points at — one
+            // card wide (resting pitch) and one card tall (visible face) — because the
+            // previous shrink-wrapped box (~111x81 px at 1080p) looked like a label,
+            // not like a tile.
+            test("deriveBadgeSizePx sizes a badge like one hand card at 1080p") { _, _ ->
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                // Live projection: adjacent standard tiles differ by nx ≈ 0.0399.
+                val views = listOf(
+                    view("1p", 0.2091, 0.9228), view("2p", 0.2489, 0.9228),
+                    view("3p", 0.2887, 0.9228), view("4p", 0.3285, 0.9228),
+                )
+                val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2256, 1080)
+                    ?: error("expected a derived card size")
+                // 0.0398 * 2376 = 94.6 px pitch (screenshot: 94-95 px).
+                check(size.width in 94..96) { "expected a 94-96 px card width, got ${size.width}" }
+                // Screenshot card face: y 922..1074 => ~152 px of the 1080 px frame.
+                check(size.height in 150..154) {
+                    "expected a ~152 px card height, got ${size.height}"
+                }
+                check(size.source == "pitch") { "expected pitch sizing, got ${size.source}" }
+            }
+            test("deriveBadgeSizePx ignores the widened drawn-tile step") { _, _ ->
+                val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
+                // Resting pitch 0.04; the rightmost (drawn) tile is 0.056 away — the
+                // ~30 px gap seen in the screenshot. That step must not widen the badge.
+                val views = listOf(
+                    view("1m", 0.10, 0.92), view("2m", 0.14, 0.92),
+                    view("3m", 0.18, 0.92), view("4m", 0.22, 0.92),
+                    view("9m", 0.276, 0.92),
+                )
+                val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2376, 1080)
+                    ?: error("expected a derived card size")
+                check(size.width in 94..96) {
+                    "drawn-tile step leaked into the width: ${size.width}"
+                }
+            }
+            test("deriveBadgeSizePx falls back to a card-width pitch without a sample") { _, _ ->
+                // One anchored hint: no neighbour, so no pitch can be measured. The
+                // badge still gets card proportions (4% of the frame width) instead of
+                // shrinking back to the text box.
+                val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
+                val single = listOf(view("1m", 0.5, 0.92))
+                val fallback = TileBadgeOverlay.deriveBadgeSizePx(single, m, 2376, 1080)
+                    ?: error("expected the normalized fallback")
+                check(fallback.source == "fallback") { "expected fallback, got ${fallback.source}" }
+                check(fallback.width in 94..96) { "expected ~95 px, got ${fallback.width}" }
+                check(fallback.height in 150..154) { "expected ~152 px, got ${fallback.height}" }
+                // No mapping at all (unmeasured frame): still card-sized, never text-sized.
+                val noMapping = TileBadgeOverlay.deriveBadgeSizePx(single, null, 2376, 1080)
+                    ?: error("expected a size even without a mapping")
+                check(noMapping.width in 94..96 && noMapping.height in 150..154)
+            }
+            test("deriveBadgeSizePx clamps a distorted or single-tile hand") { _, _ ->
+                val m = mapping(2000, 1000, viewportW = 2000, viewportH = 1000)
+                // Absurd pitch (0.3 of the width) cannot become a banner.
+                val wide = listOf(view("1m", 0.10, 0.9), view("2m", 0.40, 0.9))
+                val clamped = TileBadgeOverlay.deriveBadgeSizePx(wide, m, 2000, 1000)
+                    ?: error("expected a size")
+                check(clamped.width == (0.055 * 2000).toInt()) {
+                    "expected the max pitch clamp 110, got ${clamped.width}"
+                }
+                // A near-zero step cannot become a sliver either.
+                val tiny = listOf(view("1m", 0.10, 0.9), view("2m", 0.1005, 0.9))
+                val sliver = TileBadgeOverlay.deriveBadgeSizePx(tiny, m, 2000, 1000)!!
+                check(sliver.width == (0.03 * 2000).toInt()) {
+                    "expected the min pitch clamp 60, got ${sliver.width}"
+                }
+            }
+            test("deriveBadgeSizePx scales with the frame height") { _, _ ->
+                // 1440p: the card face keeps its fraction (0.1407 * 1440 = 202.6) and the
+                // width keeps the card pitch (0.04 * 3168 = 127).
+                val m = mapping(3168, 1440, viewportW = 3168, viewportH = 1440)
+                val views = listOf(
+                    view("1p", 0.20, 0.92), view("2p", 0.2399, 0.92),
+                    view("3p", 0.2798, 0.92),
+                )
+                val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 3168, 1440)
+                    ?: error("expected a size")
+                check(size.width in 125..130) { "expected ~127 px, got ${size.width}" }
+                check(size.height in 201..204) { "expected ~203 px, got ${size.height}" }
+                // Degenerate frame: no card size, the caller keeps the text measurement.
+                check(TileBadgeOverlay.deriveBadgeSizePx(views, m, 0, 0) == null)
+            }
+            test("a card-sized badge still sits flush above its tile") { _, _ ->
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                val views = listOf(
+                    view("1p", 0.2091, 0.9228), view("2p", 0.2489, 0.9228),
+                    view("8p", 0.2887, 0.9228),
+                )
+                val placement = TileBadgeOverlay.computeBadgePlacement(
+                    listOf(hint("discard", "2p", 1)), views, m
+                )
+                val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2256, 1080)!!
+                val anchorY = placement.placed[1]?.second ?: error("expected a placed anchor")
+                val offset = TileBadgeOverlay.tileTopOffsetPx(1080)
+                val vertical = TileBadgeOverlay.computeBadgeTop(
+                    anchorY, offset, size.height, 0, 1080
+                ) ?: error("expected a vertical placement")
+                // Bottom on the tile top, whole card above it: the badge never covers
+                // the tile it points at, and it does not shrink (152 px fits above 922).
+                check(vertical.top + vertical.height == anchorY - offset)
+                check(vertical.height == size.height)
+                check(vertical.top >= 0) { "card-sized badge left the frame: ${vertical.top}" }
+                check(vertical.top >= 700) { "badge grew into unrelated UI: ${vertical.top}" }
+            }
             test("computeBadgeTop puts the badge bottom on the tile top edge") { _, _ ->
                 val vertical = TileBadgeOverlay.computeBadgeTop(
                     anchorY = 997, tileTopOffsetPx = 75, badgeHeightPx = 70,
