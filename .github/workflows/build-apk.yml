@@ -174,19 +174,55 @@ jobs:
           arch: x86_64
           disable-animations: true
           script: |
+            set -o pipefail
             adb install -r hook-probe/build/outputs/apk/universal/debug/MajsoulHookProbe-universal-debug.apk
             adb install -r hook-probe/build/outputs/apk/androidTest/universal/debug/MajsoulHookProbe-universal-debug-androidTest.apk
             adb shell am instrument -w com.yefeng.majmax.hookprobe.test/com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation | tee instrumentation.log
             grep -q 'controller checks passed' instrumentation.log
 
+      # Bounded, redacted excerpt of the instrumented test output. Runs even when the
+      # emulator step fails so the failure reason reaches the job summary; the emulator
+      # step keeps its real non-zero status (no continue-on-error).
+      - name: Summarize Android test failure
+        if: failure()
+        shell: bash
+        run: |
+          SUMMARY="$GITHUB_STEP_SUMMARY"
+          if [ ! -s instrumentation.log ]; then
+            printf '### Android instrumented tests\n\nNo `instrumentation.log` was produced (device, install or instrumentation startup failure). Check the emulator step log.\n' >> "$SUMMARY"
+            exit 0
+          fi
+          PASSES="$(grep -a -c '^PASS ' instrumentation.log || true)"
+          FAILS="$(grep -a -c -E '(^|[[:space:]])FAIL' instrumentation.log || true)"
+          {
+            printf '### Android instrumented tests (bounded excerpt)\n\n'
+            printf '`PASS` lines: %s, `FAIL` lines: %s\n\n' "${PASSES:-0}" "${FAILS:-0}"
+            printf '```text\n'
+            # Only lines carrying PASS/FAIL/assertion signatures, truncated to 400 chars each,
+            # at most 40 lines. Arbitrary log content (tokens, env) is never echoed.
+            grep -a -E '(^|[[:space:]])(FAIL|FAILURES|AssertionError|AssertionFailedError|IllegalStateException|NullPointerException|ClassCastException|expected [^ ]|java\.lang\.)|^INSTRUMENTATION_|^OK \(' instrumentation.log \
+              | grep -a -v -E '(token|secret|password|api[_-]?key|Bearer|ghp_|github_pat_)' \
+              | cut -c1-400 | head -n 40 || true
+            printf '```\n'
+            if [ "$(wc -l < instrumentation.log)" -gt 0 ]; then
+              printf '\nLast 5 lines of the instrumented stream (truncated):\n\n```text\n'
+              tail -n 5 instrumentation.log | cut -c1-300
+              printf '```\n'
+            fi
+          } >> "$SUMMARY" 2>/dev/null || true
+
       - name: Upload APK artifacts
+        # Publish the debug APKs whenever packaging succeeded, including when only a later
+        # (non-release) step failed. Release tagging is handled by the publish steps below,
+        # so this never creates a release or ships an empty artifact.
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: MajsoulHookProbe-arm64-and-universal
+          name: MajsoulHookProbe-arm64-and-universal-${{ github.sha }}
           path: |
             hook-probe/build/outputs/apk/arm64/debug/*.apk
             hook-probe/build/outputs/apk/universal/debug/*.apk
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Prepare GitHub Release assets
