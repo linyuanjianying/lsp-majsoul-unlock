@@ -95,6 +95,73 @@ internal class TileBadgeOverlay(private val context: Context) {
             if (trimmed.matches(Regex("^0([mps])$"))) return "5" + trimmed[1] + "r"
             return trimmed
         }
+
+        internal data class BadgePlacement(
+            val placed: Map<Int, Pair<Int, Int>>,
+            val ambiguous: Int,
+            val missing: Int,
+            val pairingTrace: String,
+        )
+
+        internal fun computeBadgePlacement(
+            hints: List<DiscardHint>,
+            views: List<HookedTile>,
+            mapping: HandCoordinateMapper.Mapping,
+            frameHeight: Int,
+        ): BadgePlacement {
+            val placed = HashMap<Int, Pair<Int, Int>>(hints.size)
+            if (hints.isEmpty() || views.isEmpty()) {
+                return BadgePlacement(placed, 0, 0, "")
+            }
+            if (!HandCoordinateMapper.isUsable(mapping)) {
+                return BadgePlacement(placed, 0, 0, "")
+            }
+            val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
+
+            // Bounded hint→view pairing trace so a real device can answer "which hint
+            // went missing/ambiguous and why" without guessing. Only the tile keys and
+            // their view counts are recorded — ordinary gameplay state, not credentials.
+            val viewCounts = views.groupingBy { canonicalTile(it.tile) }.eachCount()
+            var ambiguous = 0
+            var missing = 0
+            val pairingTrace = StringBuilder()
+            // Consume each view at most once so two identical recommended tiles never
+            // share the same on-screen anchor. views is sorted by x, so the first
+            // unused match is the leftmost remaining instance of that tile type.
+            val usedViews = HashSet<Int>()
+
+            for (hint in hints) {
+                val key = canonicalTile(hint.tile)
+                val count = viewCounts[key] ?: 0
+                // Ambiguity is only relevant for the tile we actually want to point at.
+                if (count > 1) {
+                    ambiguous++
+                } else {
+                    var view: HookedTile? = null
+                    var idx = -1
+                    for ((i, v) in views.withIndex()) {
+                        if (i in usedViews) continue
+                        if (canonicalTile(v.tile) == key) { view = v; idx = i; break }
+                    }
+                    if (view == null) {
+                        missing++
+                    } else {
+                        usedViews.add(idx)
+                        val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
+                        if (local != null) {
+                            placed[hint.handIndex] = local.first to (local.second - lift).coerceAtLeast(0)
+                        } else {
+                            missing++
+                        }
+                    }
+                }
+                if (pairingTrace.length < 112) {
+                    if (pairingTrace.isNotEmpty()) pairingTrace.append(' ')
+                    pairingTrace.append(hint.tile).append('=').append(key).append(':').append(count)
+                }
+            }
+            return BadgePlacement(placed, ambiguous, missing, pairingTrace.toString())
+        }
     }
 
     internal data class FilteredCoords(
@@ -404,73 +471,6 @@ internal class TileBadgeOverlay(private val context: Context) {
      * drawn. The old calibrated-row fallback has been removed rather than kept as
      * a wrong-but-plausible default.
      */
-    internal data class BadgePlacement(
-        val placed: Map<Int, Pair<Int, Int>>,
-        val ambiguous: Int,
-        val missing: Int,
-        val pairingTrace: String,
-    )
-
-    internal fun computeBadgePlacement(
-        hints: List<DiscardHint>,
-        views: List<HookedTile>,
-        mapping: HandCoordinateMapper.Mapping,
-        frameHeight: Int,
-    ): BadgePlacement {
-        val placed = HashMap<Int, Pair<Int, Int>>(hints.size)
-        if (hints.isEmpty() || views.isEmpty()) {
-            return BadgePlacement(placed, 0, 0, "")
-        }
-        if (!HandCoordinateMapper.isUsable(mapping)) {
-            return BadgePlacement(placed, 0, 0, "")
-        }
-        val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
-
-        // Bounded hint→view pairing trace so a real device can answer "which hint
-        // went missing/ambiguous and why" without guessing. Only the tile keys and
-        // their view counts are recorded — ordinary gameplay state, not credentials.
-        val viewCounts = views.groupingBy { canonicalTile(it.tile) }.eachCount()
-        var ambiguous = 0
-        var missing = 0
-        val pairingTrace = StringBuilder()
-        // Consume each view at most once so two identical recommended tiles never
-        // share the same on-screen anchor. views is sorted by x, so the first
-        // unused match is the leftmost remaining instance of that tile type.
-        val usedViews = HashSet<Int>()
-
-        for (hint in hints) {
-            val key = canonicalTile(hint.tile)
-            val count = viewCounts[key] ?: 0
-            // Ambiguity is only relevant for the tile we actually want to point at.
-            if (count > 1) {
-                ambiguous++
-            } else {
-                var view: HookedTile? = null
-                var idx = -1
-                for ((i, v) in views.withIndex()) {
-                    if (i in usedViews) continue
-                    if (canonicalTile(v.tile) == key) { view = v; idx = i; break }
-                }
-                if (view == null) {
-                    missing++
-                } else {
-                    usedViews.add(idx)
-                    val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
-                    if (local != null) {
-                        placed[hint.handIndex] = local.first to (local.second - lift).coerceAtLeast(0)
-                    } else {
-                        missing++
-                    }
-                }
-            }
-            if (pairingTrace.length < 112) {
-                if (pairingTrace.isNotEmpty()) pairingTrace.append(' ')
-                pairingTrace.append(hint.tile).append('=').append(key).append(':').append(count)
-            }
-        }
-        return BadgePlacement(placed, ambiguous, missing, pairingTrace.toString())
-    }
-
     /**
      * Builds the [HandCoordinateMapper.Mapping] from measured geometry. The source
      * viewport comes from the payload; the game viewport is the overlay window's
