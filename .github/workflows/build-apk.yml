@@ -191,6 +191,16 @@ jobs:
             printf '### Android instrumented tests\n\nNo `instrumentation.log` was produced (device, install or instrumentation startup failure). Check the emulator step log.\n' >> "$SUMMARY"
             exit 0
           fi
+          python3 - <<'PYERROR'
+          import pathlib, re
+          lines = pathlib.Path('instrumentation.log').read_text(errors='replace').splitlines()
+          matches = [x[:350] for x in lines if re.search(r'Assertion|Exception|expected |FAIL|INSTRUMENTATION_FAILED', x)]
+          for line in matches[:8]:
+              if re.search(r'token|secret|password|Bearer|ghp_|github_pat_', line, re.I):
+                  continue
+              safe = line.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Android instrumentation::' + safe)
+          PYERROR
           PASSES="$(grep -a -c '^PASS ' instrumentation.log || true)"
           FAILS="$(grep -a -c -E '(^|[[:space:]])FAIL' instrumentation.log || true)"
           {

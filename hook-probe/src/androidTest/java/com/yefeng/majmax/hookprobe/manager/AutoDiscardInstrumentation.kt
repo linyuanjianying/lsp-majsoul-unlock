@@ -746,12 +746,12 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 check(TileBadgeOverlay.computeBadgeTop(500, 75, 70, 0, 0) == null)
             }
             test("estimateCardHeightPx uses the pitch when tiles share one row") { _, _ ->
-                // Device log row: five tiles on ~one ny, pitch 0.0398 * 2376 = 94.6 px.
+                // Synthetic flat row: five tiles on exactly one ny, pitch 0.0398 * 2376 = 94.6 px.
                 val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
                 val views = listOf(
-                    view("1p", 0.2091, 0.9228), view("2p", 0.2489, 0.9019),
-                    view("8p", 0.2887, 0.9042), view("1s", 0.3285, 0.9101),
-                    view("2s", 0.7406, 0.9150),
+                    view("1p", 0.2091, 0.92), view("2p", 0.2489, 0.92),
+                    view("8p", 0.2887, 0.92), view("1s", 0.3285, 0.92),
+                    view("2s", 0.7406, 0.92),
                 )
                 val h = TileBadgeOverlay.estimateCardHeightPx(views, m)
                 check(h != null && h in 60..90) { "expected ~70 px via pitch, got $h" }
