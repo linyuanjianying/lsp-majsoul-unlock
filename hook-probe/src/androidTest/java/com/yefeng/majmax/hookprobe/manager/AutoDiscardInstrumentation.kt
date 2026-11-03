@@ -480,6 +480,52 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val px = HandCoordinateMapper.toLocalPx(1.5, 0.5, m)!!
                 check(px.first == 3564) { "expected x=3564 (unclamped), got ${px.first}" }
             }
+            // computeBadgePlacement is the pure placement math that the overlay's
+            // asynchronous render path runs *after* the frame is laid out. The
+            // regression being pinned here: the mapping was previously measured
+            // against a zero-size (not-yet-attached) frame, producing `no_origin`
+            // and a detach before any badge could render. With the mapping now
+            // supplied externally (measured post-layout), a valid mapping must
+            // yield placed anchors even though the frame itself was 0x0 moments
+            // earlier — exactly the "initial frame=0 but post-layout mapper usable"
+            // case.
+            fun hint(kind: String, tile: String, idx: Int) =
+                TileBadgeOverlay.DiscardHint(kind, tile, 50.0, idx)
+            fun view(tile: String, nx: Double, ny: Double) =
+                TileBadgeOverlay.HookedTile(tile, nx, ny, false)
+            test("computeBadgePlacement places anchors from a post-layout mapping") { _, _ ->
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                val views = listOf(view("1m", 0.20, 0.90), view("2m", 0.28, 0.90), view("3m", 0.36, 0.90))
+                val hints = listOf(hint("discard", "2m", 1))
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m, 1080)
+                check(placement.placed.size == 1 && placement.ambiguous == 0 && placement.missing == 0)
+                check(placement.placed.containsKey(1)) { "expected handIndex 1 to be placed" }
+                // nx=0.28 -> 0.28*2376=665.28 -> -120 origin -> 545.28 -> 545.
+                check(placement.placed[1]!!.first == 545) {
+                    "expected x=545, got ${placement.placed[1]!!.first}"
+                }
+            }
+            test("computeBadgePlacement rejects an unusable mapping instead of guessing") { _, _ ->
+                // frameHeight is irrelevant when the mapping itself is unusable; the
+                // function must return empty rather than place a badge at a guess.
+                val views = listOf(view("1m", 0.20, 0.90))
+                val hints = listOf(hint("discard", "1m", 0))
+                val bad = mapping(0, 1080)
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, bad, 1080)
+                check(placement.placed.isEmpty() && placement.missing == 0)
+                // Empty views also yields empty (the no_coords case).
+                val valid = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
+                val emptyViews = TileBadgeOverlay.computeBadgePlacement(hints, emptyList(), valid, 1080)
+                check(emptyViews.placed.isEmpty())
+            }
+            test("computeBadgePlacement reports ambiguous duplicate tiles") { _, _ ->
+                val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
+                val views = listOf(view("5m", 0.20, 0.90), view("5m", 0.30, 0.90))
+                val hints = listOf(hint("discard", "5m", 0))
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m, 1080)
+                check(placement.ambiguous == 1 && placement.placed.isEmpty())
+                check(placement.pairingTrace.contains("5m=5m:2")) { "expected ambiguity trace" }
+            }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
             ApkUpdateChecks.run(targetContext)

@@ -604,22 +604,23 @@ local function reportHandCoords()
         ortho = cam ~= nil and cam.orthographic == true,
     }
     -- A bounded per-camera projection fingerprint so a real device can be diagnosed
-    -- when no candidate covers the hand. Only the selected camera and at most a
-    -- handful of rejected ones are listed, with name/ortho/bbox only. Fields are
-    -- separated by '|' and cameras by '+'; no ';' is used because the Kotlin side
-    -- splits the detail string on ';' into key=value tokens.
-    if cam == nil then
-        local camRows = {}
-        for _, c in ipairs(enumerateCameras()) do
-            if #camRows < 5 then
-                local rr = projectThrough(c, positions, screenW, screenH)
-                camRows[#camRows + 1] = string.format('%s|%s|%.2f,%.2f,%.2f,%.2f',
-                    tostring(c.name or '?'), c.orthographic and 'ortho' or 'persp',
-                    rr.minNx, rr.maxNx, rr.minNy, rr.maxNy)
-            end
+    -- when no candidate covers the hand, or to confirm the winning camera really is
+    -- the one that places the hand in the lower viewport. Emitted once per geometry
+    -- fingerprint (not per tick), with name/ortho/inView/total/bbox/meanNy for each
+    -- enabled camera. Fields are separated by '|' and cameras by '+'; no ';' is used
+    -- because the Kotlin side splits the detail string on ';' into key=value tokens.
+    local camRows = {}
+    for _, c in ipairs(enumerateCameras()) do
+        if #camRows < 6 then
+            local rr = projectThrough(c, positions, screenW, screenH)
+            camRows[#camRows + 1] = string.format('%s|%s|%d/%d|%.2f,%.2f,%.2f,%.2f|%.2f',
+                tostring(c.name or '?'), c.orthographic and 'ortho' or 'persp',
+                rr.inView, rr.total,
+                rr.minNx, rr.maxNx, rr.minNy, rr.maxNy,
+                rr.meanNy)
         end
-        diag.cams = table.concat(camRows, '+')
     end
+    diag.cams = table.concat(camRows, '+')
 
     if #coords > 0 then
         -- The signature must change whenever the hand's *contents* change, not just

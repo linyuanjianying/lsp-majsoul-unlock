@@ -110,7 +110,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         val isLast: Boolean
     )
 
-    private data class DiscardHint(
+    internal data class DiscardHint(
         val kind: String,
         val tile: String,
         val weight: Double,
@@ -136,6 +136,14 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     /** Changes whenever the rendered order snapshot would differ. */
     private var lastOrderSignature: String = ""
+
+    /**
+     * Bumped on every [render] so a deferred post-layout callback can detect that a
+     * newer render (or a detach) superseded it and bail instead of pinning margins
+     * to a dead view. A callback only runs when its captured generation still
+     * equals this value AND its frame is still the live root.
+     */
+    private var renderGeneration: Long = 0L
 
     private val layout = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
@@ -355,7 +363,7 @@ internal class TileBadgeOverlay(private val context: Context) {
             val normalizedTile = canonicalTile(tile)
 
             // A recommendation whose tile is absent from the protocol hand cannot be
-            // anchored to any on-screen tile: drop it before it reaches positionHints.
+            // anchored to any on-screen tile: drop it before it reaches placement.
             // The `hand` may be empty only transiently (result without a hand field);
             // in that case there is no index to pair against either, so skip the hint
             // rather than carrying a sentinel handIndex=-1 into placement.
@@ -378,61 +386,55 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     /**
-     * Maps each hinted hand index to an on-screen (x, y) anchor.
+     * Pure, testable placement math: pairs each hinted hand index against the
+     * on-screen tile views and maps their Unity-normalized coordinates through the
+     * supplied [mapping] to overlay-local pixel anchors. It never touches the
+     * overlay window, so it can be exercised with a mapping built from a zero-size
+     * frame as long as the *measured* mapping itself is valid — which is exactly the
+     * "initial frame reports 0 but the mapper is usable after layout" case that the
+     * overlay's asynchronous render path must handle.
      *
      * The protocol hand (AI `tehai`) and the game view list (`_handpai`, after the
      * Lua side drops melds and the wildcard) are two independent orderings. They
      * are known to carry the same multiset of tiles, but their relative order is
-     * not guaranteed.
-     *
-     * Only the *hinted* tile type needs to be unique. A duplicated tile that is
-     * not being recommended cannot move a badge, so it never suppresses one:
-     * with hand `1m 1m 9s`, a hint on `9s` still lands correctly.
-     *
+     * not guaranteed. Only the *hinted* tile type needs to be unique; a duplicated
+     * tile that is not being recommended cannot move a badge, so it never
+     * suppresses one (with hand `1m 1m 9s`, a hint on `9s` still lands correctly).
      * Without any hook coordinates there is no reliable anchor, so nothing is
-     * drawn. The old calibrated-row fallback silently depended on a guessed pitch
-     * measured on one device and put badges on the wrong tile everywhere else; it
-     * has been removed rather than kept as a wrong-but-plausible default.
+     * drawn. The old calibrated-row fallback has been removed rather than kept as
+     * a wrong-but-plausible default.
      */
-    private fun positionHints(hints: List<DiscardHint>, frame: FrameLayout): Map<Int, Pair<Int, Int>> {
+    internal data class BadgePlacement(
+        val placed: Map<Int, Pair<Int, Int>>,
+        val ambiguous: Int,
+        val missing: Int,
+        val pairingTrace: String,
+    )
+
+    internal fun computeBadgePlacement(
+        hints: List<DiscardHint>,
+        views: List<HookedTile>,
+        mapping: HandCoordinateMapper.Mapping,
+        frameHeight: Int,
+    ): BadgePlacement {
         val placed = HashMap<Int, Pair<Int, Int>>(hints.size)
-        if (hints.isEmpty()) return placed
-        if (hookedTiles.isEmpty()) {
-            GeometryTrace.note("BADGE_HIDDEN", "reason=no_coords;hints=${hints.size};hand=${hand.size}")
-            return placed
+        if (hints.isEmpty() || views.isEmpty()) {
+            return BadgePlacement(placed, 0, 0, "")
         }
-
-        // Establish the coordinate mapping from *measured* geometry: the Unity
-        // source viewport (from the payload), the game viewport's on-screen rect
-        // (the overlay window's full physical bounds), and the overlay content
-        // frame's on-screen origin. When any of these cannot be measured there is
-        // no trustworthy transform, so no badge is drawn rather than placing one at
-        // a guessed position.
-        val mapping = measureMapping(frame)
-        if (mapping == null || !HandCoordinateMapper.isUsable(mapping)) {
-            GeometryTrace.note(
-                "BADGE_HIDDEN",
-                "reason=no_origin;hints=${hints.size};views=${hookedTiles.size};" +
-                    "sourceW=$sourceW;sourceH=$sourceH;frame=${frame.width}x${frame.height}"
-            )
-            return placed
+        if (!HandCoordinateMapper.isUsable(mapping)) {
+            return BadgePlacement(placed, 0, 0, "")
         }
-
-        val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
-        val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
         val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
 
         // Bounded hint→view pairing trace so a real device can answer "which hint
         // went missing/ambiguous and why" without guessing. Only the tile keys and
         // their view counts are recorded — ordinary gameplay state, not credentials.
-        // Format uses only sanitizer-allowed separators (`=` and `:`), e.g.
-        // "9s=9s:0" (missing), "3p=3p:2" (ambiguous), "7s=7s:1" (unique match).
-        val viewCounts = hookedTiles.groupingBy { canonicalTile(it.tile) }.eachCount()
+        val viewCounts = views.groupingBy { canonicalTile(it.tile) }.eachCount()
         var ambiguous = 0
         var missing = 0
         val pairingTrace = StringBuilder()
         // Consume each view at most once so two identical recommended tiles never
-        // share the same on-screen anchor. hookedTiles is sorted by x, so the first
+        // share the same on-screen anchor. views is sorted by x, so the first
         // unused match is the leftmost remaining instance of that tile type.
         val usedViews = HashSet<Int>()
 
@@ -445,7 +447,7 @@ internal class TileBadgeOverlay(private val context: Context) {
             } else {
                 var view: HookedTile? = null
                 var idx = -1
-                for ((i, v) in hookedTiles.withIndex()) {
+                for ((i, v) in views.withIndex()) {
                     if (i in usedViews) continue
                     if (canonicalTile(v.tile) == key) { view = v; idx = i; break }
                 }
@@ -453,9 +455,6 @@ internal class TileBadgeOverlay(private val context: Context) {
                     missing++
                 } else {
                     usedViews.add(idx)
-                    // Map the Unity-normalized coordinate through the measured
-                    // source viewport -> display -> overlay-local transform. A null
-                    // result means the coordinate cannot be trusted for this shape.
                     val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
                     if (local != null) {
                         placed[hint.handIndex] = local.first to (local.second - lift).coerceAtLeast(0)
@@ -469,18 +468,7 @@ internal class TileBadgeOverlay(private val context: Context) {
                 pairingTrace.append(hint.tile).append('=').append(key).append(':').append(count)
             }
         }
-
-        if (ambiguous > 0 || missing > 0) {
-            GeometryTrace.note(
-                "BADGE_PARTIAL",
-                "ambiguous=$ambiguous;missing=$missing;placed=${placed.size};hand=${hand.size};" +
-                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight;" +
-                    "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
-                    "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY}" +
-                    if (pairingTrace.isNotEmpty()) ";pairs=${pairingTrace}" else ""
-            )
-        }
-        return placed
+        return BadgePlacement(placed, ambiguous, missing, pairingTrace.toString())
     }
 
     /**
@@ -536,6 +524,9 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     private fun render(hints: List<DiscardHint>) {
         if (hints.isEmpty()) {
+            // No hints: bump the generation so any in-flight post-layout callback
+            // from a previous render bails, then tear the window down.
+            renderGeneration++
             detach()
             return
         }
@@ -547,46 +538,90 @@ internal class TileBadgeOverlay(private val context: Context) {
 
         frame.removeAllViews()
 
-        val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
-        val placement = positionHints(hints, frame)
-
-        for ((rank, hint) in hints.withIndex()) {
-            val targetX = placement[hint.handIndex] ?: continue
-            val badgeView = createBadgeCard(hint, rank)
-            frame.addView(badgeView, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ))
-            badgeTargets.add(Triple(badgeView, targetX, hint))
-        }
-
-        if (badgeTargets.isEmpty()) {
-            // No trustworthy tile anchor: show the floating text panel only rather
-            // than drawing a badge over the wrong tile.
-            GeometryTrace.note("BADGE_HIDDEN", "reason=no_anchor;hints=${hints.size};views=${hookedTiles.size}")
-            detach()
-            return
-        }
-
+        // Attach (or re-lay-out) the overlay root to the window FIRST, so the frame
+        // gets a real measured size on the next layout pass. Previously the mapping
+        // was measured here, before the root was ever added to the window manager,
+        // so `frame.width/height` were 0 and `measureMapping` returned null —
+        // producing `BADGE_HIDDEN reason=no_origin` and an immediate detach before
+        // the deferred placement callback could ever run. The geometry is now read
+        // strictly after the root is attached and laid out.
         if (root?.parent == null) {
             runCatching { manager.addView(frame, layout) }
         } else {
             runCatching { manager.updateViewLayout(frame, layout) }
         }
 
-        // Defer only the pixel placement until the frame has a measured size.
+        // Bump the generation and capture it together with the live frame so the
+        // deferred callback can detect a superseding render or detach.
+        renderGeneration++
+        val gen = renderGeneration
+
+        // Defer the whole placement (measure mapping, pair hints, create badge
+        // views, measure them, set margins) until the frame has a measured size.
         // Guard against a stale callback racing a subsequent render: if this frame
-        // is no longer the live root, or a badge view has already been removed by a
-        // later removeAllViews(), skip it instead of pinning a dead view's margins
-        // (which previously left a badge stranded on the previous hand's tile).
-        val mapping = measureMapping(frame)
+        // is no longer the live root, or the generation moved on, skip it instead
+        // of pinning a dead view's margins (which previously left a badge stranded
+        // on the previous hand's tile).
         frame.post {
-            if (root !== frame) return@post
+            if (root !== frame || gen != renderGeneration) return@post
+
+            // Re-measure geometry now that the frame is laid out. When the mapping
+            // still cannot be established (e.g. source dims unknown, frame not yet
+            // measured), keep the text hint and record a bounded reason instead of
+            // drawing a badge at a guessed position. We do NOT detach here: the
+            // overlay text panel stays, and the next settled geometry/hand update
+            // re-renders and retries measurement.
+            val mapping = measureMapping(frame)
+            if (mapping == null || !HandCoordinateMapper.isUsable(mapping)) {
+                GeometryTrace.note(
+                    "BADGE_HIDDEN",
+                    "reason=no_origin;hints=${hints.size};views=${hookedTiles.size};" +
+                        "sourceW=$sourceW;sourceH=$sourceH;frame=${frame.width}x${frame.height}"
+                )
+                return@post
+            }
+
+            val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
+            val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
+
+            val placement = if (hookedTiles.isEmpty()) {
+                BadgePlacement(emptyMap(), 0, 0, "")
+            } else {
+                computeBadgePlacement(hints, hookedTiles, mapping, frameHeight)
+            }
+
+            if (placement.ambiguous > 0 || placement.missing > 0) {
+                GeometryTrace.note(
+                    "BADGE_PARTIAL",
+                    "ambiguous=${placement.ambiguous};missing=${placement.missing};" +
+                        "placed=${placement.placed.size};hand=${hand.size};" +
+                        "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight;" +
+                        "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
+                        "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY}" +
+                        if (placement.pairingTrace.isNotEmpty()) ";pairs=${placement.pairingTrace}" else ""
+                )
+            }
+
+            val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
+            for ((rank, hint) in hints.withIndex()) {
+                val targetX = placement.placed[hint.handIndex] ?: continue
+                val badgeView = createBadgeCard(hint, rank)
+                frame.addView(badgeView, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                ))
+                badgeTargets.add(Triple(badgeView, targetX, hint))
+            }
+
+            if (badgeTargets.isEmpty()) {
+                // No trustworthy tile anchor: show the floating text panel only rather
+                // than drawing a badge over the wrong tile.
+                GeometryTrace.note("BADGE_HIDDEN", "reason=no_anchor;hints=${hints.size};views=${hookedTiles.size}")
+                return@post
+            }
+
             // One bounded record per render with the *final* pixel target of every
             // badge plus the hand index and frame bounds it was computed against.
-            // This makes a misplaced badge attributable to a specific tile/handIndex
-            // and to the exact anchor coordinates, instead of leaving the wrong
-            // placement silent. Format uses only sanitizer-allowed separators.
             val placementTrace = StringBuilder()
             for ((badgeView, target, _) in badgeTargets) {
                 if (badgeView.parent !== frame) continue
@@ -620,10 +655,10 @@ internal class TileBadgeOverlay(private val context: Context) {
                     "BADGE_PLACED",
                     "placed=${badgeTargets.size};frame=${frame.width}x${frame.height};" +
                         "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace};" +
-                        "sourceW=${mapping?.sourceW ?: 0};sourceH=${mapping?.sourceH ?: 0};" +
-                        "frameOrigin=${mapping?.frameOriginX ?: 0},${mapping?.frameOriginY ?: 0};" +
-                        "viewport=${mapping?.viewportW ?: 0}x${mapping?.viewportH ?: 0}" +
-                        "@${mapping?.viewportLeft ?: 0},${mapping?.viewportTop ?: 0}"
+                        "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
+                        "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY};" +
+                        "viewport=${mapping.viewportW}x${mapping.viewportH}" +
+                        "@${mapping.viewportLeft},${mapping.viewportTop}"
                 )
             }
         }
@@ -693,6 +728,7 @@ internal class TileBadgeOverlay(private val context: Context) {
     private fun detach() {
         val frame = root ?: return
         root = null
+        renderGeneration++
         runCatching { windows?.removeView(frame) }
     }
 }
