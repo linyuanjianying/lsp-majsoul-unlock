@@ -439,11 +439,12 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     viewportW, viewportH, frameOriginX, frameOriginY)
             test("mapper scales by source width, not overlay width") { _, _ ->
                 // 2376-wide source, overlay content frame 2256 wide, cutout on the left
-                // (frame origin x=120). nx=0.568 must land at 0.568*2376 - 120 = 1349,
-                // matching the real-device global x for view 9s@0.568.
+                // (frame origin x=120). The global x for nx=0.568 is 0.568*2376 = 1349.568;
+                // toLocalPx subtracts the measured frame origin (120), so the overlay-local
+                // x is 1349.568 - 120 = 1229.568 -> 1230.
                 val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
                 val px = HandCoordinateMapper.toLocalPx(0.568, 0.5, m)!!
-                check(px.first == 1349) { "expected x=1349, got ${px.first}" }
+                check(px.first == 1230) { "expected x=1230, got ${px.first}" }
             }
             test("mapper subtracts frame origin so the whole row shifts correctly") { _, _ ->
                 val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
