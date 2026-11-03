@@ -174,10 +174,9 @@ jobs:
           arch: x86_64
           disable-animations: true
           script: |
-            set -o pipefail
             adb install -r hook-probe/build/outputs/apk/universal/debug/MajsoulHookProbe-universal-debug.apk
             adb install -r hook-probe/build/outputs/apk/androidTest/universal/debug/MajsoulHookProbe-universal-debug-androidTest.apk
-            adb shell am instrument -w com.yefeng.majmax.hookprobe.test/com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation | tee instrumentation.log
+            bash -o pipefail -c 'adb shell am instrument -w com.yefeng.majmax.hookprobe.test/com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation | tee instrumentation.log'
             grep -q 'controller checks passed' instrumentation.log
 
       # Bounded, redacted excerpt of the instrumented test output. Runs even when the
