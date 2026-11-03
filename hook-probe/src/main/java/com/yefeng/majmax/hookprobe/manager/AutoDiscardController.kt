@@ -145,6 +145,14 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                 val ack = rows.getJSONObject(index)
                 when (ack.optString("state")) {
                     "hand_coords" -> continue
+                    "ack_oversize" -> {
+                        // The native bridge refuses payloads beyond its transport limit.
+                        // Report it instead of ignoring it: a dropped capture otherwise
+                        // looks like "the hand hint silently stopped updating".
+                        log("ACK_OVERSIZE hint_payload_dropped")
+                        suspend("提示数据包过大被丢弃，等待下一手")
+                        continue
+                    }
                     "external" -> { if (enabled) suspend("游戏自动操作已完成，等待下一次同步"); continue }
                     "continued" -> { log("ROUND_CONTINUED"); continue }
                     "resync" -> { log("RESYNC_REQUESTED"); continue }

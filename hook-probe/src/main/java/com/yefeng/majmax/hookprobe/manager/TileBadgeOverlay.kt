@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -14,6 +15,19 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 import kotlin.math.roundToInt
+
+/**
+ * Why a badge could not be drawn. Each case is reported with its own reason token so
+ * the log distinguishes an unset source viewport from a frame that has not been laid
+ * out yet or from an origin that could not be read, instead of collapsing everything
+ * into the old catch-all `no_origin`.
+ */
+internal enum class FrameFailure(val reason: String) {
+    SOURCE_MISSING("source_missing"),
+    FRAME_UNMEASURED("frame_unmeasured"),
+    METRICS_INVALID("metrics_invalid"),
+    ORIGIN_MISSING("origin_missing"),
+}
 
 /**
  * Pixel-perfect high-visibility solid color badge cards rendered directly above
@@ -162,7 +176,66 @@ internal class TileBadgeOverlay(private val context: Context) {
             }
             return BadgePlacement(placed, ambiguous, missing, pairingTrace.toString())
         }
+
+        /**
+         * Builds the [HandCoordinateMapper.Mapping] from measured geometry. The source
+         * viewport comes from the payload; the game viewport is the overlay window's
+         * full physical bounds (full-bleed match to Unity's render surface); the frame
+         * origin is the overlay content's on-screen location.
+         *
+         * Pure and testable, and it never touches WindowManager: callers pass the
+         * already-read window bounds so the decision itself can be exercised with a
+         * not-yet-measured frame, a zero-size source, or missing window metrics.
+         */
+        internal fun buildMapping(
+            sourceW: Int,
+            sourceH: Int,
+            frameWidth: Int,
+            frameHeight: Int,
+            frameOriginX: Int,
+            frameOriginY: Int,
+            viewportLeft: Int,
+            viewportTop: Int,
+            viewportW: Int,
+            viewportH: Int,
+        ): MappingResult {
+            if (sourceW <= 0 || sourceH <= 0) {
+                return MappingResult(null, FrameFailure.SOURCE_MISSING, null)
+            }
+            // An unattached frame reports 0x0 (and is not laid out), which is normal on
+            // the first render pass and must be retried after layout — not treated as
+            // a fatal fault.
+            if (frameWidth <= 0 || frameHeight <= 0) {
+                return MappingResult(null, FrameFailure.FRAME_UNMEASURED, null)
+            }
+            // A zero-width viewport means WindowManager could not report bounds and the
+            // origin+size fallback was also empty; there is no trustworthy surface.
+            if (viewportW <= 0 || viewportH <= 0) {
+                return MappingResult(null, FrameFailure.METRICS_INVALID, null)
+            }
+            val mapping = HandCoordinateMapper.Mapping(
+                sourceW = sourceW,
+                sourceH = sourceH,
+                viewportLeft = viewportLeft,
+                viewportTop = viewportTop,
+                viewportW = viewportW,
+                viewportH = viewportH,
+                frameOriginX = frameOriginX,
+                frameOriginY = frameOriginY,
+            )
+            if (!HandCoordinateMapper.isUsable(mapping)) {
+                return MappingResult(null, FrameFailure.METRICS_INVALID, mapping)
+            }
+            return MappingResult(mapping, null, mapping)
+        }
     }
+
+    internal data class MappingResult(
+        val mapping: HandCoordinateMapper.Mapping?,
+        val failure: FrameFailure?,
+        /** Best-effort geometry even when unusable, so the trace shows the real numbers. */
+        val attempted: HandCoordinateMapper.Mapping?,
+    )
 
     internal data class FilteredCoords(
         val kept: List<HookedTile>,
@@ -205,12 +278,21 @@ internal class TileBadgeOverlay(private val context: Context) {
     private var lastOrderSignature: String = ""
 
     /**
-     * Bumped on every [render] so a deferred post-layout callback can detect that a
-     * newer render (or a detach) superseded it and bail instead of pinning margins
-     * to a dead view. A callback only runs when its captured generation still
-     * equals this value AND its frame is still the live root.
+     * Bumped on every [render] / [detach] so deferred work can detect that a newer
+     * render superseded it and bail instead of pinning margins to a dead view.
      */
     private var renderGeneration: Long = 0L
+
+    /** Hints of the newest render, replayed when a layout wait completes. */
+    private var pendingHints: List<DiscardHint> = emptyList()
+
+    /** Exactly one layout wait may be armed at a time; [cancelAwait] clears it. */
+    private var pendingAwaitingLayout: Boolean = false
+    private var preDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+    private var globalLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
+
+    /** Last reported shape of the incoming coordinate payload (wrapped vs legacy). */
+    private var lastSourceNote: String = ""
 
     private val layout = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
@@ -276,9 +358,26 @@ internal class TileBadgeOverlay(private val context: Context) {
      * established values so a transient geometry record does not wipe the mapping.
      */
     fun updateHookedCoords(coords: JSONArray, sourceW: Int, sourceH: Int) {
-        if (sourceW > 0 && sourceH > 0) {
+        // The wrapper payload `{screenW, screenH, coords}` carries the Unity source
+        // viewport. A legacy bare array (no wrapper) arrives with 0/0; keeping the
+        // previous values is only useful when they are real. Record the arrival once
+        // per change so a stale cached Lua asset (still sending the bare array, thus
+        // leaving the mapping without a source) is visible in the diagnostics rather
+        // than being misread as a Kotlin measurement fault.
+        val incoming = sourceW > 0 && sourceH > 0
+        if (incoming) {
             this.sourceW = sourceW
             this.sourceH = sourceH
+        }
+        val noteKey = "${incoming}:${if (incoming) "${sourceW}x${sourceH}" else "none"}"
+        if (noteKey != lastSourceNote) {
+            lastSourceNote = noteKey
+            GeometryTrace.note(
+                "HOOK_SOURCE",
+                "reason=${if (incoming) "wrapped" else "legacy_bare_array"};" +
+                    "sourceW=${if (incoming) sourceW else this.sourceW};" +
+                    "sourceH=${if (incoming) sourceH else this.sourceH};coords=${coords.length()}"
+            )
         }
         val filtered = filterCoords(coords)
         val list = filtered.kept
@@ -472,15 +571,11 @@ internal class TileBadgeOverlay(private val context: Context) {
      * a wrong-but-plausible default.
      */
     /**
-     * Builds the [HandCoordinateMapper.Mapping] from measured geometry. The source
-     * viewport comes from the payload; the game viewport is the overlay window's
-     * full physical bounds (full-bleed match to Unity's render surface); the frame
-     * origin is the overlay content's on-screen location. Returns null when the
-     * frame has not been laid out yet or its origin cannot be measured.
+     * Reads the frame's measured size and on-screen origin and delegates the
+     * decision to the pure [buildMapping]. Returns a structured failure instead of a
+     * bare null, so a hidden badge always carries its real cause.
      */
-    private fun measureMapping(frame: FrameLayout): HandCoordinateMapper.Mapping? {
-        if (sourceW <= 0 || sourceH <= 0) return null
-        if (frame.width <= 0 || frame.height <= 0) return null
+    private fun measureMapping(frame: FrameLayout): MappingResult {
         val loc = IntArray(2)
         frame.getLocationOnScreen(loc)
         val frameOriginX = loc[0]
@@ -490,21 +585,23 @@ internal class TileBadgeOverlay(private val context: Context) {
         // a MATCH_PARENT + NO_LIMITS + IN_SCREEN overlay equal the full display, i.e.
         // the game's full-bleed viewport. Fall back to the frame itself extended by
         // its origin so a cutout inset is still accounted for on older APIs.
-        val bounds = runCatching { windows.currentWindowMetrics.bounds }.getOrNull()
+        val bounds = runCatching { windows?.currentWindowMetrics?.bounds }.getOrNull()
         val viewportLeft = bounds?.left ?: 0
         val viewportTop = bounds?.top ?: 0
         val viewportW = bounds?.width() ?: (frameOriginX + frame.width)
         val viewportH = bounds?.height() ?: (frameOriginY + frame.height)
 
-        return HandCoordinateMapper.Mapping(
+        return buildMapping(
             sourceW = sourceW,
             sourceH = sourceH,
+            frameWidth = frame.width,
+            frameHeight = frame.height,
+            frameOriginX = frameOriginX,
+            frameOriginY = frameOriginY,
             viewportLeft = viewportLeft,
             viewportTop = viewportTop,
             viewportW = viewportW,
             viewportH = viewportH,
-            frameOriginX = frameOriginX,
-            frameOriginY = frameOriginY,
         )
     }
 
@@ -524,12 +621,14 @@ internal class TileBadgeOverlay(private val context: Context) {
 
     private fun render(hints: List<DiscardHint>) {
         if (hints.isEmpty()) {
-            // No hints: bump the generation so any in-flight post-layout callback
-            // from a previous render bails, then tear the window down.
+            // No hints: cancel the pending placement attempt (if any) by bumping the
+            // generation, then tear the window down. No layout listener survives.
             renderGeneration++
+            pendingHints = emptyList()
             detach()
             return
         }
+        pendingHints = hints
         val manager = windows ?: return
         val frame = root ?: FrameLayout(context).apply {
             isClickable = false
@@ -543,125 +642,222 @@ internal class TileBadgeOverlay(private val context: Context) {
         // was measured here, before the root was ever added to the window manager,
         // so `frame.width/height` were 0 and `measureMapping` returned null —
         // producing `BADGE_HIDDEN reason=no_origin` and an immediate detach before
-        // the deferred placement callback could ever run. The geometry is now read
-        // strictly after the root is attached and laid out.
+        // the deferred placement callback could ever run.
+        //
+        // The placement attempt below therefore has two entry points:
+        //  * immediately, when the frame already carries a real measured size that
+        //    predates this content change (every update after the first layout) —
+        //    this keeps badges responsive and never cancels itself, because nothing
+        //    remote to this attempt can bump the generation;
+        //  * otherwise once the frame is laid out (first attach, rotation, window
+        //    re-create), armed via attach-time listeners that run the *same* attempt.
+        // At most one layout wait is armed at a time (`pendingAwaitingLayout`), and it
+        // always retries with the newest hints, so an attempt can no longer be
+        // orphaned by its own render.
         if (root?.parent == null) {
             runCatching { manager.addView(frame, layout) }
         } else {
             runCatching { manager.updateViewLayout(frame, layout) }
         }
 
-        // Bump the generation and capture it together with the live frame so the
-        // deferred callback can detect a superseding render or detach.
-        renderGeneration++
+        if (!isMeasured(frame)) {
+            awaitLayout(frame)
+        }
+        schedulePlacement(frame, hints)
+    }
+
+    /**
+     * Runs (or re-arms) the placement attempt for the current generation. Callable
+     * from [render] and from a layout listener; it is a no-op for a superseded
+     * generation, so a stale listener can never pin margins on a newer render.
+     */
+    private fun schedulePlacement(frame: FrameLayout, hints: List<DiscardHint>) {
+        val gen = renderGeneration
+        if (root !== frame) return
+
+        // Retry synchronously when the frame already carries a usable measurement.
+        // This is the common steady-state path: no generation bump, no queued callback
+        // that its own render could cancel, and no layout listener left behind.
+        if (isMeasured(frame)) {
+            cancelAwait()
+            if (placeBadges(frame, hints, gen)) return
+        }
+        // Nothing measured yet (first attach / rotation / window re-create) or the
+        // mapping is transiently incomplete: make sure a layout wait is armed so the
+        // attempt is retried as soon as the window pass has laid the frame out.
+        if (!pendingAwaitingLayout) awaitLayout(frame)
+        else pendingHints = hints
+    }
+
+    private fun isMeasured(frame: FrameLayout) = frame.width > 0 && frame.height > 0
+
+    /**
+     * Arms a one-shot layout wait for [frame]. OnPreDraw runs after the window pass
+     * has measured/laid out the view but before it is drawn, so `width`/`height`
+     * are already final there; OnGlobalLayout covers a container that reports a
+     * later size change. Both are removed by [cancelAwait].
+     */
+    private fun awaitLayout(frame: FrameLayout) {
+        if (pendingAwaitingLayout) return
+        pendingAwaitingLayout = true
         val gen = renderGeneration
 
-        // Defer the whole placement (measure mapping, pair hints, create badge
-        // views, measure them, set margins) until the frame has a measured size.
-        // Guard against a stale callback racing a subsequent render: if this frame
-        // is no longer the live root, or the generation moved on, skip it instead
-        // of pinning a dead view's margins (which previously left a badge stranded
-        // on the previous hand's tile).
-        frame.post {
-            if (root !== frame || gen != renderGeneration) return@post
-
-            // Re-measure geometry now that the frame is laid out. When the mapping
-            // still cannot be established (e.g. source dims unknown, frame not yet
-            // measured), keep the text hint and record a bounded reason instead of
-            // drawing a badge at a guessed position. We do NOT detach here: the
-            // overlay text panel stays, and the next settled geometry/hand update
-            // re-renders and retries measurement.
-            val mapping = measureMapping(frame)
-            if (mapping == null || !HandCoordinateMapper.isUsable(mapping)) {
-                GeometryTrace.note(
-                    "BADGE_HIDDEN",
-                    "reason=no_origin;hints=${hints.size};views=${hookedTiles.size};" +
-                        "sourceW=$sourceW;sourceH=$sourceH;frame=${frame.width}x${frame.height}"
-                )
-                return@post
-            }
-
-            val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
-            val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
-
-            val placement = if (hookedTiles.isEmpty()) {
-                BadgePlacement(emptyMap(), 0, 0, "")
-            } else {
-                computeBadgePlacement(hints, hookedTiles, mapping, frameHeight)
-            }
-
-            if (placement.ambiguous > 0 || placement.missing > 0) {
-                GeometryTrace.note(
-                    "BADGE_PARTIAL",
-                    "ambiguous=${placement.ambiguous};missing=${placement.missing};" +
-                        "placed=${placement.placed.size};hand=${hand.size};" +
-                        "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight;" +
-                        "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
-                        "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY}" +
-                        if (placement.pairingTrace.isNotEmpty()) ";pairs=${placement.pairingTrace}" else ""
-                )
-            }
-
-            val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
-            for ((rank, hint) in hints.withIndex()) {
-                val targetX = placement.placed[hint.handIndex] ?: continue
-                val badgeView = createBadgeCard(hint, rank)
-                frame.addView(badgeView, FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT
-                ))
-                badgeTargets.add(Triple(badgeView, targetX, hint))
-            }
-
-            if (badgeTargets.isEmpty()) {
-                // No trustworthy tile anchor: show the floating text panel only rather
-                // than drawing a badge over the wrong tile.
-                GeometryTrace.note("BADGE_HIDDEN", "reason=no_anchor;hints=${hints.size};views=${hookedTiles.size}")
-                return@post
-            }
-
-            // One bounded record per render with the *final* pixel target of every
-            // badge plus the hand index and frame bounds it was computed against.
-            val placementTrace = StringBuilder()
-            for ((badgeView, target, _) in badgeTargets) {
-                if (badgeView.parent !== frame) continue
-                val (centerX, topY) = target
-                val badgeWidth = badgeView.width
-                val badgeHeight = badgeView.height
-                val desiredLeft = (centerX - badgeWidth / 2)
-                    .coerceIn(dp(2), (frame.width - badgeWidth - dp(2)).coerceAtLeast(0))
-                val desiredTop = topY.coerceIn(dp(2), (frame.height - badgeHeight - dp(2)).coerceAtLeast(0))
-
-                val lp = badgeView.layoutParams as FrameLayout.LayoutParams
-                if (lp.leftMargin != desiredLeft || lp.topMargin != desiredTop) {
-                    lp.leftMargin = desiredLeft
-                    lp.topMargin = desiredTop
-                    badgeView.layoutParams = lp
+        preDrawListener = object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (root !== frame || gen != renderGeneration) {
+                    cancelAwait()
+                    return true
                 }
-            }
-            for ((badgeView, _, hint) in badgeTargets) {
-                if (badgeView.parent !== frame) continue
-                val lp = badgeView.layoutParams as FrameLayout.LayoutParams
-                if (placementTrace.length < 200) {
-                    if (placementTrace.isNotEmpty()) placementTrace.append(' ')
-                    placementTrace.append(hint.tile)
-                        .append('@').append(lp.leftMargin + badgeView.width / 2)
-                        .append(',').append(lp.topMargin)
-                        .append(':').append(hint.handIndex)
-                }
-            }
-            if (placementTrace.isNotEmpty()) {
-                GeometryTrace.note(
-                    "BADGE_PLACED",
-                    "placed=${badgeTargets.size};frame=${frame.width}x${frame.height};" +
-                        "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace};" +
-                        "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
-                        "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY};" +
-                        "viewport=${mapping.viewportW}x${mapping.viewportH}" +
-                        "@${mapping.viewportLeft},${mapping.viewportTop}"
-                )
+                if (!isMeasured(frame)) return true
+                cancelAwait()
+                placeBadges(frame, pendingHints, gen)
+                return true
             }
         }
+        globalLayoutListener = object : ViewTreeObserver.OnGlobalLayoutListener {
+            override fun onGlobalLayout() {
+                if (root !== frame || gen != renderGeneration || !isMeasured(frame)) return
+                cancelAwait()
+                placeBadges(frame, pendingHints, gen)
+            }
+        }
+        val observer = frame.viewTreeObserver
+        observer.addOnPreDrawListener(preDrawListener)
+        observer.addOnGlobalLayoutListener(globalLayoutListener)
+    }
+
+    /** Removes both layout listeners exactly once and clears the pending flag. */
+    private fun cancelAwait() {
+        val observer = root?.viewTreeObserver?.takeIf { it.isAlive }
+        preDrawListener?.let { l ->
+            if (observer != null) runCatching { observer.removeOnPreDrawListener(l) }
+        }
+        globalLayoutListener?.let { l ->
+            if (observer != null) {
+                @Suppress("DEPRECATION")
+                runCatching { observer.removeOnGlobalLayoutListener(l) }
+            }
+        }
+        preDrawListener = null
+        globalLayoutListener = null
+        pendingAwaitingLayout = false
+    }
+
+    /**
+     * The single placement attempt. Returns true when it drew badges, false when the
+     * geometry is still unavailable (the caller then keeps waiting for layout).
+     *
+     * Every failure is reported with its own reason and the actual numbers:
+     * `source_missing` (dims never arrived from Lua), `frame_unmeasured` (0x0 frame),
+     * `metrics_invalid` (WindowManager bounds + fallback both unusable). The overlay
+     * text panel stays up in all cases; nothing detaches here.
+     */
+    private fun placeBadges(frame: FrameLayout, hints: List<DiscardHint>, gen: Long): Boolean {
+        if (root !== frame || gen != renderGeneration) return true
+        val result = measureMapping(frame)
+        val mapping = result.mapping
+        if (mapping == null) {
+            val attempted = result.attempted
+            GeometryTrace.note(
+                "BADGE_HIDDEN",
+                "reason=${result.failure?.reason ?: "unmapped"};hints=${hints.size};" +
+                    "views=${hookedTiles.size};sourceW=$sourceW;sourceH=$sourceH;" +
+                    "frame=${frame.width}x${frame.height};" +
+                    "frameOrigin=${attempted?.frameOriginX ?: -1},${attempted?.frameOriginY ?: -1};" +
+                    "viewport=${attempted?.viewportW ?: 0}x${attempted?.viewportH ?: 0}" +
+                    "@${attempted?.viewportLeft ?: 0},${attempted?.viewportTop ?: 0}"
+            )
+            // Still unmeasured: keep waiting for the layout pass. Anything else is a
+            // genuine mapping fault that a layout pass cannot fix.
+            return result.failure != FrameFailure.FRAME_UNMEASURED
+        }
+
+        val frameWidth = frame.width.takeIf { it > 0 } ?: display.widthPixels
+        val frameHeight = frame.height.takeIf { it > 0 } ?: display.heightPixels
+
+        val placement = if (hookedTiles.isEmpty()) {
+            BadgePlacement(emptyMap(), 0, 0, "")
+        } else {
+            computeBadgePlacement(hints, hookedTiles, mapping, frameHeight)
+        }
+
+        if (placement.ambiguous > 0 || placement.missing > 0) {
+            GeometryTrace.note(
+                "BADGE_PARTIAL",
+                "ambiguous=${placement.ambiguous};missing=${placement.missing};" +
+                    "placed=${placement.placed.size};hand=${hand.size};" +
+                    "views=${hookedTiles.size};overlayW=$frameWidth;overlayH=$frameHeight;" +
+                    "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
+                    "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY}" +
+                    if (placement.pairingTrace.isNotEmpty()) ";pairs=${placement.pairingTrace}" else ""
+            )
+        }
+
+        val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
+        for ((rank, hint) in hints.withIndex()) {
+            val targetX = placement.placed[hint.handIndex] ?: continue
+            val badgeView = createBadgeCard(hint, rank)
+            frame.addView(badgeView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ))
+            badgeTargets.add(Triple(badgeView, targetX, hint))
+        }
+
+        if (badgeTargets.isEmpty()) {
+            // No trustworthy tile anchor: show the floating text panel only rather
+            // than drawing a badge over the wrong tile.
+            GeometryTrace.note(
+                "BADGE_HIDDEN",
+                "reason=no_anchor;hints=${hints.size};views=${hookedTiles.size}" +
+                    ";placed=${placement.placed.size};ambiguous=${placement.ambiguous};" +
+                    "missing=${placement.missing};sourceW=${mapping.sourceW};sourceH=${mapping.sourceH}"
+            )
+            return true
+        }
+
+        // One bounded record per render with the *final* pixel target of every
+        // badge plus the hand index and frame bounds it was computed against.
+        val placementTrace = StringBuilder()
+        for ((badgeView, target, _) in badgeTargets) {
+            if (badgeView.parent !== frame) continue
+            val (centerX, topY) = target
+            val badgeWidth = badgeView.width
+            val badgeHeight = badgeView.height
+            val desiredLeft = (centerX - badgeWidth / 2)
+                .coerceIn(dp(2), (frame.width - badgeWidth - dp(2)).coerceAtLeast(0))
+            val desiredTop = topY.coerceIn(dp(2), (frame.height - badgeHeight - dp(2)).coerceAtLeast(0))
+
+            val lp = badgeView.layoutParams as FrameLayout.LayoutParams
+            if (lp.leftMargin != desiredLeft || lp.topMargin != desiredTop) {
+                lp.leftMargin = desiredLeft
+                lp.topMargin = desiredTop
+                badgeView.layoutParams = lp
+            }
+        }
+        for ((badgeView, _, hint) in badgeTargets) {
+            if (badgeView.parent !== frame) continue
+            val lp = badgeView.layoutParams as FrameLayout.LayoutParams
+            if (placementTrace.length < 200) {
+                if (placementTrace.isNotEmpty()) placementTrace.append(' ')
+                placementTrace.append(hint.tile)
+                    .append('@').append(lp.leftMargin + badgeView.width / 2)
+                    .append(',').append(lp.topMargin)
+                    .append(':').append(hint.handIndex)
+            }
+        }
+        if (placementTrace.isNotEmpty()) {
+            GeometryTrace.note(
+                "BADGE_PLACED",
+                "placed=${badgeTargets.size};frame=${frame.width}x${frame.height};" +
+                    "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace};" +
+                    "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
+                    "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY};" +
+                    "viewport=${mapping.viewportW}x${mapping.viewportH}" +
+                    "@${mapping.viewportLeft},${mapping.viewportTop}"
+            )
+        }
+        return true
     }
 
     private fun createBadgeCard(hint: DiscardHint, rank: Int) = LinearLayout(context).apply {
@@ -726,9 +922,16 @@ internal class TileBadgeOverlay(private val context: Context) {
     private fun dp(value: Int) = (value * display.density).roundToInt()
 
     private fun detach() {
-        val frame = root ?: return
+        val frame = root ?: run {
+            cancelAwait()
+            return
+        }
         root = null
         renderGeneration++
+        pendingHints = emptyList()
+        // Remove the layout listeners *before* the view leaves the window, so no
+        // observer callback can fire against a detached frame and nothing leaks.
+        cancelAwait()
         runCatching { windows?.removeView(frame) }
     }
 }

@@ -28,7 +28,7 @@ internal object GeometryTrace {
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho",
         "behind", "minNx", "maxNx", "minNy", "maxNy", "sample",
         "tiles", "order", "reds", "views_n", "cam", "cams", "pairs", "frame", "targets",
-        "sourceW", "sourceH", "frameOrigin", "viewport",
+        "sourceW", "sourceH", "frameOrigin", "viewport", "assetVersion",
     )
 
     private val counts = HashMap<String, Int>()

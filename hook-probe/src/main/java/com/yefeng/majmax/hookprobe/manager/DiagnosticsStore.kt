@@ -54,7 +54,17 @@ internal object DiagnosticsStore {
         "kept", "rejected", "ambiguous", "missing", "placed", "hand", "views", "hints",
         "screenW", "screenH", "overlayW", "overlayH", "open", "baida", "invalid", "ortho", "tiles",
         "order", "reds", "behind", "minNx", "maxNx", "minNy", "maxNy", "sample", "views_n",
-        "cam", "cams", "pairs", "frame", "targets")
+        "cam", "cams", "pairs", "frame", "targets",
+        // Badge mapping trace (GeometryTrace.structuredKeys emits these). They were
+        // missing here, so every BADGE_HIDDEN / BADGE_PLACED record silently lost
+        // the source viewport, frame origin and viewport — the exact values needed
+        // to tell "source dims never arrived" from "frame not measured yet".
+        "sourceW", "sourceH", "frameOrigin", "viewport",
+        // Build identity of the installed Lua UI asset, so a stale cached script
+        // (which kept sending the legacy bare hand_coords array, without the
+        // {screenW, screenH, coords} wrapper) is visible in the log instead of
+        // looking like a Kotlin parsing fault.
+        "assetVersion")
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
     private fun logFile(context: Context, kind: DiagnosticKind, index: Int = 1) =

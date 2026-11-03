@@ -2,106 +2,99 @@
 
 > 分支 `feat/hand-hint-alignment`。本文记录"提示又看不到了"这一轮的失败根因、实际证据、三相机逐个结果、修复与验证，以及仍需真机确认的事项。
 
-## 结论（TL;DR）
+## 第一轮（已合并进本分支历史）：窗口 attach 时序
 
-这一轮徽章消失的**直接根因不是相机投影错误**，而是 Kotlin 覆盖层的窗口时序 bug：
-
-`render()` 在 overlay 根视图**尚未 attach 到 WindowManager、尚未 measure** 时，就调用
+`render()` 在 overlay 根视图**尚未 attach 到 WindowManager、尚未 measure** 时就调用
 `measureMapping(frame)` 去读 `frame.width/height`。此时 frame 是刚 `new` 出来的
-`FrameLayout`，宽高为 0，`measureMapping` 返回 `null` → 记录
-`BADGE_HIDDEN reason=no_origin` → `badgeTargets` 为空 → 立即 `detach()`。
+`FrameLayout`，宽高为 0 → 返回 `null` → 记录 `BADGE_HIDDEN reason=no_origin` → 立即 `detach()`。
 
-结果：代码里那段"`frame.post` 布局之后再算坐标"的逻辑**永远执行不到**——因为 `addView`
-发生在 `positionHints`（内部 `measureMapping`）**之后**，而 `measureMapping` 一失败就 `detach`
-了，post 回调从未被挂上（即便挂上也因 `root` 已被置 null 而直接 return）。
+当时判断"`frame.post` 布局之后再算坐标"可修，但 #282 构建的日志证明**并没有修好**：
 
-相机投影本身是正确的：日志显示坐标 `nx ∈ 0.209..0.7406`、`ny ∈ 0.897..0.923`，全部落在屏幕内，
-且 `HOOK_COORDS kept=14 rejected=0`。问题纯粹是"几何算得对，但窗口异步测量时序错"。
+- `BADGE_HIDDEN` 单条记录与 `HINT_ORDER` 出现在**同一毫秒序列**（`timeUtcMs 1793682520923`
+  紧跟 `HINT_ORDER 1793682520915`），也就是该次 render 自己就把那次尝试判死了；
+- 且 `frame=2256x1080`，**不是** 0x0。
 
-## 实际证据（日志）
+## 第二轮（本轮，#282 / commit 5ce05bc 构建）：真正根因
 
-- 安装版本 `lastUpdate 2026-11-03 11:28:40`；assistant 日志尾部 `11:30:24`。
-- `BADGE_HIDDEN reason=no_origin views=14 hints=3 frame=0x0` —— `frame=0x0` 是决定性证据：
-  overlay 根视图在测量时宽高还是 0。
-- 邻近 `GAME_GEOMETRY`：Unity `2376x1080`，overlay `2376x1080`，`ortho=1`，坐标
-  `nx 0.209..0.7406`、`ny 0.897..0.923`。
-- `HOOK_COORDS kept=14 rejected=0` —— 相机至少投影出了屏幕内坐标，几何是对的。
+### 根因 1（决定性）：Lua UI 资产缓存从未刷新，Kotlin 收到的是旧"裸数组"载荷
 
-`frame=0x0` + `reason=no_origin` 二者同时出现，即锁定为窗口异步问题，而非相机问题。
+- 设备上 `…/com.soulgamechst.majsoul/files/majsoulmax-hook/ui/MajsoulMaxAutoDiscard.lua`
+  修改时间 `Nov 2 21:27`，大小 `33315` 字节；仓库当前资产为 `35587` 字节。
+- 该已安装脚本第 635 行仍是 `ack('', 'hand_coords', A.json.encode(coords))` —— **裸数组**，
+  没有 `{screenW, screenH, coords}` 包装；`diag.cams` 也只有 4 个字段（无 inView/total/meanNy）。
+- 同目录 `.asset-version` 内容为 `0.12.0-hint5`，而 `ProbeModule.ASSET_VERSION` 也是
+  `0.12.0-hint5`：`if (!ASSET_VERSION.equals(installed))` 恒为 false，所以
+  `VERSIONED_ASSETS` **从未被覆盖**。手写版本号忘记升级 = 新 Lua 永远不生效。
+- 后果正好对上日志：`HOOK_COORDS kept=14`（坐标到了、解析成功），但
+  `parseHandCoords` 走裸数组分支 → `sourceW=sourceH=0` → `buildMapping` 返回 null →
+  `BADGE_HIDDEN`。而且 `cams` 永远是空字符串，所以日志里只有 `cam=camera`、没有 `cams=`。
 
-## 三相机逐个结果（新增有界候选诊断）
+### 根因 2：这次 `BADGE_HIDDEN` 的字段全被诊断白名单吞掉
 
-此前 `pickCamera` 每次都真实地用 `positions` 调 `projectThrough` 枚举并评分所有 enabled 相机，
-但日志只记录获胜相机名和 `ortho`，其他相机不落日志，导致无法逐个核对。
+`GeometryTrace.structuredKeys` 里有 `sourceW/sourceH/frameOrigin/viewport`，但
+`DiagnosticsStore.allowedFieldNames` 没有这三个键，于是它们被塞进 `reason` 并被 64 字符截断，
+最终只剩 `reasonno_origin frame2256x1080`。也就是说这条 bug 本来就把自身证据抹掉了。
 
-现改为：`hand_geometry` 里**总是**输出有界候选诊断 `cams`，一轮一次（由几何指纹去重，非每 tick）：
+### 根因 3：`frame.post` 方案在更新路径上会自我取消
 
-```
-cams = name|ortho|inView/total|minNx,maxNx,minNy,maxNy|meanNy  （每台相机一段，'+' 连接）
-```
+旧的实现每次 `render()` 都 `renderGeneration++` 再 `frame.post { if (gen != renderGeneration) return }`。
+一局里 update 频率远高于一次布局通过，排队的回调很容易被下一次 render 的 generation 顶掉，
+于是"布局后再测量"永远不会发生。
 
-最多列出 6 台相机。三个字段对应你要的三件事：
+### 生产侧潜在风险：native ack 静默丢弃
 
-- `inView/total`：该相机投影命中屏幕内的牌数；
-- `minNx,maxNx,minNy,maxNy`：投影包围盒（范围）；
-- `meanNy`：投影平均 y（手牌应贴底，`meanNy` 接近 1）。
+`probe.cpp:luaAutoAck` 对 `length > 2048` 直接 `return 0`，不写日志。14 张手牌的包装载荷约
+1.1 KB，已接近上限；一旦超限，Kotlin 侧会表现为"完全没有坐标"，与相机无关。
 
-选择逻辑不变：**不盲改 `Camera.main`，不强制某相机**；仍按"命中数 → meanNy 更靠底 → 水平更紧凑"
-评分，且要求 `meanNy >= 0.5`（排除上半个镜像/特效相机）。正确手牌位置由实际全手覆盖 + 底部指标
-（`inView` 与 `meanNy`）选定。若候选含三个相机，现在能各自看到命中数、投影范围和平均 y。
+### 相机不是根因
 
-真机日志出现 `cams=...` 后，即可逐一确认三台相机里哪台把 14 张手牌投到屏幕下缘。
+`HOOK_COORDS kept=14 rejected=0` 与 `minNx 0.2091 / maxNx 0.7406 / minNy 0.9019 / maxNy 0.9228`
+说明投影是正常的（全部落在屏幕内、贴近手牌下缘）。本轮不再把 `no_origin` 归因于相机。
 
-## 修复
+## 本轮修复
 
-### 1. 覆盖层窗口时序（核心，`TileBadgeOverlay.kt`）
+1. `ProbeModule.java`：`ASSET_VERSION` 改为由资产**实际字节长度**推导
+   （`0.12.0-hint6-<name>:<len>…`）。任何一次 Lua 编辑都会改变时间戳，从而强制覆盖已缓存脚本；
+   `CONFIGURED` 诊断同时带 `assetVersion=…`，让日志能直接看出装的是哪一版 Lua。
+2. `TileBadgeOverlay.kt`：
+   - 新增纯函数 `buildMapping(...)`，把失败拆成 `source_missing` / `frame_unmeasured` /
+     `metrics_invalid`，`BADGE_HIDDEN` 一律带 `sourceW/sourceH/frame/frameOrigin/viewport` 真实数值；
+   - `render()` 不再 `post` + generation 自取消。改为：已测得尺寸则**同步**放置；未测得则用
+     `OnPreDrawListener` + `OnGlobalLayoutListener` 一次性等待，`cancelAwait()` 精确移除两个
+     listener（`detach()`/`close()` 前先移除，不泄漏）；
+   - `updateHookedCoords` 记录 `HOOK_SOURCE`（`wrapped` / `legacy_bare_array` + 实际 dims），
+     旧缓存脚本能被一眼识别，不会再被误判成 Kotlin 量测故障。
+3. `probe.cpp`：ack 上限 `2048 → 16 KiB`，超限时写入
+   `{"state":"ack_oversize"}` 并由 `AutoDiscardController` 记为 `ACK_OVERSIZE` 并暂停等待重新同步，
+   不再静默丢失。
+4. `MajsoulMaxAutoDiscard.lua`：`hand_coords` 的去重签名由"拼接全部牌名/全部 nx"改为 32 位哈希，
+   给单条 ack 留出余量（同时对相机名敏感，换相机即重发）。
+5. `DiagnosticsStore.allowedFieldNames`：补 `sourceW/sourceH/frameOrigin/viewport/assetVersion`。
 
-`render()` 重构为：
+## 三相机逐个结果
 
-1. 空 hint → `renderGeneration++` + `detach()`（使旧 post 失效）。
-2. **先** `addView`/`updateViewLayout` 把 root 挂到 WindowManager。
-3. `renderGeneration++`，捕获 `gen` 与 `frame`。
-4. `frame.post { ... }` 在布局完成后执行：
-   - 守卫：`root === frame && gen == renderGeneration`，过期直接 return；
-   - 重新 `measureMapping(frame)`（此时 frame 已测量，宽高非 0）；
-   - mapping 无效 → 记录 `BADGE_HIDDEN reason=no_origin` 并**保留**文字面板（不再 detach），
-     return，等下一轮稳定几何/手牌再试；
-   - mapping 有效 → `computeBadgePlacement` 算锚点 → 创建 badge view → 测宽 → 摆放；
-   - 输出 `BADGE_PLACED` 记录最终像素目标。
+`diag.cams` 由 `reportHandCoords` 每次几何指纹变化时输出，格式
+`name|ortho|inView/total|minNx,maxNx,minNy,maxNy|meanNy`，多台用 `+` 连接。
 
-关键点：**几何测量与坐标计算严格推迟到 root attach + 布局之后**；绝不再在零尺寸 frame 上
-提前计算并 detach；`detach()` 也 `renderGeneration++` 使所有在途 post 失效。
+**注意白名单**：`DiagnosticsStore` 按 `isLetterOrDigit || " _-./()：:@,+|"` 过滤字符串，
+所以 `inView/total` 里的 `/` 会**被删掉**（`14/14` → `1414`）。读日志时请按此解释。
 
-### 2. 数学与异步 render 拆分（可测纯函数，`TileBadgeOverlay.kt`）
-
-- 新增 `internal fun computeBadgePlacement(hints, views, mapping, frameHeight): BadgePlacement`：
-  纯配对 + 坐标映射，不碰窗口。`mapping` 由外部测量后传入。
-- `DiscardHint` 从 `private` 提升为 `internal`（纯函数需要暴露其参数类型）。
-
-### 3. 相机候选诊断（`MajsoulMaxAutoDiscard.lua`）
-
-见上文"三相机逐个结果"。`diag.cams` 从"仅 `cam == nil` 时输出"改为"总是输出"，格式扩展为
-`name|ortho|inView/total|bbox|meanNy`。
+#282 日志里 `cams` 缺失的原因是旧 Lua（根因 1），不是 Kotlin 没带该字段——修复后重启一次牌局
+即可看到三台相机各自的投影结果。
 
 ## 验证
 
-- Lua 语法：`luac -p` 通过。
-- Lua 测试：`lua tools/tests/test_auto_discard.lua` → **61 automatic operation checks passed**，
-  含 4 个相机选择测试（正交手牌相机优先、排除上半个镜像投影、无覆盖时保留文字提示并输出候选诊断、
-  同相机稳定性）。
-- Kotlin 主源码：`compileArm64DebugKotlin`（本机 arm64，跳过资源链接）确认 `TileBadgeOverlay.kt`、
-  `HandCoordinateMapper.kt` 无编译错误（剩余 `R` unresolved 为跳过资源生成所致，非本改动引入）。
-- 新增 Instrumented 纯测试（`AutoDiscardInstrumentation.kt`）：
-  - "computeBadgePlacement places anchors from a post-layout mapping"——覆盖"初始 frame=0 但
-    post-layout mapper 可用"场景（`nx=0.28 → x=545`）；
-  - "rejects an unusable mapping instead of guessing"——mapping 无效/空 views 时返回空；
-  - "reports ambiguous duplicate tiles"——重复牌歧义上报。
+- `lua5.1 tools/tests/test_auto_discard.lua` → **61 automatic operation checks passed**。
+- Kotlin：`compileUniversalDebugKotlin` + `compileUniversalDebugAndroidTestKotlin`（本机 JDK 21）。
+- 新增 instrumented 断言：`source_missing` / `frame_unmeasured` / `metrics_invalid` 三态，
+  以及"初始 0x0 → 测得 2376x1080 后放置"的回归用例（`nx=0.7406 → x=1640`）。
+- 模拟器 instrumented 测试与 APK 打包以 CI 为准。
 
 ## 待真机确认
 
-1. 真机安装新构建后，`frame=0x0` 的 `BADGE_HIDDEN` 应消失，改为 `BADGE_PLACED` 且
-   `frame=2376x1080`。
-2. 新 `cams` 字段应出现三台相机的 `inView/total`/包围盒/`meanNy`，据此最终确认获胜相机确实是
-   把 14 张手牌投到底部下缘的那台。
-3. 若仍无徽章，下一级信号是 `BADGE_HIDDEN reason=no_coords`（无坐标）或 `reason=no_anchor`
-   （坐标有但配对不到），而非 `no_origin`——据此可区分"相机几何"与"窗口异步"两类问题。
+1. 重启牌局后 `CONFIGURED` 里 `assetVersion` 应变为 `0.12.0-hint6-…`；`HOOK_SOURCE` 应为
+   `wrapped;sourceW=2376;sourceH=1080`。
+2. 徽章应出现 `BADGE_PLACED`（`frame=2256x1080`、`frameOrigin=120,0`、`viewport=2376x1080`）。
+3. 若仍是 `BADGE_HIDDEN`，看 `reason` 取自 `source_missing` / `frame_unmeasured` / `no_anchor`，
+   据此区分数据链路与窗口时序。
+4. `GAME_GEOMETRY` 应带上 `cams=…`，可据此最终确认获胜相机。

@@ -31,10 +31,44 @@ public final class ProbeModule extends XposedModule {
     private static final String TAG = "MajsoulProbe";
     private static final Uri AI_ENDPOINT_URI = Uri.parse(
             "content://com.yefeng.majmax.hookprobe.ai/capture");
-    private static final String ASSET_VERSION = "0.12.0-hint5";
     private static final String[] VERSIONED_ASSETS = {
             "ui/MajsoulMaxSettings.lua", "ui/MajsoulMaxAutoDiscard.lua"
     };
+
+    /**
+     * Version stamp for the bundled Lua UI. It is derived from the shipped file
+     * lengths so that *any* edit to a versioned asset changes the stamp and forces a
+     * refresh of the cached copy under the game's files dir. A hand-maintained
+     * string was the actual root of the hand-hint regression: the wrapper
+     * `{screenW, screenH, coords}` payload shipped while this stamp stayed at
+     * `0.12.0-hint5`, so the installed (older, bare-array) script was never
+     * replaced and the overlay never received source dimensions.
+     */
+    private static final String ASSET_VERSION = assetVersion();
+
+    private static String assetVersion() {
+        StringBuilder stamp = new StringBuilder("0.12.0-hint6");
+        for (String name : VERSIONED_ASSETS) {
+            stamp.append('-').append(name.substring(name.lastIndexOf('/') + 1)).append(':')
+                    .append(assetLength(name));
+        }
+        return stamp.toString();
+    }
+
+    private static long assetLength(String name) {
+        try (java.io.InputStream stream = ProbeModule.class.getClassLoader()
+                .getResourceAsStream("assets/" + name)) {
+            if (stream == null) return -1;
+            long total = 0;
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = stream.read(buffer)) > 0) total += read;
+            return total;
+        } catch (java.io.IOException error) {
+            return -1;
+        }
+    }
+
     private static final String[] USER_ASSETS = {"settings.mod.json"};
     private static final AtomicBoolean CONFIGURED = new AtomicBoolean();
     private static final AtomicBoolean AI_ENDPOINT_POLLING = new AtomicBoolean();
@@ -125,7 +159,8 @@ public final class ProbeModule extends XposedModule {
             if (result != 0) throw new IOException("nativeConfigure returned " + result);
             if (catalog != null) reportCatalogApplied(gameContext, configDir, catalog);
             startAiEndpointDiscovery(gameContext.getApplicationContext());
-            HookDiagnostics.event("INFO", "hook.entry", "CONFIGURED", new JSONObject());
+            HookDiagnostics.event("INFO", "hook.entry", "CONFIGURED",
+                    HookDiagnostics.fields("assetVersion", ASSET_VERSION));
             log(Log.INFO, TAG, "Rust Modder configured at " + configDir);
         } catch (Throwable error) {
             CONFIGURED.set(false);

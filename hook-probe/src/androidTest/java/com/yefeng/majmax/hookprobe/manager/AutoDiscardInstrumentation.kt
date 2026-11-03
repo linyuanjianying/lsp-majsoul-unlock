@@ -526,6 +526,52 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 check(placement.ambiguous == 1 && placement.placed.isEmpty())
                 check(placement.pairingTrace.contains("5m=5m:2")) { "expected ambiguity trace" }
             }
+            // buildMapping is the pure decision behind BADGE_HIDDEN. Each failure must
+            // name its own cause, so an unset source viewport is never reported as a
+            // frame/origin fault (the old `no_origin` label conflated all three).
+            test("buildMapping names source_missing when the payload has no dims") { _, _ ->
+                val r = TileBadgeOverlay.buildMapping(0, 0, 2256, 1080, 120, 0, 0, 0, 2376, 1080)
+                check(r.mapping == null && r.failure == FrameFailure.SOURCE_MISSING) {
+                    "expected source_missing, got ${r.failure}"
+                }
+            }
+            test("buildMapping names frame_unmeasured for a not-yet-laid-out frame") { _, _ ->
+                val r = TileBadgeOverlay.buildMapping(2376, 1080, 0, 0, 0, 0, 0, 0, 2376, 1080)
+                check(r.mapping == null && r.failure == FrameFailure.FRAME_UNMEASURED) {
+                    "expected frame_unmeasured, got ${r.failure}"
+                }
+            }
+            test("buildMapping names metrics_invalid when the viewport is empty") { _, _ ->
+                val r = TileBadgeOverlay.buildMapping(2376, 1080, 2256, 1080, 120, 0, 0, 0, 0, 0)
+                check(r.mapping == null && r.failure == FrameFailure.METRICS_INVALID) {
+                    "expected metrics_invalid, got ${r.failure}"
+                }
+            }
+            // The regression #82 shape: the first pass sees a 0x0 frame AND no source
+            // dims (stale bare-array Lua capture). Once the frame is laid out and the
+            // wrapped payload arrives — source 2376x1080, overlay frame 2256x1080 at
+            // x=120 — the same hints must place, proving the retry path recovers a
+            // badge instead of dying on the first null mapping.
+            test("initial 0x0 frame then measured 2376x1080 source places the badge") { _, _ ->
+                val before = TileBadgeOverlay.buildMapping(2376, 1080, 0, 0, 0, 0, 0, 0, 2376, 1080)
+                check(before.mapping == null && before.failure == FrameFailure.FRAME_UNMEASURED)
+                val after = TileBadgeOverlay.buildMapping(2376, 1080, 2256, 1080, 120, 0, 0, 0, 2376, 1080)
+                val m = after.mapping ?: error("expected a usable mapping after layout")
+                check(after.failure == null && HandCoordinateMapper.isUsable(m))
+                // Same hand as the device log: 14 tiles, the badge on hand index 12.
+                val views = listOf(
+                    view("1p", 0.2091, 0.9228), view("2p", 0.2489, 0.9019),
+                    view("8p", 0.2887, 0.9042), view("1s", 0.3285, 0.9101),
+                    view("2s", 0.7406, 0.9150),
+                )
+                val hints = listOf(hint("discard", "2s", 12))
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m, 1080)
+                check(placement.placed.size == 1 && placement.ambiguous == 0 && placement.missing == 0)
+                // 0.7406 * 2376 = 1759.6656 - 120 origin -> 1639.67; badge is lifted.
+                val anchor = placement.placed[12] ?: error("expected hand index 12 placed")
+                check(anchor.first == 1640) { "expected x=1640, got ${anchor.first}" }
+                check(anchor.second < (0.9150 * 1080).toInt()) { "badge must sit above the tile" }
+            }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
             ApkUpdateChecks.run(targetContext)

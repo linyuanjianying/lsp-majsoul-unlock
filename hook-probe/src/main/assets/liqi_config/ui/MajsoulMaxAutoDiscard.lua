@@ -508,6 +508,22 @@ local function pickCamera(positions, screenW, screenH)
     return best, bestScore
 end
 
+-- Stable 32-bit FNV-1a hash of a value list, used only for change detection of
+-- captures. Collisions are harmless: a collision re-sends the same coordinates,
+-- never suppresses a genuine change beyond a 1-in-4e9 chance.
+local function hashSignature(values)
+    local h = 2166136261
+    for _, v in ipairs(values) do
+        local text = tostring(v)
+        for i = 1, #text do
+            h = bit32 and bit32.bxor(h, string.byte(text, i)) or (h + string.byte(text, i)) % 4294967296
+            h = (h * 16777619) % 4294967296
+        end
+        h = (h * 16777619) % 4294967296
+    end
+    return string.format('%x', h)
+end
+
 local function reportHandCoords()
     local d = DesktopMgr and DesktopMgr.Inst
     local r = d and d.mainrole
@@ -660,8 +676,13 @@ local function reportHandCoords()
             end
         end
         if monotonic then
-            local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. table.concat(tiles, ',')
-                .. ':' .. table.concat(xs, ',')
+            -- The signature only needs to detect a *changed* capture, so it is a
+            -- bounded 32-bit hash rather than the full tile/coordinate lists. The
+            -- whole payload travels through a single-size native bridge, so keeping
+            -- the dedupe token small preserves headroom for the coordinates
+            -- themselves (a longer capture used to be close to the transport limit).
+            local sig = tostring(step) .. ':' .. tostring(#coords) .. ':' .. hashSignature(tiles)
+                .. ':' .. hashSignature(xs) .. ':' .. tostring(cam and cam.name or '')
             if A.lastCoordsSig ~= sig then
                 A.lastCoordsSig = sig
                 -- Wrap the coordinate array with the Unity source viewport it was

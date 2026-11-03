@@ -70,6 +70,9 @@ std::string uiScript;
 std::mutex autoMutex;
 std::string autoCommand;
 std::deque<std::string> autoResults;
+// Largest acknowledgement the Lua UI may push: bounded so a runaway script cannot
+// grow the queue without limit, but comfortably above a full hand_coords wrapper.
+constexpr int kMaxAutoAckBytes = 16 * 1024;
 uint64_t autoGeneration = 0, autoConnection = 0, autoSequence = 0;
 int64_t autoReceivedMs = 0, autoLastPumpMs = 0;
 
@@ -202,7 +205,21 @@ int luaAutoCurrent(void *state) {
 int luaAutoAck(void *state) {
     size_t length = 0;
     const char *text = luaToLString ? luaToLString(state, 1, &length) : nullptr;
-    if (!text || !length || length > 2048) return 0;
+    if (!text || !length) return 0;
+    // A 14-tile hand_coords payload wrapped with {screenW, screenH, coords} is ~1.1 KB,
+    // close enough to the old 2048-byte ceiling that a longer capture was dropped
+    // *silently*: the Kotlin side then saw no coordinates at all. The limit is now
+    // well above the largest legitimate payload, still bounded against a runaway
+    // script, and an oversize payload is reported instead of vanishing.
+    if (length > static_cast<size_t>(kMaxAutoAckBytes)) {
+        INFO("Lua ack dropped: %zu bytes exceeds the %d byte limit", length, kMaxAutoAckBytes);
+        // Surface the drop as a diagnostic record instead of losing it silently: the
+        // Kotlin side then reports "ack_oversize" rather than looking like "no data".
+        std::lock_guard<std::mutex> lock(autoMutex);
+        if (autoResults.size() == 32) autoResults.pop_front();
+        autoResults.emplace_back("{\"id\":\"\",\"state\":\"ack_oversize\",\"reason\":\"oversize\"}");
+        return 0;
+    }
     std::lock_guard<std::mutex> lock(autoMutex);
     if (autoResults.size() == 32) autoResults.pop_front();
     autoResults.emplace_back(text, length);
