@@ -29,6 +29,9 @@ internal object GeometryTrace {
         "behind", "minNx", "maxNx", "minNy", "maxNy", "sample",
         "tiles", "order", "reds", "views_n", "cam", "cams", "pairs", "frame", "targets",
         "sourceW", "sourceH", "frameOrigin", "viewport", "assetVersion",
+        // Badge vertical calibration: raw projected anchor y, calibrated card height,
+        // anchor->tile-top offset, measured badge height, gap, final top, skips.
+        "anchor", "cardH", "off", "badgeH", "gap", "top", "skipped", "frameH",
     )
 
     private val counts = HashMap<String, Int>()

@@ -497,32 +497,38 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
                 val views = listOf(view("1m", 0.20, 0.90), view("2m", 0.28, 0.90), view("3m", 0.36, 0.90))
                 val hints = listOf(hint("discard", "2m", 1))
-                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m, 1080)
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m)
                 check(placement.placed.size == 1 && placement.ambiguous == 0 && placement.missing == 0)
                 check(placement.placed.containsKey(1)) { "expected handIndex 1 to be placed" }
                 // nx=0.28 -> 0.28*2376=665.28 -> -120 origin -> 545.28 -> 545.
                 check(placement.placed[1]!!.first == 545) {
                     "expected x=545, got ${placement.placed[1]!!.first}"
                 }
+                // The anchor carries the raw projected y (no lift baked in); the
+                // vertical offset is applied later against the measured badge height.
+                check(placement.placed[1]!!.second == 972) {
+                    "expected raw anchor y=972, got ${placement.placed[1]!!.second}"
+                }
             }
             test("computeBadgePlacement rejects an unusable mapping instead of guessing") { _, _ ->
-                // frameHeight is irrelevant when the mapping itself is unusable; the
-                // function must return empty rather than place a badge at a guess.
+                // An unusable mapping must return empty rather than place a badge at
+                // a guess, and it must not invent a card-height calibration either.
                 val views = listOf(view("1m", 0.20, 0.90))
                 val hints = listOf(hint("discard", "1m", 0))
                 val bad = mapping(0, 1080)
-                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, bad, 1080)
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, bad)
                 check(placement.placed.isEmpty() && placement.missing == 0)
+                check(placement.cardHeightPx == null)
                 // Empty views also yields empty (the no_coords case).
                 val valid = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
-                val emptyViews = TileBadgeOverlay.computeBadgePlacement(hints, emptyList(), valid, 1080)
+                val emptyViews = TileBadgeOverlay.computeBadgePlacement(hints, emptyList(), valid)
                 check(emptyViews.placed.isEmpty())
             }
             test("computeBadgePlacement reports ambiguous duplicate tiles") { _, _ ->
                 val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
                 val views = listOf(view("5m", 0.20, 0.90), view("5m", 0.30, 0.90))
                 val hints = listOf(hint("discard", "5m", 0))
-                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m, 1080)
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m)
                 check(placement.ambiguous == 1 && placement.placed.isEmpty())
                 check(placement.pairingTrace.contains("5m=5m:2")) { "expected ambiguity trace" }
             }
@@ -565,12 +571,130 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     view("2s", 0.7406, 0.9150),
                 )
                 val hints = listOf(hint("discard", "2s", 12))
-                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m, 1080)
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m)
                 check(placement.placed.size == 1 && placement.ambiguous == 0 && placement.missing == 0)
-                // 0.7406 * 2376 = 1759.6656 - 120 origin -> 1639.67; badge is lifted.
+                // 0.7406 * 2376 = 1759.6656 - 120 origin -> 1639.67.
                 val anchor = placement.placed[12] ?: error("expected hand index 12 placed")
                 check(anchor.first == 1640) { "expected x=1640, got ${anchor.first}" }
-                check(anchor.second < (0.9150 * 1080).toInt()) { "badge must sit above the tile" }
+                // 0.9150 * 1080 = 988.2 -> 988: the raw projected anchor, *not* lifted.
+                check(anchor.second == 988) { "expected raw anchor y=988, got ${anchor.second}" }
+                // The sample's own card-height estimate is real but small (the row is
+                // nearly flat: mean dy 0.015 * 1080 = 16.2 px, clamped up to the 0.045
+                // floor = 48.6 -> 49 px), which is exactly why it does not drive the
+                // offset: 0.7 * 49 = 34 px would leave the badge ~40 px too low.
+                val cardH = placement.cardHeightPx ?: error("expected a card height estimate")
+                check(cardH == 49) { "expected clamped card height 49, got $cardH" }
+                // The offset is frame-normalized: 0.0694 * 1080 = 75 px, matching the
+                // 997 -> 922 px anchor-to-tile-top distance in the screenshot.
+                check(TileBadgeOverlay.tileTopOffsetPx(1080) == 75) { "expected offset 75" }
+            }
+            // Vertical placement, pinned to the reference screenshot: the badge's
+            // bottom edge must land on the tile's top edge, not on the tile face.
+            // Device evidence: anchorY = 0.9228 * 1080 = 997 px, tile top ~922 px
+            // (75 px anchor->tile-top), badge height 70..80 px. Data payload gave
+            // tileTop 922 / badgeH 70 / top 852 / bottom 922.
+            test("computeBadgeTop puts the badge bottom on the tile top edge") { _, _ ->
+                val vertical = TileBadgeOverlay.computeBadgeTop(
+                    anchorY = 997, tileTopOffsetPx = 75, badgeHeightPx = 70,
+                    gapPx = 0, frameHeight = 1080,
+                ) ?: error("expected a vertical placement")
+                check(vertical.tileTop == 922) { "expected tileTop=922, got ${vertical.tileTop}" }
+                check(vertical.top == 852) { "expected top=852, got ${vertical.top}" }
+                check(vertical.top + vertical.height == 922) {
+                    "badge bottom must touch the tile top, got ${vertical.top + vertical.height}"
+                }
+                check(vertical.height == 70)
+            }
+            test("computeBadgeTop subtracts the measured badge height, not a frame fraction") { _, _ ->
+                // The old bug used a fixed 0.0333 * 1080 = 36 px lift *as the top*,
+                // ignoring the badge height: top=961 with the tile top at 922.
+                val short = TileBadgeOverlay.computeBadgeTop(997, 75, 60, 4, 1080)!!
+                val tall = TileBadgeOverlay.computeBadgeTop(997, 75, 80, 4, 1080)!!
+                check(short.top == 858 && tall.top == 838) {
+                    "expected 858/838, got ${short.top}/${tall.top}"
+                }
+                // A taller badge always starts higher; the bottom stays fixed.
+                check(short.top + 60 == 922 - 4 && tall.top + 80 == 922 - 4)
+            }
+            test("computeBadgeTop scales with the render height") { _, _ ->
+                // Same relative framing rendered taller: the offset is derived from the
+                // frame height (a fraction), not from a hard-coded pixel value.
+                val hd = TileBadgeOverlay.computeBadgeTop(1330, 100, 93, 0, 1440)!!
+                check(hd.tileTop == 1230 && hd.top + hd.height == 1230) {
+                    "expected bottom=1230, got ${hd.top + hd.height}"
+                }
+                // The same ratio that yields 75 px at 1080p yields 100 px here.
+                check(TileBadgeOverlay.tileTopOffsetPx(1440) == 100)
+                // A larger frame must place the badge proportionally higher.
+                val small = TileBadgeOverlay.computeBadgeTop(997, 75, 70, 0, 1080)!!
+                check(small.top.toDouble() / 1080.0 in 0.78..0.80) {
+                    "unexpected relative top ${small.top.toDouble() / 1080.0}"
+                }
+            }
+            test("computeBadgeTop clamps instead of leaving the frame or covering the tile") { _, _ ->
+                // Row near the bottom: the whole badge fits above it, so nothing is lost.
+                val low = TileBadgeOverlay.computeBadgeTop(1070, 75, 70, 0, 1080)!!
+                check(low.top + low.height == 995)
+                // Row near the top: the badge cannot leave the frame; it is shrunk to
+                // the room above the tile rather than pushed down over the tile.
+                val high = TileBadgeOverlay.computeBadgeTop(80, 75, 70, 4, 1080)!!
+                check(high.top == 0) { "expected top=0, got ${high.top}" }
+                check(high.height == 1) { "expected shrunk height=1, got ${high.height}" }
+                // No room at all above the tile: skip rather than misplace.
+                check(TileBadgeOverlay.computeBadgeTop(70, 75, 70, 4, 1080) == null)
+                // Degenerate frame: skip.
+                check(TileBadgeOverlay.computeBadgeTop(500, 75, 70, 0, 0) == null)
+            }
+            test("estimateCardHeightPx uses the pitch when tiles share one row") { _, _ ->
+                // Device log row: five tiles on ~one ny, pitch 0.0398 * 2376 = 94.6 px.
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                val views = listOf(
+                    view("1p", 0.2091, 0.9228), view("2p", 0.2489, 0.9019),
+                    view("8p", 0.2887, 0.9042), view("1s", 0.3285, 0.9101),
+                    view("2s", 0.7406, 0.9150),
+                )
+                val h = TileBadgeOverlay.estimateCardHeightPx(views, m)
+                check(h != null && h in 60..90) { "expected ~70 px via pitch, got $h" }
+                // The frame-normalized offset is independent of that estimate and keeps
+                // the reference distance (75 px at 1080p).
+                check(TileBadgeOverlay.tileTopOffsetPx(1080) == 75)
+                check(TileBadgeOverlay.tileTopOffsetPx(1440) == 100) { "expected 1440 -> 100" }
+            }
+            test("estimateCardHeightPx prefers the drawn-tile row offset and clamps it") { _, _ ->
+                // A pickup tile drawn one full card height above the row: dy = 0.10.
+                val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
+                val drawn = listOf(view("1m", 0.10, 0.90), view("2m", 0.20, 0.80))
+                check(TileBadgeOverlay.estimateCardHeightPx(drawn, m) == 108)
+                // Absurd sample (dy = 0.5 of the screen) is clamped into a plausible band.
+                val absurd = listOf(view("1m", 0.10, 0.90), view("2m", 0.20, 0.40))
+                val clamped = TileBadgeOverlay.estimateCardHeightPx(absurd, m)!!
+                check(clamped == 173) { "expected clamp to 0.16*1080=172.8 -> 173, got $clamped" }
+                // A single tile with no pitch and no row offset cannot be calibrated.
+                check(TileBadgeOverlay.estimateCardHeightPx(listOf(view("1m", 0.5, 0.9)), m) == null)
+            }
+            // Full pipeline: device coordinates through placement and the vertical
+            // formula, asserting the badge never covers the tile it points at.
+            test("device row places badges flush above each hinted tile") { _, _ ->
+                val m = mapping(2376, 1080, frameOriginX = 120, viewportW = 2376, viewportH = 1080)
+                val views = listOf(
+                    view("1m", 0.15, 0.9228), view("2p", 0.25, 0.9228),
+                    view("9m", 0.35, 0.9228), view("5s", 0.45, 0.9228),
+                )
+                val hints = listOf(
+                    hint("discard", "2p", 1), hint("discard", "1m", 0),
+                )
+                val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m)
+                check(placement.placed.size == 2)
+                check(placement.cardHeightPx != null) { "expected a card height estimate" }
+                val offset = TileBadgeOverlay.tileTopOffsetPx(1080)
+                for (idx in listOf(0, 1)) {
+                    val anchorY = placement.placed[idx]!!.second
+                    val v = TileBadgeOverlay.computeBadgeTop(anchorY, offset, 70, 0, 1080)!!
+                    check(v.top + v.height == anchorY - offset) {
+                        "badge bottom must equal tileTop for hand index $idx"
+                    }
+                    check(v.top < anchorY - 70) { "badge must be fully above the tile" }
+                }
             }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })

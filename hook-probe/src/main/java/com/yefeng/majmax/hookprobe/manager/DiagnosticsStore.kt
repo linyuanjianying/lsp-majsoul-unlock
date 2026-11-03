@@ -60,6 +60,7 @@ internal object DiagnosticsStore {
         // the source viewport, frame origin and viewport — the exact values needed
         // to tell "source dims never arrived" from "frame not measured yet".
         "sourceW", "sourceH", "frameOrigin", "viewport",
+        "anchor", "cardH", "off", "badgeH", "gap", "top", "skipped", "frameH",
         // Build identity of the installed Lua UI asset, so a stale cached script
         // (which kept sending the legacy bare hand_coords array, without the
         // {screenW, screenH, coords} wrapper) is visible in the log instead of

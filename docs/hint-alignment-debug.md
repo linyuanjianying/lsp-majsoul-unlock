@@ -98,3 +98,95 @@
 3. 若仍是 `BADGE_HIDDEN`，看 `reason` 取自 `source_missing` / `frame_unmeasured` / `no_anchor`，
    据此区分数据链路与窗口时序。
 4. `GAME_GEOMETRY` 应带上 `cams=…`，可据此最终确认获胜相机。
+
+## 第三轮（本轮，commit 61488dc 之后）：竖直偏移 —— 徽章压住牌面
+
+前两轮修好的是"徽章有没有出现"；本轮只修"徽章出现在哪个高度"。相机、x 轴投影、
+牌到提示的配对逻辑一律未动。
+
+### 实测证据（`assistant-1.jsonl`，2026-11-03 约 14:31，游戏 `lastUpdate 2026-11-03 14:28:47`）
+
+```
+GAME_GEOMETRY ortho=1;cam=camera          # 三相机中只有它对 14/14 张牌投影成功
+screenW=2376;screenH=1080
+overlay root frame=2256x1080;origin=(120,0);viewport=2376x1080
+BADGE_PLACED targets=2z@1420,961:12 1m@377,961:0 9m@472,961:1 …
+```
+
+对照同一帧的截图（2400x1080 手机，手牌在画面下缘）：
+
+| 量 | 值 | 来源 |
+| --- | --- | --- |
+| 手牌牌顶边 | y ≈ 922 | 截图 |
+| 徽章**顶边** | y = 961 | 日志 `BADGE_PLACED` |
+| 徽章底边 | y ≈ 961 + 70~80 | 截图（徽章高度约 70~80 px） |
+| 投影锚点 | `ny=0.9228` → 0.9228×1080 ≈ **997** | 日志 |
+
+结论：锚点 997 与牌顶 922 相差 **75 px**；旧实现把
+`BADGE_LIFT_FRACTION = 0.0333 × frameHeight`，即 0.0333×1080 ≈ **36 px**，
+直接当成徽章**顶边**（997−36=961），既没有减掉徽章自身高度，也远小于真实的
+"锚点→牌顶"距离，于是徽章整块压在牌面上（参考图要求徽章**底边贴着牌顶**）。
+
+### 旧公式的问题不止是常数
+
+1. **忽略了徽章高度**：即使常数凑对，只要换字号/换权重文案让徽章变高，仍会压牌。
+2. **竖直和水平用了不同基准**：x 用"牌宽中心"，y 用"帧高分比"，两者没有共同语义。
+3. **硬编码 1080p 像素量级**：不同分辨率/密度下比例会漂。
+
+### 新方案（仅竖直方向）
+
+`computeBadgePlacement` 现在只返回**投影锚点本身**（`x` 为牌中心，`y` 为原始投影 y），
+不再在纯函数里减 lift；竖直位置在徽章**实测尺寸**之后按下面的式子得出：
+
+```
+tileTop  = anchorY - tileTopOffset            # 锚点→牌顶边
+top      = tileTop - badgeHeight - gap        # 徽章底边贴在牌顶上方
+bottom   = tileTop - gap
+```
+
+- `tileTopOffset = round(frameHeight × 0.0694)`（`TILE_TOP_OFFSET_OF_FRAME_HEIGHT`）。
+  0.0694 = 75/1080，是**同一帧的日志锚点与截图牌顶**唯一对得上的量；按帧高归一化，
+  因此随分辨率/密度线性缩放（1440 高 → 100 px）。
+- `badgeHeight` 不再猜：`createBadgeCard()` 之后**先同步 `measure(AT_MOST frameWidth,
+  AT_MOST frameHeight)`**，再 `addView` 并用 `measuredHeight` 计算 `top`，并将
+  `LayoutParams.height` 固定为该高度。这样避免了"刚 addView 时 width=height=0"以及
+  `post` 第二轮被新 render 的 generation 顶掉（前两轮的坑）。
+- `gap = 1dp`；`top` 会被夹在 `[0, frameHeight - height]`；若牌顶以上空间不足，
+  徽章高度收缩到可用空间；仍低于 20 px（1080p 尺度）则**跳过该徽章并记
+  `BADGE_SKIPPED`**，而不是画到牌面上。
+- 只改竖直；`x` 仍为 `centerX - badgeWidth/2`（夹在 2 px 内缩），投影、相机、配对不变。
+
+### 为什么不用"牌高比例"
+
+`estimateCardHeightPx()` 仍保留，但它只用于**记录**（`BADGE_VERTICAL cardH=…`）与
+合理性判断。原因是实测样本里同一行牌之间的 `ny` 差很小（0.008~0.021，均值约 0.015，
+即约 16 px），由此估出的"卡高"只有 48 px；若用它乘 0.70，锚点→牌顶只有约 34 px，
+徽章仍会低 40 px。也就是说，在 `ortho1/camera` 这台相机下**坐标样本本身不足以反推牌高**，
+帧高归一化才是唯一有实测佐证的量。
+
+### 新增诊断
+
+`BADGE_PLACED` 现在报告真实可见的徽章数；新增一条 `BADGE_VERTICAL`：
+`anchor=997;cardH=48;off=75;badgeH=72;gap=1;top=852;skipped=0;frameH=1080`。
+核对方式：`top + badgeH == anchor - off - gap`，且该值应等于截图里对应牌的牌顶。
+`DiagnosticsStore` / `GeometryTrace` 已把 `anchor/cardH/off/badgeH/gap/top/skipped/frameH`
+加入结构化白名单，不会再被折进 `reason` 并被 64 字符截断。
+
+### 验证与验证边界
+
+- 新增 instrumented 用例（纯函数，无需真机）：
+  - `computeBadgeTop`：`anchor=997, off=75, badgeH=70, gap=0` → `top=852, bottom=922`；
+    徽章更高时 top 更小、底边不变；1440 高时 `off=100`；底部/顶部/退化帧的夹取与跳过。
+  - `estimateCardHeightPx`：同排用步距估、抽牌行用 dy 估、异常值夹取、单张无法定标。
+  - 整链路：设备坐标 → 放置 → 竖直公式，断言每枚徽章底边 == 牌顶。
+  - 既有用例改为断言 `computeBadgePlacement` 返回**未抬升**的原始锚点
+    （`0.28→(545,972)`、`0.7406→(1640,988)`）。
+- Lua 资产未改动，`lua5.1 tools/tests/test_auto_discard.lua` 61 项不受影响。
+
+### 局限（务必知晓）
+
+- 0.0694 是在**这一台设备 + `ortho1/camera` 这台相机 + 该游戏版本**上，用日志锚点与
+  截图牌顶对齐得到的。换相机、换游戏 UI 缩放、换纵横比后该比值可能不同；届时
+  应看 `BADGE_VERTICAL` 的 `anchor/off/top` 与截图重新定标，而不是调徽章字号。
+- 目前只有"手牌在下缘、横向布局"这一种情况被验证；竖屏/其他牌桌布局未验证。
+- 本轮**没有真机肉眼确认**，只保证编译与纯函数断言。

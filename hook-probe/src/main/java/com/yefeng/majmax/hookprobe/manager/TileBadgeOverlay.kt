@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
+import android.view.View
 import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -51,8 +52,56 @@ internal class TileBadgeOverlay(private val context: Context) {
             "P" to "5z", "F" to "6z", "C" to "7z",
         )
 
-        /** Badge anchor sits this fraction of the overlay height above the tile top. */
-        private const val BADGE_LIFT_FRACTION = 0.0333f
+        /**
+         * Distance, as a fraction of the rendered frame height, from the projected tile
+         * anchor (Unity-normalized `ny` of the tile's own transform) up to the visual
+         * **top edge** of that tile.
+         *
+         * The anchor is not the tile's top edge: the game projects a point inside the
+         * card, so a badge placed at the raw anchor lands on the tile face. Measured on
+         * the reference device (2376x1080 render, overlay frame 2256x1080 at origin
+         * 120, game build `lastUpdate 2026-11-03 14:28:47`): the live log reports
+         * `ny = 0.9228` → anchorY = 997 px, while the matching screenshot shows the
+         * hand tile's top edge at y ≈ 922 px — a 75 px anchor→tile-top distance
+         * (75 / 1080 = 0.0694 of the frame height).
+         *
+         * Deliberately the coordinate-normalized ratio, not a fraction of the card
+         * height: the same coordinate payload's camera perspective compresses `ny`
+         * differences between tiles (~16 px from row to row in that log), so a card
+         * height re-estimated from those differences came out at ~48 px and left the
+         * badge ~40 px too low. The frame-normalized distance is the one quantity the
+         * log and the screenshot agree on. It scales with resolution and density but is
+         * tied to the camera the projection was taken with.
+         */
+        private const val TILE_TOP_OFFSET_OF_FRAME_HEIGHT = 0.0694f
+
+        /**
+         * Sanity band for the derived card height when it is estimated from a sample
+         * ([estimateCardHeightPx]) — a card is a small but visible fraction of the hand
+         * area. The estimate is used to *report* the calibration and to reject a sample
+         * that cannot be a hand at all; it does not move the offset above.
+         */
+        private const val CARD_HEIGHT_MIN_OF_FRAME = 0.045f
+        private const val CARD_HEIGHT_MAX_OF_FRAME = 0.16f
+
+        /** Small air gap between the badge's bottom edge and the tile's top edge. */
+        private const val BADGE_GAP_DP = 1
+
+        /**
+         * Typographic hand-card aspect ratio for a tile (height / width ≈ 1.36).
+         * Used only to convert a measured *width* step between tiles into a card
+         * height when no height sample is available.
+         */
+        private const val HAND_CARD_ASPECT = 1.36f
+
+        /**
+         * Drops and re-arm padding (px at 1080p, scaled). A badge is never pushed off
+         * the matching tile: if its top would leave the frame it shrinks to the room
+         * above the tile, and if it still does not fit it is skipped and reported.
+         */
+        private const val REFERENCE_FRAME_HEIGHT = 1080f
+        private const val EDGE_INSET_REF = 2f
+        private const val MIN_BADGE_HEIGHT_REF = 20f
 
         /**
          * Filters a raw `hand_coords` array into valid in-viewport tiles plus a
@@ -111,17 +160,127 @@ internal class TileBadgeOverlay(private val context: Context) {
         }
 
         internal data class BadgePlacement(
+            /**
+             * handIndex -> projected tile anchor in overlay-local pixels: the tile's
+             * `x` centre and the raw projected `y`. The anchor deliberately carries
+             * **no** lift: the vertical offset between that anchor and the visual top
+             * edge of the card is applied later, once the badge view has been measured
+             * (see [computeBadgeTop]).
+             */
             val placed: Map<Int, Pair<Int, Int>>,
             val ambiguous: Int,
             val missing: Int,
             val pairingTrace: String,
+            /**
+             * Calibrated card height in overlay-local pixels for this render, derived
+             * from the coordinates themselves; null when the sample is too weak to
+             * trust (a single visible tile with no usable frame geometry).
+             */
+            val cardHeightPx: Int? = null,
+        ) {
+            /** Raw projected `y` of the newest anchor, for the vertical trace. */
+            fun anchorY(): Int? = placed.values.maxOfOrNull { it.second }
+        }
+
+        /**
+         * Estimates the on-screen height of one hand card from the coordinate sample
+         * itself. Used for the vertical trace (`BADGE_VERTICAL cardH=…`) so the real
+         * card size on any device is visible next to the placement; the anchor→tile-top
+         * offset itself is frame-normalized (see
+         * [TILE_TOP_OFFSET_OF_FRAME_HEIGHT]) because this estimate proved too small on
+         * the reference camera (two tiles on nearly the same `ny` row).
+         *
+         * Two independent estimates, best first:
+         *
+         *  1. `dy`: tiles that report a *lower* `ny` than the first tile in the sample
+         *     are drawn (or picked up, i.e. the drawn tile) above the resting row; the
+         *     mean difference approximates one card height in source pixels.
+         *  2. `dx`: the median horizontal step between adjacent tiles is the card pitch
+         *     (no overlap in the live game), i.e. one card width on screen.
+         *
+         * The chosen estimate is clamped to a plausible band for a hand card
+         * ([CARD_HEIGHT_MIN_OF_FRAME]..[CARD_HEIGHT_MAX_OF_FRAME] of the render
+         * height) so a malformed sample can never report an absurd card size, and the
+         * source→overlay scale is applied so the result is in overlay-local pixels.
+         *
+         * Returns null when neither estimate is available.
+         */
+        internal fun estimateCardHeightPx(
+            views: List<HookedTile>,
+            mapping: HandCoordinateMapper.Mapping,
+        ): Int? {
+            if (!HandCoordinateMapper.isUsable(mapping) || views.isEmpty()) return null
+            val scaleY = mapping.viewportH.toDouble() / mapping.sourceH
+            val referenceNy = views[0].normY
+            val shorter = views.drop(1).map { referenceNy - it.normY }.filter { it > 0.0 }
+            val raw = when {
+                shorter.isNotEmpty() -> shorter.average() * mapping.sourceH
+                views.size >= 2 -> {
+                    val steps = views.zipWithNext { a, b -> kotlin.math.abs(b.normX - a.normX) }
+                        .filter { it > 0.0 }
+                        .sorted()
+                    if (steps.isEmpty()) return null
+                    val pitch = steps[steps.size / 2] * mapping.sourceW
+                    pitch / HAND_CARD_ASPECT
+                }
+                else -> return null
+            }
+            val minH = CARD_HEIGHT_MIN_OF_FRAME.toDouble() * mapping.sourceH
+            val maxH = CARD_HEIGHT_MAX_OF_FRAME.toDouble() * mapping.sourceH
+            val clamped = raw.coerceIn(minH, maxH)
+            return kotlin.math.round(clamped * scaleY).toInt()
+        }
+
+        /**
+         * Vertical placement of one badge, all in overlay-local pixels.
+         *
+         * The reference framing puts the badge *flush on the tile's top edge*:
+         * `badgeBottom == tileTop - gap`, so `badgeTop = anchorY - tileTopOffset -
+         * badgeHeight - gap`. The previous code instead lifted the anchor by a fixed
+         * fraction of the frame height and treated that lift as the *top* of the badge,
+         * which ignored the badge's own height and pushed the badge down over the tile
+         * face (device log: anchorY 997 → top 961 with the tile top at ~922).
+         *
+         * `tileTopOffsetPx` is the measured anchor→tile-top distance
+         * ([tileTopOffsetPx] of the frame height), i.e. 75 px at 1080p.
+         */
+        internal data class BadgeVertical(
+            val top: Int,
+            val height: Int,
+            val tileTop: Int,
         )
+
+        internal fun computeBadgeTop(
+            anchorY: Int,
+            tileTopOffsetPx: Int,
+            badgeHeightPx: Int,
+            gapPx: Int,
+            frameHeight: Int,
+        ): BadgeVertical? {
+            if (frameHeight <= 0) return null
+            val tileTop = anchorY - tileTopOffsetPx
+            val desiredTop = tileTop - badgeHeightPx - gapPx
+            val maxHeight = tileTop - gapPx
+            if (maxHeight <= 0) return null
+            val height = minOf(badgeHeightPx, maxHeight)
+            // Keep the whole badge inside the frame: if the row sits high enough that
+            // the badge would leave the top edge, shrink it to the available room
+            // rather than moving it down onto the tile.
+            val top = desiredTop.coerceIn(0, frameHeight - height)
+            return BadgeVertical(top, height, tileTop)
+        }
+
+        /**
+         * Anchor→tile-top distance in overlay-local px for a frame of [frameHeight] px,
+         * derived from [TILE_TOP_OFFSET_OF_FRAME_HEIGHT]: 75 px at 1080p.
+         */
+        internal fun tileTopOffsetPx(frameHeight: Int): Int =
+            (frameHeight * TILE_TOP_OFFSET_OF_FRAME_HEIGHT).roundToInt()
 
         internal fun computeBadgePlacement(
             hints: List<DiscardHint>,
             views: List<HookedTile>,
             mapping: HandCoordinateMapper.Mapping,
-            frameHeight: Int,
         ): BadgePlacement {
             val placed = HashMap<Int, Pair<Int, Int>>(hints.size)
             if (hints.isEmpty() || views.isEmpty()) {
@@ -130,7 +289,6 @@ internal class TileBadgeOverlay(private val context: Context) {
             if (!HandCoordinateMapper.isUsable(mapping)) {
                 return BadgePlacement(placed, 0, 0, "")
             }
-            val lift = (frameHeight * BADGE_LIFT_FRACTION).roundToInt()
 
             // Bounded hint→view pairing trace so a real device can answer "which hint
             // went missing/ambiguous and why" without guessing. Only the tile keys and
@@ -163,7 +321,7 @@ internal class TileBadgeOverlay(private val context: Context) {
                         usedViews.add(idx)
                         val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
                         if (local != null) {
-                            placed[hint.handIndex] = local.first to (local.second - lift).coerceAtLeast(0)
+                            placed[hint.handIndex] = local.first to local.second
                         } else {
                             missing++
                         }
@@ -174,7 +332,8 @@ internal class TileBadgeOverlay(private val context: Context) {
                     pairingTrace.append(hint.tile).append('=').append(key).append(':').append(count)
                 }
             }
-            return BadgePlacement(placed, ambiguous, missing, pairingTrace.toString())
+            return BadgePlacement(placed, ambiguous, missing, pairingTrace.toString(),
+                estimateCardHeightPx(views, mapping))
         }
 
         /**
@@ -778,7 +937,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         val placement = if (hookedTiles.isEmpty()) {
             BadgePlacement(emptyMap(), 0, 0, "")
         } else {
-            computeBadgePlacement(hints, hookedTiles, mapping, frameHeight)
+            computeBadgePlacement(hints, hookedTiles, mapping)
         }
 
         if (placement.ambiguous > 0 || placement.missing > 0) {
@@ -793,18 +952,44 @@ internal class TileBadgeOverlay(private val context: Context) {
             )
         }
 
+        val cardHeight = placement.cardHeightPx
+        val tileTopOffset = tileTopOffsetPx(frameHeight)
+        val gap = dp(BADGE_GAP_DP)
+        val edgeInset = pxFromReference(EDGE_INSET_REF, frameHeight)
+        val minBadgeHeight = pxFromReference(MIN_BADGE_HEIGHT_REF, frameHeight)
+
         val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
+        var skippedHeight = 0
+        // Measure each badge synchronously with real constraints *before* adding it to
+        // the frame: a freshly attached view still reports width = height = 0, and the
+        // vertical placement needs the real badge height to put its bottom edge on the
+        // tile. Measuring first is what lets the top be computed in the same pass,
+        // instead of a `post`-style second pass that a newer render could cancel.
+        val widthSpec = View.MeasureSpec.makeMeasureSpec(frameWidth, View.MeasureSpec.AT_MOST)
+        val heightSpec = View.MeasureSpec.makeMeasureSpec(frameHeight, View.MeasureSpec.AT_MOST)
         for ((rank, hint) in hints.withIndex()) {
-            val targetX = placement.placed[hint.handIndex] ?: continue
+            val target = placement.placed[hint.handIndex] ?: continue
             val badgeView = createBadgeCard(hint, rank)
+            badgeView.measure(widthSpec, heightSpec)
+            if (badgeView.measuredHeight <= 0) {
+                skippedHeight++
+                continue
+            }
             frame.addView(badgeView, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT
             ))
-            badgeTargets.add(Triple(badgeView, targetX, hint))
+            badgeTargets.add(Triple(badgeView, target, hint))
         }
 
-        if (badgeTargets.isEmpty()) {
+        if (skippedHeight > 0) {
+            GeometryTrace.note(
+                "BADGE_SKIPPED",
+                "reason=measured_zero;skipped=$skippedHeight;placed=${placement.placed.size}"
+            )
+        }
+
+        if (badgeTargets.isEmpty() && skippedHeight == 0) {
             // No trustworthy tile anchor: show the floating text panel only rather
             // than drawing a badge over the wrong tile.
             GeometryTrace.note(
@@ -819,29 +1004,59 @@ internal class TileBadgeOverlay(private val context: Context) {
         // One bounded record per render with the *final* pixel target of every
         // badge plus the hand index and frame bounds it was computed against.
         val placementTrace = StringBuilder()
+        // Vertical calibration actually used, so a device log can be checked against
+        // the screenshot without re-deriving it (cardH / tileTop offset / gap).
+        var usedOffset = 0
         for ((badgeView, target, _) in badgeTargets) {
             if (badgeView.parent !== frame) continue
-            val (centerX, topY) = target
-            val badgeWidth = badgeView.width
-            val badgeHeight = badgeView.height
-            val desiredLeft = (centerX - badgeWidth / 2)
-                .coerceIn(dp(2), (frame.width - badgeWidth - dp(2)).coerceAtLeast(0))
-            val desiredTop = topY.coerceIn(dp(2), (frame.height - badgeHeight - dp(2)).coerceAtLeast(0))
-
-            val lp = badgeView.layoutParams as FrameLayout.LayoutParams
-            if (lp.leftMargin != desiredLeft || lp.topMargin != desiredTop) {
-                lp.leftMargin = desiredLeft
-                lp.topMargin = desiredTop
-                badgeView.layoutParams = lp
+            val (centerX, anchorY) = target
+            val badgeWidth = badgeView.measuredWidth.takeIf { it > 0 } ?: badgeView.width
+            val badgeHeight = badgeView.measuredHeight.takeIf { it > 0 } ?: badgeView.height
+            // Bottom edge sits on the tile's top edge (`tileTop - gap`), never on the
+            // tile face: the badge's own height is subtracted here, not baked into a
+            // fixed lift. Falls back to the calibrated card height when this render had
+            // no coordinate sample strong enough to estimate one.
+            val probe = computeBadgeTop(
+                anchorY = anchorY,
+                tileTopOffsetPx = tileTopOffset,
+                badgeHeightPx = badgeHeight,
+                gapPx = gap,
+                frameHeight = frameHeight,
+            )
+            if (probe == null) {
+                badgeView.visibility = View.GONE
+                skippedHeight++
+                continue
             }
+            usedOffset = tileTopOffset
+            if (probe.height < badgeHeight && probe.height < minBadgeHeight) {
+                // Not enough room above the tile for a legible badge: skip rather than
+                // cover the tile it is supposed to point at.
+                badgeView.visibility = View.GONE
+                skippedHeight++
+                continue
+            }
+
+            val desiredLeft = (centerX - badgeWidth / 2)
+                .coerceIn(edgeInset, (frameWidth - badgeWidth - edgeInset).coerceAtLeast(0))
+
+            val params = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+            )
+            params.leftMargin = desiredLeft
+            params.topMargin = probe.top
+            params.height = probe.height
+            badgeView.layoutParams = params
         }
-        for ((badgeView, _, hint) in badgeTargets) {
+        for ((badgeView, target, hint) in badgeTargets) {
             if (badgeView.parent !== frame) continue
+            if (badgeView.visibility != View.VISIBLE) continue
             val lp = badgeView.layoutParams as FrameLayout.LayoutParams
             if (placementTrace.length < 200) {
                 if (placementTrace.isNotEmpty()) placementTrace.append(' ')
                 placementTrace.append(hint.tile)
-                    .append('@').append(lp.leftMargin + badgeView.width / 2)
+                    .append('@').append(lp.leftMargin + (badgeView.measuredWidth / 2))
                     .append(',').append(lp.topMargin)
                     .append(':').append(hint.handIndex)
             }
@@ -849,12 +1064,29 @@ internal class TileBadgeOverlay(private val context: Context) {
         if (placementTrace.isNotEmpty()) {
             GeometryTrace.note(
                 "BADGE_PLACED",
-                "placed=${badgeTargets.size};frame=${frame.width}x${frame.height};" +
+                "placed=${badgeTargets.count { it.first.visibility == View.VISIBLE }};" +
+                    "frame=${frame.width}x${frame.height};" +
                     "hand=${hand.size};views=${hookedTiles.size};targets=${placementTrace};" +
                     "sourceW=${mapping.sourceW};sourceH=${mapping.sourceH};" +
                     "frameOrigin=${mapping.frameOriginX},${mapping.frameOriginY};" +
                     "viewport=${mapping.viewportW}x${mapping.viewportH}" +
                     "@${mapping.viewportLeft},${mapping.viewportTop}"
+            )
+            // Vertical calibration, so a device log can be checked against the
+            // screenshot without re-deriving it: anchorY is the raw projected tile y,
+            // off the frame-normalized anchor->tile-top distance actually applied,
+            // cardH the card height estimated from this coordinate sample (reported,
+            // not used for the offset), badgeH the measured badge height. The badge
+            // top must equal anchor - off - badgeH - gap.
+            val sampleTop = (badgeTargets.firstOrNull { it.first.visibility == View.VISIBLE }
+                ?.first?.layoutParams as? FrameLayout.LayoutParams)?.topMargin ?: -1
+            val sampleBadgeH = badgeTargets.firstOrNull { it.first.visibility == View.VISIBLE }
+                ?.first?.measuredHeight ?: 0
+            GeometryTrace.note(
+                "BADGE_VERTICAL",
+                "anchor=${placement.anchorY() ?: -1};cardH=${cardHeight ?: 0};off=$usedOffset;" +
+                    "badgeH=$sampleBadgeH;gap=$gap;top=$sampleTop;" +
+                    "skipped=$skippedHeight;frameH=$frameHeight"
             )
         }
         return true
@@ -865,7 +1097,7 @@ internal class TileBadgeOverlay(private val context: Context) {
         gravity = Gravity.CENTER
         isClickable = false
         isFocusable = false
-        setPadding(dp(4), dp(1), dp(4), dp(1))
+        setPadding(dp(6), dp(1), dp(6), dp(1))
 
         val bgColor = when (rank) {
             0 -> primaryColor   // Solid Orange/Amber for #1
@@ -920,6 +1152,13 @@ internal class TileBadgeOverlay(private val context: Context) {
     }
 
     private fun dp(value: Int) = (value * display.density).roundToInt()
+
+    /**
+     * Scales a value calibrated on the 1080p reference frame to this overlay's height,
+     * so paddings and minimum sizes keep their visual proportion on other resolutions.
+     */
+    private fun pxFromReference(referencePx: Float, frameHeight: Int): Int =
+        (referencePx * (frameHeight.toFloat() / REFERENCE_FRAME_HEIGHT)).roundToInt()
 
     private fun detach() {
         val frame = root ?: run {
