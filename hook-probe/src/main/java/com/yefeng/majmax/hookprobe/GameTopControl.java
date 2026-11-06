@@ -356,10 +356,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        // Draw the full touch target so its visible boundary matches the tappable area.
-        // Inset from the top edge to avoid notification gestures.
-        handleTab = new TabView(activity, dp(activity, 48),
-            GameTopUi.round(activity, 18, GameTopUi.CARD, 0x802F6FE4, 1));
+        // Reference proportions: ~18.5% of screen width, ~4.4% of height visible.
+        // The capsule body is drawn above the viewport; only its curved bottom remains.
+        handleTab = new TabView(activity,
+            GameTopUi.round(activity, 26, GameTopUi.CARD, 0xCCFFFFFF, 1));
         handleTab.setContentDescription("展开雀魂助手");
         handleTab.setOnClickListener(view -> {
             stage = STAGE_CAPSULE;
@@ -367,8 +367,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             applyState();
         });
         FrameLayout.LayoutParams handleParams = new FrameLayout.LayoutParams(
-            dp(activity, 128), dp(activity, 48), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        handleParams.topMargin = dp(activity, 12);
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        handleParams.topMargin = 0;
         root.addView(handleTab, handleParams);
 
         // Full "雀魂助手" capsule, ~160x44dp, just below the top edge.
@@ -585,45 +586,41 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    /** Visible 128x48dp handle matching its touch target, inset from the system edge. */
+    /** Top-clipped capsule: visible and touchable bounds use the reference proportions. */
     private static final class TabView extends View {
-        private final int sliver;
-        private final int hitWidth;
-        private final android.graphics.Paint gripPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
         private final Drawable background;
 
-        TabView(Context context, int sliverPx, GradientDrawable pill) {
+        TabView(Context context, GradientDrawable pill) {
             super(context);
-            sliver = Math.max(1, sliverPx);
-            hitWidth = GameTopUi.dp(context, 128);
-            gripPaint.setColor(0xFF2F6FE4);
             background = pill;
-            // Never focusable: opening the menu or waiting for a reply must not pull
-            // focus away from the game window or a dialog the game is showing.
             setFocusable(false);
             setFocusableInTouchMode(false);
             setClickable(true);
         }
 
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
-            int width = resolveSize(hitWidth, widthSpec);
-            setMeasuredDimension(width, resolveSize(sliver, heightSpec));
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            int availableWidth = metrics.widthPixels;
+            int availableHeight = metrics.heightPixels;
+            if (getRootView().getWidth() > 0) availableWidth = getRootView().getWidth();
+            if (getRootView().getHeight() > 0) availableHeight = getRootView().getHeight();
+            int width = Math.max(GameTopUi.dp(getContext(), 72), Math.round(availableWidth * .185f));
+            int height = Math.max(GameTopUi.dp(getContext(), 12), Math.round(availableHeight * .044f));
+            height = Math.min(height, GameTopUi.dp(getContext(), 22));
+            setMeasuredDimension(resolveSize(width, widthSpec), resolveSize(height, heightSpec));
         }
 
         @Override protected void onDraw(Canvas canvas) {
-            background.setBounds(0, 0, getWidth(), getHeight());
+            // A full rounded capsule extends off-screen, matching the reference's
+            // shallow lower arc rather than a detached floating rectangle.
+            int fullHeight = Math.max(getHeight() * 3, GameTopUi.dp(getContext(), 48));
+            background.setBounds(0, getHeight() - fullHeight, getWidth(), getHeight());
             background.draw(canvas);
-            float halfWidth = GameTopUi.dp(getContext(), 22);
-            float halfHeight = GameTopUi.dp(getContext(), 2);
-            float cx = getWidth() / 2f;
-            float cy = getHeight() / 2f;
-            canvas.drawRoundRect(cx - halfWidth, cy - halfHeight,
-                cx + halfWidth, cy + halfHeight, halfHeight, halfHeight, gripPaint);
         }
 
         @Override public void setPressed(boolean pressed) {
             super.setPressed(pressed);
-            setAlpha(pressed ? .6f : 1f);
+            setAlpha(pressed ? .65f : 1f);
         }
     }
 
