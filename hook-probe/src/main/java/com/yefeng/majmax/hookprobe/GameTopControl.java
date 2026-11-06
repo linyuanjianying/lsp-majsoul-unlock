@@ -356,10 +356,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        // Keep the visual tab small but give it a full-sized touch target below
-        // the top edge, where tapping does not compete with notification gestures.
+        // Draw the full touch target so its visible boundary matches the tappable area.
+        // Inset from the top edge to avoid notification gestures.
         handleTab = new TabView(activity, dp(activity, 48),
-            GameTopUi.round(activity, 7, GameTopUi.CARD, 0x402F6FE4, 1));
+            GameTopUi.round(activity, 18, GameTopUi.CARD, 0x802F6FE4, 1));
         handleTab.setContentDescription("展开雀魂助手");
         handleTab.setOnClickListener(view -> {
             stage = STAGE_CAPSULE;
@@ -585,20 +585,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    /** Small visual handle inside a 128x48dp touch target, inset from the system edge. */
+    /** Visible 128x48dp handle matching its touch target, inset from the system edge. */
     private static final class TabView extends View {
         private final int sliver;
         private final int hitWidth;
-        private final int pillWidth;
-        private final int pillHeight;
+        private final android.graphics.Paint gripPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
         private final Drawable background;
 
         TabView(Context context, int sliverPx, GradientDrawable pill) {
             super(context);
             sliver = Math.max(1, sliverPx);
             hitWidth = GameTopUi.dp(context, 128);
-            pillWidth = GameTopUi.dp(context, 44);
-            pillHeight = GameTopUi.dp(context, 10);
+            gripPaint.setColor(0xFF2F6FE4);
             background = pill;
             // Never focusable: opening the menu or waiting for a reply must not pull
             // focus away from the game window or a dialog the game is showing.
@@ -613,11 +611,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
 
         @Override protected void onDraw(Canvas canvas) {
-            // Draw only the slim tab; the transparent area below stays tappable.
-            float left = (getWidth() - pillWidth) / 2f;
-            float right = left + pillWidth;
-            background.setBounds(Math.round(left), 0, Math.round(right), pillHeight);
+            background.setBounds(0, 0, getWidth(), getHeight());
             background.draw(canvas);
+            float halfWidth = GameTopUi.dp(getContext(), 22);
+            float halfHeight = GameTopUi.dp(getContext(), 2);
+            float cx = getWidth() / 2f;
+            float cy = getHeight() / 2f;
+            canvas.drawRoundRect(cx - halfWidth, cy - halfHeight,
+                cx + halfWidth, cy + halfHeight, halfHeight, halfHeight, gripPaint);
         }
 
         @Override public void setPressed(boolean pressed) {
