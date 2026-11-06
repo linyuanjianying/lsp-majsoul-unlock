@@ -356,10 +356,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        // Half-hidden handle: a real ~8dp sliver hanging from the top edge. Because the
-        // view's own height is the visible height, the hit rect matches what the user
-        // sees; no translation is involved, so nothing can mis-report its bounds.
-        handleTab = new TabView(activity, dp(activity, 8),
+        // Keep the visual tab small but give it a full-sized touch target below
+        // the top edge, where tapping does not compete with notification gestures.
+        handleTab = new TabView(activity, dp(activity, 48),
             GameTopUi.round(activity, 7, GameTopUi.CARD, 0x402F6FE4, 1));
         handleTab.setContentDescription("展开雀魂助手");
         handleTab.setOnClickListener(view -> {
@@ -367,8 +366,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             restartIdleTimer();
             applyState();
         });
-        root.addView(handleTab, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(activity, 8), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+        FrameLayout.LayoutParams handleParams = new FrameLayout.LayoutParams(
+            dp(activity, 128), dp(activity, 48), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        handleParams.topMargin = dp(activity, 12);
+        root.addView(handleTab, handleParams);
 
         // Full "雀魂助手" capsule, ~160x44dp, just below the top edge.
         capsule = cell(activity, 13, GameTopUi.INK_MUTED, false);
@@ -584,11 +585,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    /**
-     * The half-hidden tab. The view itself is only {@code sliver} pixels tall, so the
-     * touchable rect is exactly the strip the user can see; it merely keeps a wider
-     * hit box around that strip and draws the translucent rounded pill centred in it.
-     */
+    /** Small visual handle inside a 128x48dp touch target, inset from the system edge. */
     private static final class TabView extends View {
         private final int sliver;
         private final int hitWidth;
@@ -599,8 +596,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         TabView(Context context, int sliverPx, GradientDrawable pill) {
             super(context);
             sliver = Math.max(1, sliverPx);
-            hitWidth = GameTopUi.dp(context, 48);
-            pillWidth = GameTopUi.dp(context, 36);
+            hitWidth = GameTopUi.dp(context, 128);
+            pillWidth = GameTopUi.dp(context, 44);
             pillHeight = GameTopUi.dp(context, 10);
             background = pill;
             // Never focusable: opening the menu or waiting for a reply must not pull
@@ -616,9 +613,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
 
         @Override protected void onDraw(Canvas canvas) {
-            // Only the lower part of a slightly taller pill is on screen: the rounded
-            // bottom edge shows as a hanging tab and the top is cut by the window edge,
-            // so no translation is used and the view is exactly as tall as the strip.
+            // Draw only the slim tab; the transparent area below stays tappable.
             float left = (getWidth() - pillWidth) / 2f;
             float right = left + pillWidth;
             background.setBounds(Math.round(left), 0, Math.round(right), pillHeight);
