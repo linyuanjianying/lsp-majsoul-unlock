@@ -155,6 +155,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                 val ack = rows.getJSONObject(index)
                 when (ack.optString("state")) {
                     "hand_coords" -> continue
+                    "rematch_step", "rematch_again", "rematch_confirmed", "rematch_paused", "rematch_failed" -> continue
                     "ack_oversize" -> {
                         // The native bridge refuses payloads beyond its transport limit.
                         // Report it instead of ignoring it: a dropped capture otherwise

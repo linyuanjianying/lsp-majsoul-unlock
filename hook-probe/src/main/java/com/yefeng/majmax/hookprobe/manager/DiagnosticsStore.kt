@@ -46,7 +46,7 @@ internal object DiagnosticsStore {
         "COORD_UNSTABLE", "BADGE_PLACED",
     )
     private val levels = setOf("DEBUG", "INFO", "WARN", "ERROR")
-    private val components = setOf("hook.entry", "hook.native", "hook.capture", "assistant.service", "assistant.model", "assistant.engine", "assistant.autoplay", "assistant.hint", "manager")
+    private val components = setOf("hook.entry", "hook.native", "hook.capture", "assistant.service", "assistant.model", "assistant.engine", "assistant.autoplay", "assistant.rematch", "assistant.hint", "manager")
     private val allowedFieldNames = setOf("api", "moduleVersion", "count", "reason",
         "importId", "stage", "format", "bytes", "elapsedMs", "nativeStatus", "errorClass", "errorMessage",
         // Badge geometry diagnostics: fixed-shape counters, sizes, and the tile

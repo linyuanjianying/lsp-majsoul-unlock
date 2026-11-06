@@ -186,6 +186,7 @@ class AiOverlayService : Service() {
     private var overlay: AiFloatingWindow? = null
     private var badges: TileBadgeOverlay? = null
     @Volatile private var fallbackLogged = false
+    /** One diagnostics record per rematch ack state, for the lifetime of the service. */
     private val autoUiTick = object : Runnable {
         override fun run() {
             if (!alive.get()) return
@@ -343,12 +344,40 @@ class AiOverlayService : Service() {
         if (acks != null && acks.contains("\"hand_coords\"")) parseHandCoords(acks)
         if (acks != null && acks.contains("\"hand_geometry\"")) parseHandGeometry(acks)
         if (acks != null && acks.contains("\"button_coords\"")) parseButtonCoords(acks)
+        if (acks != null && acks.contains("rematch_")) noteRematchAcks(acks)
         val command = auto.poll(acks)
         val delay = AutoDelaySettings.read(this)
         val response = if (command != null && !demoMode.get()) JSONObject(command).put("unattended", true)
         else JSONObject().put("control", "mode").put("enabled", auto.isEnabled() && !demoMode.get())
             .put("resync", auto.needsSync()).put("nonce", SystemClock.elapsedRealtime())
-        return response.put("delayMinMs", delay.minTenths * 100).put("delayMaxMs", delay.maxTenths * 100).toString()
+        // Experimental auto-rematch opt-in. Sent on every heartbeat (action frame and
+        // mode frame alike) so the game observes a revocation on the next poll. Gated
+        // by the same switches as unattended mode: the stored opt-in alone never arms
+        // anything, and a self-test session must never drive the live game.
+        val rematch = autoRematchWanted()
+        return response.put("delayMinMs", delay.minTenths * 100).put("delayMaxMs", delay.maxTenths * 100)
+            .put("autoRematch", rematch).toString()
+    }
+
+    /** Opt-in AND unattended AND not in demo: the only state where rematch may be true. */
+    private fun autoRematchWanted(): Boolean =
+        !demoMode.get() && auto.isEnabled() && AutoRematchSettings.read(this)
+
+    /**
+     * Bounded diagnostics for the experimental rematch acks. Only the adapter's fixed
+     * `rematch_*` vocabulary is recorded (state plus a shortened reason) and emitted only on transitions by the Lua adapter.
+     */
+    private fun noteRematchAcks(acks: String) {
+        runCatching {
+            val rows = org.json.JSONArray(acks)
+            for (index in 0 until rows.length()) {
+                val row = rows.getJSONObject(index)
+                val state = row.optString("state")
+                if (!state.startsWith("rematch_")) continue
+                DiagnosticsStore.appendAssistant(this, "INFO", "assistant.rematch", state,
+                    JSONObject().put("reason", row.optString("reason").take(120)))
+            }
+        }.onFailure { GeometryTrace.note("REMATCH_ACK", "reason=decode_failed") }
     }
 
     private fun parseHandCoords(acks: String) {

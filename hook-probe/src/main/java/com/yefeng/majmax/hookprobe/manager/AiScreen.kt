@@ -50,6 +50,7 @@ internal fun AiScreen(padding: PaddingValues) {
     var displayMode by remember { mutableStateOf(AssistantDisplayModeSettings.read(context)) }
     var showLicense by remember { mutableStateOf(false) }
     var autoDelay by remember { mutableStateOf(AutoDelaySettings.read(context)) }
+    var autoRematch by remember { mutableStateOf(AutoRematchSettings.read(context)) }
     var fourModel by remember { mutableStateOf(OnnxModelStore.info(context, 4)) }
     var threeModel by remember { mutableStateOf(OnnxModelStore.info(context, 3)) }
     var modelMessage by remember { mutableStateOf("支持 Akagi ONNX，以及实验性四麻/三麻 Mortal v4（ONNX/PTH/PT，单文件上限 ${OnnxModelStore.MAX_MODEL_MIB} MiB）。自动识别人数并保存到对应槽位；兼容的自定义模型仍需手动开启无人值守。模型仅保存在本机。") }
@@ -124,7 +125,19 @@ internal fun AiScreen(padding: PaddingValues) {
                 style = MaterialTheme.typography.bodySmall)
             Text("首次默认关闭；开启状态会保存。按 AI 首选操作，结算后继续下一局；断线或游戏退出后尝试恢复，取得完整牌局后继续。所有操作按上方范围等待。手动出牌或停止助手会关闭此模式。",
                 style = MaterialTheme.typography.bodySmall)
-            Text("关闭模式后可正常退出游戏；也可通过游戏内顶部菜单直接关闭，关闭时本应用服务不会停止。整场结束后不会自动创建新对局。", style = MaterialTheme.typography.bodySmall)
+            Text("关闭模式后可正常退出游戏；也可通过游戏内顶部菜单直接关闭，关闭时本应用服务不会停止。整场结束后是否继续匹配由下方独立开关控制。", style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("整场结束后自动匹配（实验性）", modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium)
+                Switch(checked = autoRematch, onCheckedChange = {
+                    autoRematch = it
+                    AutoRematchSettings.save(context, it)
+                }, modifier = Modifier.semantics {
+                    contentDescription = "整场结束后自动匹配（实验性）"
+                })
+            }
+            Text("默认关闭。仅在无人值守模式开启时生效，模型自检和关闭无人值守时都不会自动匹配。只调用游戏已有的结算、收益和下一局原按钮，不新增或伪造请求；遇到未知界面、对局中断或手动操作时暂停并等待。本场自动匹配失败或手动取消后不再重试；未知收益弹窗可能需要手动处理。",
+                style = MaterialTheme.typography.bodySmall)
         }
         Text("实验性 Mortal v4 支持四麻和三麻，可手动开启无人值守；特征含近似计算，尚未完成与上游的完整一致性验证。", style = MaterialTheme.typography.bodySmall)
         Text("策略模型", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)

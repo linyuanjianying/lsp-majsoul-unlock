@@ -66,6 +66,147 @@ local function install()
     end
     return true
 end
+
+-- Ranked rematch uses only the game's visible buttons and observed result pages.
+-- Never rebuild or replay a matchmaking RPC. Unknown/locked pages keep game control.
+local R = { generation = 0 }
+A.rematch = R
+function R.visible(o)
+    local g = o and (o.gameObject or (o.transform and o.transform.gameObject) or o)
+    return g and g.activeInHierarchy == true
+end
+function R.emit(state, reason)
+    ack('', 'rematch_' .. state, reason)
+end
+function R.cancel(reason)
+    if R.session then R.session.stopped = true; R.session.pending = nil end
+    if reason then R.emit('paused', reason) end
+end
+function R.installHooks()
+    local c = UI_GameEnd
+    if c and type(c.OnShow) == 'function' and not c._majmaxRematchShow then
+        c._majmaxRematchShow = true
+        local original = c.OnShow
+        function c:OnShow(callback, data, ...)
+            local result = original(self, callback, data, ...)
+            if not (data and data.reopen) then
+                R.generation = R.generation + 1
+                local value = data and data.game_end_result
+                R.session = value and type(value.players) == 'table' and #value.players > 0
+                    and { ui = self, generation = R.generation, seen = {} } or nil
+            end
+            return result
+        end
+    end
+    local c = UI_AnotherGameConfirm
+    if c and not c._majmaxRematchHooks then
+        -- Retry installation if this class is not fully loaded yet.
+        if type(c.Cancel) ~= 'function' or type(c.Confirm) ~= 'function' then return end
+        c._majmaxRematchHooks = true
+        local cancel, confirm = c.Cancel, c.Confirm
+        function c:Cancel(...)
+            R.cancel('manual_cancel')
+            return cancel(self, ...)
+        end
+        function c:Confirm(...)
+            if not R.executing then R.cancel('manual_confirm') end
+            return confirm(self, ...)
+        end
+    end
+end
+function R.mode(d)
+    local config = d and d.game_config
+    local mode = config and config.mode and config.mode.mode
+    return d and GameUtility and GameUtility.EMJ_Mode and d.mode == GameUtility.EMJ_Mode.play
+        and not d.duringReconnect and not d.time_stopped and config.category == 2
+        and (mode == 1 or mode == 2 or mode == 11 or mode == 12)
+        and config.meta and config.meta.mode_id
+end
+function R.delay(command)
+    local lo, hi = command.delayMinMs, command.delayMaxMs
+    if type(lo) ~= 'number' or type(hi) ~= 'number' or lo ~= lo or hi ~= hi
+        or lo < 0 or hi > 5000 or lo > hi or lo % 100 ~= 0 or hi % 100 ~= 0 then
+        lo, hi = 2000, 5000
+    end
+    return (lo == hi and lo or math.random(lo, hi)) / 1000
+end
+function R.act(command, now)
+    R.installHooks()
+    if not A.armed or command.autoRematch ~= true then
+        -- Revoking the lease cancels waiting actions, but never clears a manual stop.
+        if R.session then R.session.pending = nil end
+        return false
+    end
+    local session = R.session
+    local d = DesktopMgr and DesktopMgr.Inst
+    local mode = R.mode(d)
+    local net = MJNetMgr and MJNetMgr.Inst
+    if not session or not now or not mode then return false end
+    local ui = session.ui
+    local popup = UI_AnotherGameConfirm and UI_AnotherGameConfirm.Inst
+    local shown = R.visible(ui)
+    if not shown and not R.visible(popup) then return false end
+    -- Do not fall through to the old match's resync while final results are open.
+    if session.stopped or session.done then return true end
+    if not net or type(net.IsOK) ~= 'function' or not net:IsOK() then
+        session.pending = nil; return true
+    end
+    if session.againAt then
+        if now - session.againAt > 15 then R.cancel('confirmation_timeout'); return true end
+        if not R.visible(popup) or popup.locking or popup.enable ~= true then return true end
+        if mode ~= session.mode or popup.match_id ~= session.mode then R.cancel('match_mismatch'); return true end
+        session.done = true -- latch before invoking: a callback can hide/destroy the UI
+        R.executing = true
+        local ok = pcall(popup.Confirm, popup)
+        R.executing = nil
+        R.emit(ok and 'confirmed' or 'failed', ok and 'confirmation_invoked' or 'confirm_exception')
+        return true
+    end
+    if R.visible(popup) then return true end -- never confirm a manually opened popup
+    if not shown or ui.locking or ui.isDoAnimation then session.pending = nil; return true end
+    if R.visible(UI_GetReward and UI_GetReward.Inst) then session.pending = nil; return true end
+    local step = ui.step
+    local known = { [0]=true,[30]=true,[31]=true,[50]=true,[51]=true,[60]=true,
+        [70]=true,[80]=true,[90]=true,[91]=true,[100]=true }
+    if not known[step] then return true end
+    local again = ui.btn_again
+    local reward = UI_MJReward_Activity and UI_MJReward_Activity.Inst
+    if R.visible(reward) and reward.locking then session.pending = nil; return true end
+    local action = not R.visible(reward) and R.visible(again) and again.interactable ~= false and 'again' or 'next'
+    local button = action == 'again' and again or ui.btn_next
+    if not R.visible(button) or button.interactable == false then session.pending = nil; return true end
+    local key = action .. ':' .. tostring(step) .. ':' .. tostring(ui._index or 0)
+        .. ':' .. tostring(R.visible(reward) and reward.index or '-')
+    if session.seen[key] then
+        if session.clickedAt and now - session.clickedAt > 15 then R.cancel('step_timeout') end
+        return true
+    end
+    local pending = session.pending
+    if not pending or pending.key ~= key then
+        pending = { key = key, due = now + R.delay(command) }
+        session.pending = pending
+    end
+    if now < pending.due then return true end
+    session.seen[key] = true
+    session.pending = nil
+    session.clickedAt = now
+    local ok
+    if action == 'again' then
+        session.againAt, session.mode = now, mode
+        -- Btn_Again is the exact callback installed on the native Again button.
+        ok = pcall(ui.Btn_Again, ui)
+    else
+        -- Activity rewards rebind this listener to TryClose: preserve that binding.
+        if not button.onClick or type(button.onClick.Invoke) ~= 'function' then
+            R.cancel('listener_unavailable'); return true
+        end
+        ok = pcall(button.onClick.Invoke, button.onClick)
+    end
+    if not ok then R.cancel(); R.emit('failed', action == 'again' and 'again_exception' or 'next_exception')
+    else R.emit(action == 'again' and 'again' or 'step', action == 'again' and 'again_invoked' or 'next_invoked') end
+    return true
+end
+
 local function active(object)
     if not object then return false end
     local gameObject = object.gameObject or (object.transform and object.transform.gameObject)
@@ -843,10 +984,20 @@ function __majmax_auto_tick()
         pcall(reportButtonCoords)
         if type(__majmax_auto_command) ~= 'function' then return end
         local text = __majmax_auto_command()
-        if not text or text == '' then A.armed = false; A.continuation = nil; A.resyncDue = nil; return end
+        if not text or text == '' then
+            A.armed = false; A.continuation = nil; A.resyncDue = nil
+            if R.session then R.session.pending = nil end
+            return
+        end
         local command = A.json.decode(text)
         if type(command) == 'table' then
             A.armed = (command.control == 'mode' and command.enabled == true) or command.unattended == true
+            -- Rematch runs first: while a settlement is being walked, the previous
+            -- match's own continuation/resync must not race the new match.
+            local settled = false
+            local okTick = pcall(function() settled = R.act(command, seconds()) end)
+            if not okTick then R.cancel('adapter_exception'); return end
+            if settled then return end
             continuation(command)
             if command.control ~= 'mode' then execute(command) end
         end
