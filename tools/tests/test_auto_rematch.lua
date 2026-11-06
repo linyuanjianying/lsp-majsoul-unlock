@@ -251,16 +251,16 @@ test('an unobserved settlement page is never clicked before its show', function(
     assert(s.again >= 1, 'an observed page may be driven')
 end)
 
-test('page lock and animation block every press', function(s)
-    prime(s)
-    command(s)
+test('native ranking lock and hidden buttons block premature presses', function(s)
+    prime(s); command(s)
     s.gameEnd.locking = true
     drive(s, 0, 6)
-    assert(s.again == 0 and #s.nextPushed == 0, 'locking page must not be driven')
+    assert(s.again == 0 and #s.nextPushed == 0)
     s.gameEnd.locking = false
-    s.gameEnd.isDoAnimation = true
+    s.gameEnd.btn_again.activeInHierarchy = false
+    s.gameEnd.btn_next.activeInHierarchy = false
     drive(s, 10, 6)
-    assert(s.again == 0 and #s.nextPushed == 0, 'animating page must not be driven')
+    assert(s.again == 0 and #s.nextPushed == 0)
 end)
 
 test('one settlement presses again once, never once per tick', function(s)
@@ -623,6 +623,16 @@ test('native rematch confirmation works after final table socket closure', funct
     MJNetMgr.Inst.IsOK = function() return false end
     drive(s, 0, 2)
     assert(s.again == 1 and s.confirmAttempts == 1, 'old table socket is not a matchmaking prerequisite')
+end)
+
+test('ranking intro leaves isDoAnimation true after native buttons unlock', function(s)
+    prime(s); command(s)
+    s.gameEnd.isDoAnimation = true
+    s.gameEnd.locking = false
+    s.gameEnd.btn_again.activeInHierarchy = false
+    MJNetMgr.Inst.IsOK = function() return false end
+    tick(s, 0.1)
+    assert(#s.nextPushed == 1, 'native unlocked ranking must confirm despite stale animation flag')
 end)
 
 print(string.format('%d auto rematch checks passed', count))

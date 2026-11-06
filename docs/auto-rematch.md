@@ -24,7 +24,7 @@ lua5.1 tools/tests/test_auto_discard.lua
 lua5.1 tools/tests/test_emoji_compat.lua
 ```
 
-26条续场、63条自动操作、10条表情回归；仓库构建使用原有工作流。仍需实机确认整场结算、任务与段位页面、重新匹配和新场无人值守。
+27条续场、63条自动操作、10条表情回归；仓库构建使用原有工作流。仍需实机确认整场结算、任务与段位页面、重新匹配和新场无人值守。
 
 ## 限制
 
@@ -33,3 +33,7 @@ lua5.1 tools/tests/test_emoji_compat.lua
 ## 最终排名断连修复
 
 游戏DesktopMgr在NotifyGameEndResult后延迟3秒主动关闭MJNetMgr；终局按钮推进不得依赖旧牌桌IsOK。已移除此守卫，出牌网络校验不变。普通最终排名调用已知Btn_Next回调，活动收益阶段保留当前按钮绑定的TryClose。新增两条旧牌桌断连回归。
+
+## 排名页动画残留标记
+
+转储UI_GameEnd.OnShow设置isDoAnimation=true，结束计时器仅清locking并显示btns，不清isDoAnimation；Btn_Next自身只检查locking。最终排名适配按原生locking及按钮可见性判断，不将残留动画标记视为阻断。对应回归使用isDoAnimation=true、locking=false、旧牌桌断线。

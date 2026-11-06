@@ -265,7 +265,9 @@ function R.act(command, now)
         return true
     end
     if R.visible(popup) then return true end -- never confirm a manually opened popup
-    if ui.locking or ui.isDoAnimation then session.pending = nil; return true end
+    -- UI_GameEnd keeps isDoAnimation=true after its ranking intro. Its native
+    -- handlers guard locking, and buttons become visible when the intro completes.
+    if ui.locking then session.pending = nil; return true end
     if foreign() then session.pending = nil; return true end
     local step = ui.step
     local known = { [0]=true,[30]=true,[31]=true,[50]=true,[51]=true,[60]=true,
