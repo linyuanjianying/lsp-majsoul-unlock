@@ -6,6 +6,7 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.ColorStateList;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -18,6 +19,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -56,6 +58,13 @@ import java.util.function.Consumer;
  *       removes the lease the next heartbeat carries.</li>
  * </ul>
  *
+ * Surface behaviour: the control is a fixed, top-centre tab, never a draggable
+ * floating window. It starts half-hidden at the top edge (a transparent rounded pill
+ * with only ~8dp on screen), the first tap shows the full 雀魂助手 capsule, the second
+ * tap opens the menu below the top edge, and the collapse row (or ~6s without use)
+ * folds it back to the handle. Nothing in the provider protocol is involved in any of
+ * that: the stages are pure local view state.
+ *
  * Nothing here blocks the game's main thread: provider calls run on a worker pool
  * with a bounded timeout, results are compared against a generation counter so a
  * late reply can never paint over a newer activity, and only one poll and one user
@@ -83,6 +92,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private static final int TAG_NOTE = 0x7E010003;
     private static final int TAG_SWITCH = 0x7E010004;
 
+    /** Top inset for the capsule and the menu; the half-hidden tab ignores it. */
+    private static final int TOP_GAP_DP = 8;
+    /** Idle window before the capsule / menu folds back into the handle. */
+    private static final long IDLE_COLLAPSE_MS = 6_000L;
+    /**
+     * Fall-back delay while something must not be interrupted: a touch still down, a
+     * start sequence running, or a provider write in flight.
+     */
+    private static final long ACTION_HOLD_MS = 2_000L;
+
     private static final long POLL_MENU_MS = 1_000L;
     private static final long POLL_IDLE_MS = 3_000L;
     private static final long REQUEST_TIMEOUT_MS = 8_000L;
@@ -101,14 +120,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private final AtomicBoolean pollBusy = new AtomicBoolean();
 
     private WeakReference<Activity> active = new WeakReference<>(null);
-    private FrameLayout panel;
+    /** Root of the attached control (a wrap-content {@link StageRoot}). */
+    private StageRoot panel;
     private FrameLayout.LayoutParams panelParams;
-    private GameTopUi.DragController drag;
-
-    /** Collapsed floating bubble. Tapping it expands the menu, tapping again collapses. */
-    private TextView handle;
-    /** Wide "collapsed but informative" pill between handle and menu. */
-    private TextView capsule;
 
     /** Expanded menu: light rounded panel with a left sidebar and two switch cards. */
     private LinearLayout menu;
@@ -145,16 +159,37 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private LinearLayout manualRow;
     private LinearLayout collapseRow;
 
-    /** Survives activity switches so the menu does not collapse on every transition. */
+    /**
+     * Survives activity switches so the menu does not collapse on every transition.
+     * STAGE_HANDLE is the resting state, so a re-attach always starts half-hidden.
+     */
     private int stage = STAGE_HANDLE;
     private int tab = TAB_CONTROL;
-    /**
-     * True once the user dragged the bubble. A pinned control keeps the user's corner
-     * and is only clamped to the window; an unpinned one stays top-centre as before.
-     */
-    private boolean pinned;
     private int generation;
     private final GameHintLayer hints = new GameHintLayer();
+
+    /* Top-centre docking geometry: the control never drags, it always sits top-centre. */
+    private View decor;
+    private TabView handleTab;
+    private TextView capsule;
+    /** Only keeps the wrap-content root clamped top-centre; it never drives a drag. */
+    private SizeWatcher hooks;
+
+    /**
+     * Idle auto-collapse: while the capsule or the menu is showing, this brings the
+     * control back to the handle after {@link #IDLE_COLLAPSE_MS} without interaction.
+     * Only a user interaction (or an action still running) restarts it - polling and
+     * {@link #applyState()} never do, so a one-second status refresh cannot keep the
+     * menu open forever.
+     */
+    private final Runnable collapseTick = new Runnable() {
+        @Override public void run() {
+            collapseIfIdle();
+        }
+    };
+    private long lastTouchAt;
+    /** True between ACTION_DOWN and ACTION_UP/CANCEL inside the menu area. */
+    private boolean touching;
 
     /* Last reply from the manager app. */
     private boolean available;
@@ -168,7 +203,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * True while the user has selected the system-overlay surface in the manager's
      * settings. In that mode this whole in-game control (handle, capsule, menu) is
      * hidden so it never duplicates the overlay, but polling continues so a switch
-     * back to Hook mode is picked up immediately and the control reappears.
+     * back to Hook mode is picked up immediately and the control reappears. While it is
+     * hidden the idle timer is stopped as well: a control nobody can see has nothing
+     * to collapse.
      */
     private boolean overlayMode;
 
@@ -216,36 +253,48 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (panel != null && active.get() == activity) return;
         detach();
         if (activity.getWindow() == null) return;
-        View decor = activity.getWindow().peekDecorView();
-        if (!(decor instanceof ViewGroup)) return;
+        View decorView = activity.getWindow().peekDecorView();
+        if (!(decorView instanceof ViewGroup)) return;
         active = new WeakReference<>(activity);
+        decor = decorView;
         panel = build(activity);
-        // Wrap-content child of the decor view: it never covers the game's own touch
-        // surface, and the only drag listener sits on the collapsed handle.
+        // Wrap-content child of the decor view: it is only as large as the visible
+        // stage, never a full-screen surface, so the game keeps every other touch.
         panelParams = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        ((ViewGroup) decor).addView(panel, panelParams);
-        drag = new GameTopUi.DragController(panel, panelParams);
-        drag.setOnDragged(() -> pinned = true);
-        handle.setOnTouchListener(drag);
+        ((ViewGroup) decorView).addView(panel, panelParams);
+        // Drag is gone by design: a fixed top-centre tab needs no travel, and the
+        // helper only keeps the (now trivial) position legal after a size change.
+        // The stage survives activity switches; a restored capsule / menu gets a fresh
+        // idle window instead of an already-expired one.
+        if (stage != STAGE_HANDLE) restartIdleTimer();
         applyState();
-        drag.reflow(!pinned);
+        hooks = new SizeWatcher(activity);
+        ((ViewGroup) decorView).addOnLayoutChangeListener(hooks);
         hints.attach(activity);
         schedulePoll(0L);
     }
 
     private void detach() {
+        stopIdleTimer();
+        touching = false;
         hints.detach();
         generation++;
         main.removeCallbacks(pollTick);
         if (panel != null && panel.getParent() instanceof ViewGroup) {
             ((ViewGroup) panel.getParent()).removeView(panel);
         }
+        if (hooks != null) {
+            // The listener is on the decor view, which may already be gone; removing it
+            // from a detached view is a no-op, so the reference is dropped either way.
+            if (decor != null) decor.removeOnLayoutChangeListener(hooks);
+            hooks = null;
+        }
         panel = null;
         panelParams = null;
-        drag = null;
-        handle = null;
+        decor = null;
+        handleTab = null;
         capsule = null;
         menu = null;
         title = null;
@@ -264,7 +313,6 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         manualRow = collapseRow = null;
         active.clear();
     }
-
     /* ---------------------------------------------------------------------- UI */
 
     private static int dp(Context context, int value) {
@@ -289,61 +337,298 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return view;
     }
 
-    /** Small, round flat button used for the collapsed bubble and the collapse row. */
-    private TextView bubbleButton(Activity activity, String label, String description) {
-        TextView view = cell(activity, 15, GameTopUi.ACCENT, true);
-        view.setText(label);
-        view.setContentDescription(description);
-        GradientDrawable shape = GameTopUi.round(activity, 15, GameTopUi.CARD, 0x332F6FE4, 1);
-        ripple(view, shape);
-        view.setElevation(dp(activity, 6));
-        return view;
-    }
-
-    /** Opens the menu on the control page and asks for a fresh status immediately. */
-    private void expand() {
+    /**
+     * Opens the menu on the control page (from a capsule tap or an explicit call) and
+     * asks for a fresh status immediately. This is the only place the menu stage is
+     * entered, so every entry point arms the idle window exactly once.
+     */
+    private void openMenu() {
+        if (stage == STAGE_MENU) return;
         stage = STAGE_MENU;
         tab = TAB_CONTROL;
+        restartIdleTimer();
         applyState();
         schedulePoll(0L);
     }
 
-    private FrameLayout build(Activity activity) {
-        FrameLayout root = new FrameLayout(activity);
+    private StageRoot build(Activity activity) {
+        StageRoot root = new StageRoot(activity);
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        handle = bubbleButton(activity, "雀", "展开雀魂助手");
-        handle.setOnClickListener(view -> {
-            // Tap the bubble to expand, tap the collapse row to go back: one entry
-            // point, no hidden stage in between.
-            if (stage == STAGE_MENU) {
-                stage = STAGE_HANDLE;
-                applyState();
-            } else {
-                expand();
-            }
+        // Half-hidden handle: a real ~8dp sliver hanging from the top edge. Because the
+        // view's own height is the visible height, the hit rect matches what the user
+        // sees; no translation is involved, so nothing can mis-report its bounds.
+        handleTab = new TabView(activity, dp(activity, 8),
+            GameTopUi.round(activity, 7, GameTopUi.CARD, 0x402F6FE4, 1));
+        handleTab.setContentDescription("展开雀魂助手");
+        handleTab.setOnClickListener(view -> {
+            stage = STAGE_CAPSULE;
+            restartIdleTimer();
+            applyState();
         });
-        FrameLayout.LayoutParams handleParams = new FrameLayout.LayoutParams(
-            dp(activity, 40), dp(activity, 40), Gravity.TOP | Gravity.START);
-        root.addView(handle, handleParams);
+        root.addView(handleTab, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(activity, 8), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
 
+        // Full "雀魂助手" capsule, ~160x44dp, just below the top edge.
         capsule = cell(activity, 13, GameTopUi.INK_MUTED, false);
+        capsule.setGravity(Gravity.CENTER);
+        capsule.setPadding(dp(activity, 16), 0, dp(activity, 16), 0);
+        capsule.setMinHeight(dp(activity, 44));
         capsule.setContentDescription("打开雀魂助手菜单");
-        ripple(capsule, GameTopUi.round(activity, 14, GameTopUi.CARD, 0x332F6FE4, 1));
+        ripple(capsule, GameTopUi.round(activity, 22, GameTopUi.CARD, 0x332F6FE4, 1));
         capsule.setElevation(dp(activity, 4));
-        capsule.setOnClickListener(view -> expand());
+        // openMenu() arms the idle window, so the capsule needs no touch listener of its
+        // own; a plain click keeps the ripple and the accessibility tap working.
+        capsule.setOnClickListener(view -> openMenu());
         FrameLayout.LayoutParams capsuleParams = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP | Gravity.START);
-        capsuleParams.leftMargin = dp(activity, 48);
+            dp(activity, 160), dp(activity, 44), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        capsuleParams.topMargin = dp(activity, TOP_GAP_DP);
         root.addView(capsule, capsuleParams);
 
         menu = buildMenu(activity);
-        root.addView(menu, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams menuParams = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP | Gravity.START));
+            Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        menuParams.topMargin = dp(activity, TOP_GAP_DP);
+        root.addView(menu, menuParams);
+
+        // Outer touch watcher. It only observes: every event is handed straight back to
+        // the normal child/click path (return false), so switches, rows and the scroll
+        // behaviour of the panel keep working exactly as before.
         return root;
+    }
+
+    /**
+     * Records menu interactions for the idle timer and never consumes the event.
+     * ACTION_DOWN arms a hold so a finger resting on the panel (reading the status)
+     * does not trigger the fall-back mid-read.
+     */
+    private void noteMenuTouch(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                touching = true;
+                lastTouchAt = SystemClock.elapsedRealtime();
+                stopIdleTimer();
+                break;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                lastTouchAt = SystemClock.elapsedRealtime();
+                break;
+            case MotionEvent.ACTION_MOVE:
+                if (stage != STAGE_HANDLE) restartIdleTimer();
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                touching = false;
+                restartIdleTimer();
+                break;
+            default:
+                break;
+        }
+    }
+
+    /* ------------------------------------------------------------ idle collapse */
+
+    /** Restarts the idle window; the handle stage has no timer to run. */
+    private void restartIdleTimer() {
+        main.removeCallbacks(collapseTick);
+        lastTouchAt = SystemClock.elapsedRealtime();
+        if (stage == STAGE_HANDLE) return;
+        // A start sequence or a settings write must not land on a collapsed view: the
+        // reply is kept and repainted, but the fall-back waits until it is done.
+        long delay = actionBusy.get() || starting ? ACTION_HOLD_MS : IDLE_COLLAPSE_MS;
+        main.postDelayed(collapseTick, delay);
+    }
+
+    private void stopIdleTimer() {
+        main.removeCallbacks(collapseTick);
+    }
+
+    /**
+     * Pushes the pending fall-back out by {@link #ACTION_HOLD_MS} without counting as
+     * user activity. Used while an action is in flight; the handle stage has no timer.
+     */
+    private void deferCollapse() {
+        if (stage == STAGE_HANDLE) return;
+        main.removeCallbacks(collapseTick);
+        main.postDelayed(collapseTick, ACTION_HOLD_MS);
+    }
+
+    /**
+     * Auto-collapse entry point. Any interaction (or any action still in flight)
+     * postpones it instead of hiding the panel; only a genuinely idle control folds
+     * back to the half-hidden handle. Nothing in polling reaches this method.
+     */
+    private void collapseIfIdle() {
+        if (panel == null || overlayMode || stage == STAGE_HANDLE) return;
+        if (touching || actionBusy.get() || starting) {
+            main.postDelayed(collapseTick, ACTION_HOLD_MS);
+            return;
+        }
+        long idle = SystemClock.elapsedRealtime() - lastTouchAt;
+        if (idle < IDLE_COLLAPSE_MS - 250L) {
+            main.postDelayed(collapseTick, Math.max(250L, IDLE_COLLAPSE_MS - idle));
+            return;
+        }
+        collapse();
+    }
+
+    /** Back to the half-hidden handle. The timer is not armed again from here. */
+    private void collapse() {
+        stopIdleTimer();
+        if (stage == STAGE_HANDLE) return;
+        stage = STAGE_HANDLE;
+        applyState();
+    }
+
+    /**
+     * Window size / density changed. The control stays top-centre, which the layout
+     * gravity already guarantees, so the only work left is re-clamping and letting the
+     * panel re-measure against the new window height.
+     */
+    private void onWindowResized() {
+        if (panel == null) return;
+        panel.post(() -> {
+            if (panel == null || panel.getParent() == null) return;
+            if (menu != null) ((CappedColumn) menu).refreshCap();
+            applyState();
+        });
+    }
+
+    /**
+     * Listens for window size changes (rotation, split screen, density change). Only a
+     * real size change re-centres; ordinary layout passes are ignored so the control is
+     * never re-laid-out for nothing while the user is reading it.
+     */
+    private final class SizeWatcher implements View.OnLayoutChangeListener {
+        private final Activity activity;
+        private int lastWidth;
+        private int lastHeight;
+        private boolean armed;
+
+        SizeWatcher(Activity activity) { this.activity = activity; }
+
+        @Override public void onLayoutChange(View view, int left, int top, int right, int bottom,
+                                             int oldLeft, int oldTop, int oldRight, int oldBottom) {
+            if (active.get() != activity) return;
+            int width = right - left;
+            int height = bottom - top;
+            if (!armed) {
+                armed = true;
+                lastWidth = width;
+                lastHeight = height;
+                return;
+            }
+            if (width == lastWidth && height == lastHeight) return;
+            lastWidth = width;
+            lastHeight = height;
+            onWindowResized();
+        }
+    }
+
+    /**
+     * Stage host. It is a wrap-content FrameLayout, but it also strips the full-screen
+     * decor constraint the window hands down: the root must only ever be as large as
+     * what it draws, otherwise the game's touches would be eaten by an invisible box
+     * around the menu. Children are measured exactly as FrameLayout would, against the
+     * real window size, so the capped panel and CENTER_HORIZONTAL gravity still work.
+     */
+    private final class StageRoot extends FrameLayout {
+        StageRoot(Context context) { super(context); }
+
+        @Override public boolean dispatchTouchEvent(MotionEvent event) {
+            noteMenuTouch(event);
+            return super.dispatchTouchEvent(event);
+        }
+
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            int maxW = MeasureSpec.getMode(widthSpec) == MeasureSpec.UNSPECIFIED
+                ? 0 : MeasureSpec.getSize(widthSpec);
+            int maxH = MeasureSpec.getMode(heightSpec) == MeasureSpec.UNSPECIFIED
+                ? 0 : MeasureSpec.getSize(heightSpec);
+            int count = getChildCount();
+            int width = 0;
+            int height = 0;
+            for (int i = 0; i < count; i++) {
+                View child = getChildAt(i);
+                if (child.getVisibility() == GONE) continue;
+                FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) child.getLayoutParams();
+                int childWidthSpec;
+                if (params.width == LayoutParams.MATCH_PARENT && maxW > 0) {
+                    childWidthSpec = MeasureSpec.makeMeasureSpec(maxW, MeasureSpec.EXACTLY);
+                } else if (params.width >= 0) {
+                    childWidthSpec = MeasureSpec.makeMeasureSpec(params.width, MeasureSpec.EXACTLY);
+                } else {
+                    childWidthSpec = MeasureSpec.makeMeasureSpec(
+                        Math.max(0, maxW - params.leftMargin - params.rightMargin),
+                        maxW > 0 ? MeasureSpec.AT_MOST : MeasureSpec.UNSPECIFIED);
+                }
+                int childHeightSpec;
+                if (params.height == LayoutParams.MATCH_PARENT && maxH > 0) {
+                    childHeightSpec = MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.EXACTLY);
+                } else if (params.height >= 0) {
+                    childHeightSpec = MeasureSpec.makeMeasureSpec(params.height, MeasureSpec.EXACTLY);
+                } else {
+                    childHeightSpec = MeasureSpec.makeMeasureSpec(
+                        Math.max(0, maxH - params.topMargin - params.bottomMargin),
+                        maxH > 0 ? MeasureSpec.AT_MOST : MeasureSpec.UNSPECIFIED);
+                }
+                child.measure(childWidthSpec, childHeightSpec);
+                if (child.getVisibility() == GONE) continue;
+                width = Math.max(width, child.getMeasuredWidth() + params.leftMargin + params.rightMargin);
+                height = Math.max(height, child.getMeasuredHeight() + params.topMargin + params.bottomMargin);
+            }
+            if (maxW > 0) width = Math.min(width, maxW);
+            if (maxH > 0) height = Math.min(height, maxH);
+            setMeasuredDimension(resolveSize(width, widthSpec), resolveSize(height, heightSpec));
+        }
+    }
+
+    /**
+     * The half-hidden tab. The view itself is only {@code sliver} pixels tall, so the
+     * touchable rect is exactly the strip the user can see; it merely keeps a wider
+     * hit box around that strip and draws the translucent rounded pill centred in it.
+     */
+    private static final class TabView extends View {
+        private final int sliver;
+        private final int hitWidth;
+        private final int pillWidth;
+        private final int pillHeight;
+        private final Drawable background;
+
+        TabView(Context context, int sliverPx, GradientDrawable pill) {
+            super(context);
+            sliver = Math.max(1, sliverPx);
+            hitWidth = GameTopUi.dp(context, 48);
+            pillWidth = GameTopUi.dp(context, 36);
+            pillHeight = GameTopUi.dp(context, 10);
+            background = pill;
+            // Never focusable: opening the menu or waiting for a reply must not pull
+            // focus away from the game window or a dialog the game is showing.
+            setFocusable(false);
+            setFocusableInTouchMode(false);
+            setClickable(true);
+        }
+
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            int width = resolveSize(hitWidth, widthSpec);
+            setMeasuredDimension(width, resolveSize(sliver, heightSpec));
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            // Only the lower part of a slightly taller pill is on screen: the rounded
+            // bottom edge shows as a hanging tab and the top is cut by the window edge,
+            // so no translation is used and the view is exactly as tall as the strip.
+            float left = (getWidth() - pillWidth) / 2f;
+            float right = left + pillWidth;
+            background.setBounds(Math.round(left), 0, Math.round(right), pillHeight);
+            background.draw(canvas);
+        }
+
+        @Override public void setPressed(boolean pressed) {
+            super.setPressed(pressed);
+            setAlpha(pressed ? .6f : 1f);
+        }
     }
 
     /**
@@ -352,12 +637,28 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * against the cap, and the top of the panel (header, sidebar) stays reachable.
      */
     private static final class CappedColumn extends LinearLayout {
-        private final int maxHeight;
+        private final int marginReserve;
+        private int maxHeight;
 
         CappedColumn(Context context, int maxHeight) {
             super(context);
+            this.marginReserve = maxHeight;
             this.maxHeight = Math.max(0, maxHeight);
             setOrientation(VERTICAL);
+        }
+
+        /**
+         * Re-reads the window height after a rotation / size change so a menu opened in
+         * portrait can never overflow a short landscape window.
+         */
+        void refreshCap() {
+            int available = marginReserve;
+            View parent = (View) getParent();
+            if (parent != null && parent.getHeight() > 0) {
+                available = Math.min(available, parent.getHeight());
+            }
+            maxHeight = Math.max(0, available);
+            requestLayout();
         }
 
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
@@ -375,11 +676,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             }
         }
     }
-
     /** The expanded panel: white rounded surface, sidebar, two pages. */
     private LinearLayout buildMenu(Activity activity) {
         int maxHeight = Math.round(activity.getResources().getDisplayMetrics().heightPixels
-            - 4 * GameTopUi.density(activity) * 8);
+            - GameTopUi.density(activity) * (TOP_GAP_DP + 8));
         LinearLayout panelView = new CappedColumn(activity, maxHeight);
         panelView.setBackground(GameTopUi.panel(activity));
         panelView.setPadding(dp(activity, 12), dp(activity, 10), dp(activity, 12), dp(activity, 10));
@@ -431,8 +731,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         panelView.addView(GameTopUi.divider(activity));
         collapseRow = actionRow(activity, "收起面板", GameTopUi.INK_MUTED, null);
         collapseRow.setOnClickListener(view -> {
-            stage = STAGE_HANDLE;
-            applyState();
+            // A tap on the collapse row is an explicit user request: no idle wait.
+            collapse();
         });
         panelView.addView(collapseRow);
         return panelView;
@@ -622,25 +922,28 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (overlayMode) {
             // The user switched to the system-overlay surface in the manager. Hide the
             // entire in-game control (handle, capsule and menu) so nothing is shown
-            // twice, but keep polling so the control can reappear on switch-back.
-            show(handle, false);
+            // twice, but keep polling so the control can reappear on switch-back. The
+            // idle timer has nothing to do while the control is invisible.
+            stopIdleTimer();
+            show(handleTab, false);
             show(capsule, false);
             show(menu, false);
             return;
         }
-        show(menu, stage == STAGE_MENU);
-        show(handle, stage != STAGE_MENU);
+        boolean menuShown = stage == STAGE_MENU;
+        show(menu, menuShown);
         show(capsule, stage == STAGE_CAPSULE);
+        show(handleTab, stage == STAGE_HANDLE);
         if (stage == STAGE_CAPSULE) setText(capsule, "雀魂助手 · " + shortState() + "  ▸");
-        if (stage != STAGE_MENU) {
-            if (drag != null) drag.reflow(!pinned);
-            return;
+        if (menuShown) {
+            paintTab();
+            paintSwitches();
+            paintStatusPage();
+            paintActions();
         }
-        paintTab();
-        paintSwitches();
-        paintStatusPage();
-        paintActions();
-        if (drag != null) drag.reflow(!pinned);
+        // Polling repaints arrive here every few seconds and deliberately never touch
+        // the idle window: only a real interaction (restartIdleTimer) re-arms it, and the
+        // capsule / menu are only entered through those interaction paths.
     }
 
     private static void show(View view, boolean visible) {
@@ -1058,6 +1361,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             });
         }
         schedulePoll(stage == STAGE_MENU || starting ? POLL_MENU_MS : POLL_IDLE_MS);
+        if (starting || actionBusy.get()) {
+            // A reply or a start completion is still on its way; hold the control on
+            // whatever stage it is so that reply lands on a visible view. The idle
+            // window itself is untouched, so a poll never extends it.
+            deferCollapse();
+        }
     }
 
     private void applyReply(Bundle reply) {
