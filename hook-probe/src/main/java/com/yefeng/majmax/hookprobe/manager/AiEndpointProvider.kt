@@ -63,6 +63,15 @@ class AiEndpointProvider : ContentProvider() {
             }
             return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
         }
+        if (method == "rematchSet") {
+            // Single boolean preference. It never starts/stops the service, never flips
+            // unattended mode and never changes the display mode; the value takes effect
+            // on the next heartbeat, where it is still gated by unattended + non-demo.
+            val requested = extras?.takeIf { it.containsKey("enabled") }?.getBoolean("enabled")
+                ?: throw IllegalArgumentException("Missing enabled")
+            AiOverlayService.publishRematch(app, requested)
+            return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
+        }
         if (method == "displayMode") {
             // Read-only projection of the persisted presentation mode. The game process
             // reads this so its in-game control can hide itself (while still polling)
@@ -374,6 +383,15 @@ object AssistLaunch {
         val mode = AssistantDisplayModeSettings.read(context)
         bundle.putString("displayMode", mode.wire)
         bundle.putBoolean("overlayMode", AssistantDisplayModeSettings.overlayActive(context))
+        // Auto-rematch opt-in, read-only projection. `rematch` is the stored setting,
+        // `rematchActive` is the effective gate (stored AND unattended AND not demo) and
+        // matches the `autoRematch` field of the next autoPoll heartbeat exactly, so the
+        // in-game control, the manager UI and the floating window never disagree.
+        val rematch = AutoRematchSettings.read(context)
+        val unattended = bundle.getBoolean("enabled") && !bundle.getBoolean("demo")
+        bundle.putBoolean("rematch", rematch)
+        bundle.putBoolean("rematchActive", AutoRematchSettings.active(context, unattended,
+            bundle.getBoolean("demo")))
         return bundle
     }
 

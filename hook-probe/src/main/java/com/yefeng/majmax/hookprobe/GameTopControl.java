@@ -45,7 +45,11 @@ import java.util.function.Consumer;
  *       allowed exemption, so the start from there is legal.</li>
  *   <li>{@code autoSet} switches the mode off without stopping the service, so the
  *       foreground notification keeps explaining what is still running.</li>
- *   <li>{@code autoStatus} is polled for progress and for the live mode state.</li>
+ *   <li>{@code autoStatus} is polled for progress, for the live mode state and for the
+ *       auto-rematch opt-in (`rematch` / `rematchActive`).</li>
+ *   <li>{@code rematchSet} writes the single auto-rematch preference. It never changes
+ *       unattended mode, the service lifetime or the display mode; revoking it only
+ *       removes the lease the next heartbeat carries.</li>
  * </ul>
  *
  * Nothing here blocks the game's main thread: provider calls run on a worker pool
@@ -89,6 +93,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private LinearLayout menu;
     private TextView title;
     private TextView toggle;
+    private TextView rematchRow;
     private TextView detail;
     private TextView manual;
     private TextView collapse;
@@ -113,6 +118,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * back to Hook mode is picked up immediately and the control reappears.
      */
     private boolean overlayMode;
+
+    /**
+     * Auto-rematch as reported by the manager's status reply. [rematch] is the persisted
+     * opt-in (what the row shows and toggles); [rematchActive] is the effective gate
+     * reported alongside it and is only used to explain why an enabled opt-in is inert.
+     * Both are read-only here: the row's tap is the only writer, and it never touches
+     * unattended mode, the service lifetime or the display mode.
+     */
+    private boolean rematch;
+    private boolean rematchActive;
 
     /* Local, transient start sequence. */
     private boolean starting;
@@ -168,7 +183,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             ((ViewGroup) panel.getParent()).removeView(panel);
         }
         panel = null;
-        handle = capsule = title = toggle = detail = manual = collapse = null;
+        handle = capsule = title = toggle = rematchRow = detail = manual = collapse = null;
         menu = null;
         active.clear();
     }
@@ -233,6 +248,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         toggle.setOnClickListener(view -> onToggle());
         menu.addView(toggle);
 
+        // Independent of the unattended row above: this only flips the persisted
+        // auto-rematch preference, so it stays tappable while unattended mode is off.
+        rematchRow = label(activity, 14, 44, 16);
+        rematchRow.setOnClickListener(view -> onRematchToggle());
+        menu.addView(rematchRow);
+
         detail = label(activity, 11, 16, 10);
         menu.addView(detail);
 
@@ -277,6 +298,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         setText(title, "实时模式：" + modeText());
         setText(toggle, toggleText());
         toggle.setAlpha(starting ? .55f : 1f);
+        setText(rematchRow, rematchText());
+        rematchRow.setTextColor(rematchActive ? Color.rgb(140, 214, 186) : Color.rgb(170, 190, 185));
         setText(detail, detailText());
         detail.setTextColor(noticeFailed ? Color.rgb(255, 158, 128) : Color.rgb(196, 206, 203));
 
@@ -311,6 +334,22 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private String toggleText() {
         if (starting) return "启动中…";
         return enabled ? "关闭无人值守" : "开启无人值守";
+    }
+
+    /**
+     * The row doubles as switch and explanation: the tap target is one line, so the
+     * available state (why an enabled opt-in is not acting yet, or why it cannot be
+     * armed) is folded into the label instead of a second view.
+     */
+    private String rematchText() {
+        String state = rematch ? "开" : "关";
+        String note;
+        if (demo && rematch) note = "自检中不生效";
+        else if (rematch && !enabled) note = "待无人值守开启";
+        else if (rematch && !rematchActive) note = "待条件满足";
+        else if (rematch) note = "仅按下一局原按钮";
+        else note = "点按开启";
+        return "整场后续局 · " + state + "（" + note + "）";
     }
 
     private String detailText() {
@@ -376,6 +415,39 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
                     notice = AssistLaunch.UNAVAILABLE.equals(state)
                         ? "无法启动前台服务 · 点击重试" : "启动中断 · 点击重试";
                 }
+            }
+            applyState();
+            schedulePoll(POLL_MENU_MS);
+        });
+    }
+
+    /**
+     * Persists the auto-rematch opt-in through the UID-checked provider. Sends the
+     * *requested* value (a toggle of what the last reply reported), and the reply is
+     * applied like any poll, so the row can never show a value the manager did not
+     * store. Revoking while a settlement is being walked cancels the adapter's pending
+     * action on the next heartbeat; it deliberately does not change unattended mode.
+     */
+    private void onRematchToggle() {
+        if (!actionBusy.compareAndSet(false, true)) return;
+        boolean wanted = !rematch;
+        notice = wanted ? "正在开启整场后续局…" : "正在关闭整场后续局…";
+        noticeFailed = false;
+        applyState();
+        Bundle args = new Bundle();
+        args.putBoolean("enabled", wanted);
+        call("rematchSet", args, REQUEST_TIMEOUT_MS, reply -> {
+            actionBusy.set(false);
+            if (reply == null) {
+                noticeFailed = true;
+                notice = "管理应用无响应 · 设置可能未保存";
+            } else {
+                applyReply(reply);
+                // The reply carries the stored value, so a write that did not stick is
+                // reported instead of leaving the row claiming the new state.
+                noticeFailed = rematch != wanted;
+                notice = rematch != wanted ? "设置未保存 · 当前" + (rematch ? "开" : "关")
+                    : wanted ? "整场后续局已开启" : "整场后续局已关闭 · 无人值守未变";
             }
             applyState();
             schedulePoll(POLL_MENU_MS);
@@ -496,6 +568,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         String message = reply.getString("message", "");
         remoteMessage = message == null ? "" : message.trim();
         overlayMode = reply.getBoolean("overlayMode", false);
+        rematch = reply.getBoolean("rematch", rematch);
+        rematchActive = reply.getBoolean("rematchActive", false);
         unreachable = false;
         managerMissing = false;
     }

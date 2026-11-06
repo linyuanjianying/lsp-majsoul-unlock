@@ -160,6 +160,7 @@ local function fixture()
     end
     _G.UI_MJReward_Activity = { Inst = reward, className = 'UI_MJReward_Activity' }
 
+    s.rewardClass = { Inst = reward, className = 'UI_MJReward_Activity' }
     dofile(asset)
     s.gameEnd, s.popup, s.reward = inst, popupInst, reward
     s.R = __majmax_auto.rematch
@@ -278,7 +279,8 @@ test('turning the switch off revokes a queued step', function(s)
     drive(s, 0, 8)
     assert(s.again == 0, 'enabled=false must revoke a queued step')
     s.command.enabled = true
-    drive(s, 10, 8)
+    -- Same page, same settlement: re-enabling picks the still-open result page back up.
+    drive(s, 0, 8)
     assert(s.again >= 1, 'a re-enabled switch re-arms the page')
 end)
 
@@ -438,6 +440,173 @@ test('confirmation exception is latched and contains no exception text', functio
     drive(s, 3, 2)
     assert(countState(s, 'rematch_failed:confirm_exception') == 1)
     for _, value in ipairs(states(s)) do assert(not value:find('private fixture detail',1,true)) end
+end)
+
+-- ---------------------------------------------------------------------------
+-- 0.13.1 regressions. The user report behind these checks is "auto rematch does
+-- nothing and unattended mode is broken after 550a671". Three independent causes
+-- are pinned here; each one reproduces the device symptom on its own.
+-- ---------------------------------------------------------------------------
+
+-- ToLua resolves a global that is not yet require'd by raising instead of
+-- returning nil. The settlement walk sits in the per-frame tick, so a single
+-- unguarded `local c = UI_GameEnd` throws a hundred times a second while the page
+-- is closed. The wrapper then answered with rematch_failed/adapter_exception and
+-- `return`, and the old `R.cancel('adapter_exception')` answer additionally skipped
+-- the whole unattended continuation/execute path for that tick.
+local function lazy(t)
+    return setmetatable(t, { __index = function(_, key)
+        error("lazy global '" .. tostring(key) .. "' not loaded", 2)
+    end })
+end
+
+test('a closed settlement page cannot throw through the world tick', function(s)
+    -- Every page the walk looks at is still unloaded, exactly like a fresh attach
+    -- before its window exists.
+    _G.UI_GameEnd, _G.UI_AnotherGameConfirm = nil, nil
+    -- Reading a missing global now raises, as ToLua does.
+    local saved = getfenv(0)
+    setmetatable(_G, { __index = function(_, key)
+        error("lazy global '" .. tostring(key) .. "' not loaded", 2)
+    end })
+    command(s)
+    local ok, err = pcall(drive, s, 0, 3)
+    setmetatable(_G, nil)
+    assert(ok, 'the tick raised: ' .. tostring(err))
+    assert(countState(s, 'rematch_failed') == 0,
+        'a closed page must not be reported as a rematch failure')
+    assert(countState(s, 'adapter_exception') == 0,
+        'a closed page must not report adapter_exception')
+end)
+
+test('a late attached session is recoverable without a new show', function(s)
+    -- Module loaded after UI_GameEnd: OnShow was never wrapped, so the settlement
+    -- is already up when the adapter arrives. The live page still carries its
+    -- game_end_result, and the walk must adopt it instead of waiting forever.
+    command(s)
+    drive(s, 0, 2)
+    s.gameEnd.game_end_result = { players = { { seat = 1 } } }
+    s.gameEnd.transform.gameObject.activeInHierarchy = true
+    s.R.session = nil
+    drive(s, 3, 8)
+    assert(s.again >= 1, 'a late session on a live page must be driven')
+    assert(countState(s, 'rematch_failed') == 0)
+end)
+
+test('the settlement walk wins over the previous match continuation', function(s)
+    -- UI_ConfirmNewRound is up at the same time as the final result page: pressing
+    -- its confirm closes the round and ends the match, which is exactly how the
+    -- rematch used to be thrown away. The walk must win, and the confirmation must
+    -- be held back while the settlement is live.
+    prime(s)
+    local confirm = node(true)
+    local confirmUi = node(true)
+    confirmUi.locking = false
+    confirmUi.isDoAnimation = false
+    confirmUi.btn_confirm = confirm
+    confirmUi.Btn_Confirm = function(self) s.roundConfirmed = (s.roundConfirmed or 0) + 1 end
+    _G.UI_ConfirmNewRound = { Inst = confirmUi, OnShow = function(self) end }
+    command(s)
+    drive(s, 0, 6)
+    -- The round confirmation waits its own delay first; the settlement must get a
+    -- chance before that button is pressed, so keep driving well past both delays.
+    drive(s, 6, 6)
+    assert(confirm.clicks == 0,
+        'the round confirmation must not pre-empt the settlement page')
+    assert(s.again >= 1, 'the settlement page must still be driven')
+end)
+
+test('a raised settlement walk still lets the unattended path run', function(s)
+    -- The settlement walk breaks (a bridge call raises mid-step). The tick must
+    -- report a bounded rematch failure, stop the walk, and still continue the
+    -- previous match work in the same tick: a broken settlement may never take the
+    -- play loop down with it.
+    command(s)
+    -- The page is raised without OnShow, the way a module that attached after the
+    -- result page already opened sees it (attachLive adopts it from game_end_result).
+    s.gameEnd.game_end_result = { players = { { seat = 1 } } }
+    s.gameEnd.transform.gameObject.activeInHierarchy = true
+    local confirm = node(true)
+    local confirmUi = node(true)
+    confirmUi.btn_confirm = confirm
+    confirmUi.Btn_Confirm = function(self) s.roundConfirmed = (s.roundConfirmed or 0) + 1 end
+    _G.UI_ConfirmNewRound = { Inst = confirmUi, OnShow = function(self) end }
+    s.gameEnd.step = 70
+    -- A bridge object the walk must read raises while it inspects it (Unity
+    -- property access on a destroyed page is the real-world shape of this). The
+    -- next page is the activity reward page, so the walk reads its `locking` flag.
+    local brokenReward = setmetatable({}, { __index = function()
+        error('bridge exploded')
+    end })
+    _G.UI_MJReward_Activity = { Inst = brokenReward, className = 'UI_MJReward_Activity' }
+    s.reward.activeInHierarchy = true
+    s.reward.transform.gameObject.activeInHierarchy = true
+    -- One tick: the settlement walk raises, so the tick reports that, skips to the
+    -- rest of the work, and the unattended continuation still presses its button.
+    tick(s, 0.3)
+    assert(countState(s, 'rematch_failed:adapter_exception') == 1,
+        'the raised settlement step must be reported once')
+    assert(s.roundConfirmed == 1,
+        'the unattended continuation must still run in the same tick')
+    assert(countState(s, 'continued') == 1, 'the continuation must be acknowledged')
+    assert(s.R.session == nil or s.R.session.stopped == true,
+        'the broken walk must stop itself')
+    -- The broken settlement is not retried: later ticks only continue the match.
+    for i = 1, 5 do tick(s, 0.3 + i / 10) end
+    assert(countState(s, 'rematch_failed:adapter_exception') == 1,
+        'a raised settlement must not be retried on every tick')
+    s.reward.activeInHierarchy = false
+    s.reward.transform.gameObject.activeInHierarchy = false
+    _G.UI_MJReward_Activity = s.rewardClass
+end)
+
+test('unknown pages stop the walk without blocking the match', function(s)
+    -- An unlisted page (step 250 in this fixture) is not this build's settlement:
+    -- nothing is pressed, nothing is failed, and the play loop keeps its own path.
+    prime(s)
+    local confirm = node(true)
+    local confirmUi = node(true)
+    confirmUi.btn_confirm = confirm
+    confirmUi.Btn_Confirm = function(self) s.roundConfirmed = (s.roundConfirmed or 0) + 1 end
+    _G.UI_ConfirmNewRound = { Inst = confirmUi, OnShow = function(self) end }
+    s.gameEnd.step = 250
+    command(s)
+    drive(s, 0, 6)
+    assert(s.again == 0 and #s.nextPushed == 0, 'an unknown page must not be pressed')
+    assert(countState(s, 'rematch_failed') == 0, 'an unknown page is not a failure')
+    assert(countState(s, 'rematch_paused') == 0, 'an unknown page is not a cancel')
+end)
+
+test('a missing again method is a bounded refusal', function(s)
+    -- A UI class that does not expose Btn_Again (renamed or partially loaded) must
+    -- not be reported as a tick crash and must never fall through to Next.
+    prime(s); command(s)
+    -- The instance now reports a page with no usable again button.
+    s.gameEnd.btn_again = setmetatable({}, { __index = function() return nil end })
+    s.gameEnd.btn_again_active = false
+    s.gameEnd.btn_next = node(false)
+    s.gameEnd.Btn_Again = nil
+    local ok, err = pcall(drive, s, 0, 4)
+    assert(ok, 'a missing method raised: ' .. tostring(err))
+    assert(#s.nextPushed == 0, 'a missing again must not fall through to next')
+    assert(s.confirmAttempts == 0, 'no popup means no confirm')
+    assert(countState(s, 'rematch_failed:adapter_exception') == 0,
+        'a missing button is a closed page, not a tick crash')
+end)
+
+test('a missing confirm method is a bounded refusal', function(s)
+    -- The confirmation window exists but the class lost Confirm: the walk stops
+    -- that settlement instead of crashing or retrying it every tick.
+    prime(s); command(s)
+    UI_AnotherGameConfirm.Confirm = nil
+    tick(s, 0.1)
+    assert(s.popup.activeInHierarchy, 'the popup must be open')
+    s.popup.locking = false
+    local ok, err = pcall(drive, s, 1, 4)
+    assert(ok, 'a missing confirm raised: ' .. tostring(err))
+    assert(s.confirmAttempts == 0, 'nothing may be confirmed without Confirm')
+    assert(countState(s, 'rematch_failed:adapter_exception') == 0,
+        'a missing confirm is a refusal, not a tick crash')
 end)
 
 print(string.format('%d auto rematch checks passed', count))

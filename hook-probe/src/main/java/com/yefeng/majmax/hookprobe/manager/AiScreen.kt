@@ -50,7 +50,13 @@ internal fun AiScreen(padding: PaddingValues) {
     var displayMode by remember { mutableStateOf(AssistantDisplayModeSettings.read(context)) }
     var showLicense by remember { mutableStateOf(false) }
     var autoDelay by remember { mutableStateOf(AutoDelaySettings.read(context)) }
-    var autoRematch by remember { mutableStateOf(AutoRematchSettings.read(context)) }
+    // Lives in AutoRematchState so a change made from the floating window or the in-game
+    // capsule shows up here as soon as this screen is composed/resumed.
+    val autoRematch by AutoRematchState.state.collectAsStateWithLifecycle()
+    DisposableEffect(Unit) {
+        AutoRematchState.mutable.value = AutoRematchSettings.read(context)
+        onDispose { }
+    }
     var fourModel by remember { mutableStateOf(OnnxModelStore.info(context, 4)) }
     var threeModel by remember { mutableStateOf(OnnxModelStore.info(context, 3)) }
     var modelMessage by remember { mutableStateOf("支持 Akagi ONNX，以及实验性四麻/三麻 Mortal v4（ONNX/PTH/PT，单文件上限 ${OnnxModelStore.MAX_MODEL_MIB} MiB）。自动识别人数并保存到对应槽位；兼容的自定义模型仍需手动开启无人值守。模型仅保存在本机。") }
@@ -129,13 +135,17 @@ internal fun AiScreen(padding: PaddingValues) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("整场结束后自动匹配（实验性）", modifier = Modifier.weight(1f),
                     style = MaterialTheme.typography.titleMedium)
-                Switch(checked = autoRematch, onCheckedChange = {
-                    autoRematch = it
-                    AutoRematchSettings.save(context, it)
+                Switch(checked = autoRematch, onCheckedChange = { value ->
+                    // Preference only: never starts/stops the service, never flips the
+                    // unattended opt-in and never touches the display mode.
+                    AiOverlayService.publishRematch(context, value)
                 }, modifier = Modifier.semantics {
                     contentDescription = "整场结束后自动匹配（实验性）"
                 })
             }
+            Text(if (!autoRematch) "当前未开启；也可在悬浮窗或游戏内顶部菜单直接切换。"
+                else if (!autoStatus.enabled) "已开启，但无人值守模式关闭，暂不生效；开启无人值守后按上条规则执行。"
+                else "已开启，且无人值守模式已开启。", style = MaterialTheme.typography.bodySmall)
             Text("默认关闭。仅在无人值守模式开启时生效，模型自检和关闭无人值守时都不会自动匹配。只调用游戏已有的结算、收益和下一局原按钮，不新增或伪造请求；遇到未知界面、对局中断或手动操作时暂停并等待。本场自动匹配失败或手动取消后不再重试；未知收益弹窗可能需要手动处理。",
                 style = MaterialTheme.typography.bodySmall)
         }

@@ -106,6 +106,47 @@ class AiOverlayService : Service() {
             .put("legalOperations", result.optJSONArray("legalOperations"))
 
         fun toggleAuto() { instance?.auto?.toggle() }
+
+        /**
+         * The auto-rematch opt-in as the user can see it right now: the persisted value
+         * plus whether this session may actually act on it. The stored flag always
+         * survives (it is a setting, not a session state); only *active* is gated by
+         * unattended mode and demo mode, exactly like the heartbeat in [autoRematchWanted].
+         */
+        private fun rematchState(): RematchState {
+            val service = instance
+            val live = service != null && service.alive.get()
+            val demo = service != null && service.demoMode.get()
+            val enabled = service?.let { AutoRematchSettings.read(it) } ?: AutoRematchState.mutable.value
+            val unattended = service != null && live && !demo && service.auto.isEnabled()
+            return RematchState(enabled = enabled, unattended = unattended, demo = demo)
+        }
+
+        /**
+         * Persists the auto-rematch opt-in without touching unattended mode, the service
+         * lifetime or the display mode. The next heartbeat carries the new value, so a
+         * revocation also cancels the adapter's pending settlement action.
+         */
+        internal fun setRematchEnabled(enabled: Boolean): Boolean? {
+            val service = instance
+            val context = service ?: return null
+            AutoRematchSettings.save(context, enabled)
+            DiagnosticsStore.appendAssistant(context, "INFO", "assistant.rematch", "OPT_IN",
+                JSONObject().put("enabled", enabled))
+            return enabled
+        }
+
+        /**
+         * Settings-page entry point. Works whether or not the service runs: the opt-in is
+         * only a preference, and the game reads it through the heartbeat (or through the
+         * status reply while the service is down).
+         */
+        internal fun publishRematch(context: Context, enabled: Boolean) {
+            AutoRematchSettings.save(context, enabled)
+            DiagnosticsStore.appendAssistant(context, "INFO", "assistant.rematch", "OPT_IN",
+                JSONObject().put("enabled", enabled))
+        }
+
         internal fun setAutoEnabled(enabled: Boolean): Boolean? {
             val service = instance ?: return null
             if (!service.alive.get() || service.demoMode.get()) return null
@@ -192,6 +233,9 @@ class AiOverlayService : Service() {
             if (!alive.get()) return
             applyDisplayMode()
             overlay?.updateAuto(AutoDiscardState.mutable.value)
+            // Pushed on the same 200 ms tick as the mode: the switch follows a change made
+            // in the manager UI or in-game without waiting for the overlay to be rebuilt.
+            overlay?.updateRematch(rematchState())
             if (recovery.shouldLaunch(auto.isEnabled() && !demoMode.get(), connected, SystemClock.elapsedRealtime())) {
                 runCatching {
                     val launch = checkNotNull(packageManager.getLaunchIntentForPackage(GAME))
@@ -209,6 +253,9 @@ class AiOverlayService : Service() {
         super.onCreate()
         instance = this
         auto.isEnabled() // Restore persisted opt-in only after the Service context is attached.
+        // Publish the stored auto-rematch opt-in before the first overlay is built, so the
+        // floating window's switch starts from the persisted value, not from "off".
+        AutoRematchSettings.publish(this)
         OnnxModelStore.initialize(this)
         DiagnosticsStore.appendAssistant(this, "INFO", "assistant.service", "SERVICE_STARTED")
         val notifications = getSystemService(NotificationManager::class.java)
@@ -266,7 +313,8 @@ class AiOverlayService : Service() {
             val needsReplay = overlay == null || badges == null
             if (overlay == null) {
                 runCatching {
-                    overlay = AiFloatingWindow(this, { stop(this) }, { auto.toggle() }).also { it.show() }
+                    overlay = AiFloatingWindow(this, { stop(this) }, { auto.toggle() },
+                        { enabled -> setRematchEnabled(enabled) }, { rematchState() }).also { it.show() }
                 }.onFailure {
                     overlay?.close(); overlay = null
                     DiagnosticsStore.appendAssistant(this, "WARN", "assistant.service", "LEGACY_OVERLAY_UNAVAILABLE")
@@ -361,7 +409,7 @@ class AiOverlayService : Service() {
 
     /** Opt-in AND unattended AND not in demo: the only state where rematch may be true. */
     private fun autoRematchWanted(): Boolean =
-        !demoMode.get() && auto.isEnabled() && AutoRematchSettings.read(this)
+        AutoRematchSettings.active(this, auto.isEnabled(), demoMode.get())
 
     /**
      * Bounded diagnostics for the experimental rematch acks. Only the adapter's fixed

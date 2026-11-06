@@ -11,9 +11,11 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.widget.CompoundButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,9 +23,22 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/** A small native overlay: only its bounds receive touches; text stays opaque. */
+/**
+ * System floating window. It renders the in-game hint plus two independent switches:
+ * unattended mode (owned by [AutoDiscardController]) and the experimental auto-rematch
+ * opt-in (owned by [AutoRematchSettings], persisted in its own file).
+ *
+ * The rematch switch is *not* a session control: tapping it always writes the
+ * preference through [setRematch] without stopping the service, toggling unattended
+ * mode or changing the display mode, and the switch position is then re-read from the
+ * authoritative [rematch] state on every 200 ms service tick, so it can never drift
+ * from the value the next heartbeat will ship. Switching it on while unattended mode
+ * is off (or during a self-test) is allowed and simply stays inert; the caption says
+ * why, because the game gates on both.
+ */
 internal class AiFloatingWindow(private val context: Context, private val stop: () -> Unit,
-    private val toggleAuto: () -> Unit) {
+    private val toggleAuto: () -> Unit, private val setRematch: (Boolean) -> Boolean?,
+    private val rematch: () -> RematchState) {
     private val windows = context.getSystemService(WindowManager::class.java)
     private val preferences = context.getSharedPreferences("ai-window", Context.MODE_PRIVATE)
     private val green = Color.rgb(114, 236, 176)
@@ -35,10 +50,14 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private var collapsed = preferences.getBoolean("collapsed", true)
     private var settings = false
     private var auto = AutoDiscardStatus()
+    private var rematchState = RematchState()
     private var result = JSONObject().put("status", "waiting").put("message", "等待牌局连接")
     private var root: LinearLayout? = null
     private var body: LinearLayout? = null
     private var title: TextView? = null
+    private var rematchSwitch: Switch? = null
+    private var rematchCaption: TextView? = null
+    private var rematchDetail: TextView? = null
     private val layout = WindowManager.LayoutParams(
         dp(width), WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -70,6 +89,18 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         if (collapsed) root?.background = background()
         if (!collapsed) renderBody()
     }
+
+    /**
+     * Follows the persisted opt-in (and its gate) from the service tick. Re-renders only
+     * when the real state changed, so a tap that is still being written is not
+     * overwritten by a repaint; when it did change, the switch, its caption and the
+     * disabled state are all refreshed together.
+     */
+    fun updateRematch(value: RematchState) {
+        if (rematchState == value) return
+        rematchState = value
+        applyRematch()
+    }
     private fun caption() = if (collapsed) (if (auto.enabled) "停" else "AI")
         else if (result.optString("status") == "demo") "本地自检 · 样例" else "雀魂 · 本地 AI"
 
@@ -99,6 +130,13 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
 
     private fun rebuild() {
         close()
+        // `close()` drops the view references; refresh from the authoritative state so a
+        // rebuild (collapse, resize, rotation) never shows a stale switch position.
+        rematchSwitch = null
+        rematchCaption = null
+        rematchDetail = null
+        // Never let a throwing state supplier tear down the window rebuild itself.
+        rematchState = runCatching { rematch() }.getOrNull() ?: rematchState
         val panel = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             background = background()
@@ -158,6 +196,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         content.addView(action(if (auto.enabled) "关闭无人值守模式" else "开启无人值守模式", "无人值守模式开关", toggleAuto).apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44))
         })
+        addRematchSwitch(content)
         if (settings) {
             addSlider(content, "背景不透明度", 25, 95, opacity, { "$it%" }) {
                 opacity = it; root?.background = background(); save()
@@ -269,6 +308,61 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val rate = if (shanten == 0) "和率 ${number(hand.optDouble("avg_agari_rate"))}%" else null
         return listOfNotNull(stage, "进张 $waits 枚", rate, if (hand.optBoolean("is_furiten")) "振听" else null, "风险 $risk")
             .joinToString(" · ")
+    }
+
+    /**
+     * "整场结束后自动匹配" switch. The listener is attached only after the initial
+     * `isChecked` is set, so restoring the persisted value never fires a write.
+     */
+    private fun addRematchSwitch(parent: LinearLayout) {
+        val caption = label(if (rematchState.enabled) "整场结束后自动匹配 · 开" else "整场结束后自动匹配 · 关",
+            13f, if (rematchState.active) green else muted, true)
+        parent.addView(caption)
+        val toggle = Switch(context).apply {
+            isChecked = rematchState.enabled
+            thumbTintList = ColorStateList.valueOf(if (rematchState.enabled) green else dimmed)
+            contentDescription = "整场结束后自动匹配（实验性）"
+            setPadding(dp(4), 0, dp(4), 0)
+            setOnCheckedChangeListener { _: CompoundButton, checked: Boolean -> onRematchTap(checked) }
+        }
+        rematchSwitch = toggle
+        parent.addView(toggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44)))
+        val detail = label(rematchText(), 11f, if (rematchState.active) muted else dimmed)
+        rematchDetail = detail
+        parent.addView(detail)
+        rematchCaption = caption
+        applyRematch()
+    }
+
+    /** Keeps switch, caption and explanation in one place so they can never disagree. */
+    private fun applyRematch() {
+        rematchSwitch?.isChecked = rematchState.enabled
+        rematchSwitch?.thumbTintList = ColorStateList.valueOf(if (rematchState.enabled) green else dimmed)
+        rematchCaption?.text = if (rematchState.enabled) "整场结束后自动匹配 · 开" else "整场结束后自动匹配 · 关"
+        rematchCaption?.setTextColor(if (rematchState.active) green else muted)
+        rematchDetail?.text = rematchText()
+        rematchDetail?.setTextColor(if (rematchState.active) muted else dimmed)
+    }
+
+    private fun rematchText(): String = when {
+        rematchState.demo -> "模型自检中不会自动匹配"
+        rematchState.enabled && !rematchState.unattended -> "已开启，但无人值守关闭时不生效"
+        rematchState.enabled -> "仅调用游戏的“下一局”原按钮；可随时在此关闭"
+        else -> "默认关闭。开启后仍需无人值守模式，不新增或伪造请求"
+    }
+
+    /**
+     * One tap = one preference write. The switch first snaps to the *stored* result of
+     * that write (never to the requested value), so a failed or unavailable write is
+     * visible immediately instead of leaving a lying switch; the next service tick then
+     * replaces it with the authoritative state.
+     */
+    private fun onRematchTap(checked: Boolean) {
+        val saved = runCatching { setRematch(checked) }.getOrNull()
+        // A null write result means "no service owns this preference right now": keep the
+        // last known value instead of painting the unchecked request as if it stuck.
+        rematchState = if (saved != null) rematchState.copy(enabled = saved) else rematch()
+        applyRematch()
     }
 
     private fun addSlider(parent: LinearLayout, name: String, min: Int, max: Int, value: Int,

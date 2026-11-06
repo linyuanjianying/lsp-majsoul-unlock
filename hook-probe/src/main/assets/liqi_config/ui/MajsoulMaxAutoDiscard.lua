@@ -27,6 +27,14 @@ local function claimProbe(id, stage)
     A.probeStages[stage] = true
     ack(id, 'probe', 'claim_' .. stage)
 end
+-- ToLua resolves a require'd global lazily: reading a not-yet-loaded one raises
+-- instead of returning nil. Plain `if X then` therefore throws on every call whose
+-- page is merely not open yet, and the error propagates through any boolean guard. Both are
+-- reachable from the settlement walk, which the world always ticks. Read globals
+-- through rawget so a missing page is "not there" and never an exception.
+local function g(name)
+    return rawget(_G, name)
+end
 local function tile(value)
     local honors = { E='1z', S='2z', W='3z', N='4z', P='5z', F='6z', C='7z' }
     if honors[value] then return honors[value] end
@@ -36,11 +44,14 @@ local function tile(value)
 end
 local function install()
     if not A.json then local ok, json = pcall(require, 'cjson'); if ok then A.json = json end end
-    if not A.json or not MJNetMgr or type(MJNetMgr.SendRequest) ~= 'function' then return false end
+    -- The network manager is a lazy require'd global: a plain `not MJNetMgr` would
+    -- trigger a lazy lookup before the hook is installed.
+    local net = g('MJNetMgr')
+    if not A.json or not net or type(net.SendRequest) ~= 'function' then return false end
     if not A.networkHooked then
         A.networkHooked = true
-        local original = MJNetMgr.SendRequest
-        function MJNetMgr:SendRequest(service, method, request, callback, ...)
+        local original = net.SendRequest
+        function net:SendRequest(service, method, request, callback, ...)
             if service == 'FastTest' and method == 'syncGame' and A.resyncing then
                 -- Rebuild the assistant from auth + the complete round, not a partial delta.
                 request.round_id = '-1'; request.step = 1000000
@@ -69,7 +80,7 @@ end
 
 -- Ranked rematch uses only the game's visible buttons and observed result pages.
 -- Never rebuild or replay a matchmaking RPC. Unknown/locked pages keep game control.
-local R = { generation = 0 }
+local R = { generation = 0, stopped = setmetatable({}, { __mode = 'k' }), misreads = {} }
 A.rematch = R
 function R.visible(o)
     local g = o and (o.gameObject or (o.transform and o.transform.gameObject) or o)
@@ -78,49 +89,128 @@ end
 function R.emit(state, reason)
     ack('', 'rematch_' .. state, reason)
 end
+-- Stopping is terminal for that settlement instance: a result page is shown once,
+-- so the same page can never be driven again after it was stopped, including from
+-- inside one of its own button callbacks.
+function R.stop(session)
+    if not session then return end
+    session.stopped = true; session.pending = nil
+    R.stopped[session] = true
+end
 function R.cancel(reason)
-    if R.session then R.session.stopped = true; R.session.pending = nil end
+    R.stop(R.session)
     if reason then R.emit('paused', reason) end
 end
+-- Names a failure of the settlement walk itself. It never travels: the Kotlin
+-- diagnostics only keep the fixed rematch_* vocabulary. A state that the walk
+-- cannot handle (a missing page, a changed class shape) must be a refusal to act,
+-- never an exception that aborts the surrounding unattended tick.
+local function fault(reason)
+    R.faults = (R.faults or 0) + 1
+    R.lastFault = reason
+end
+-- Pages that belong to someone else: when one of them is open the settlement walk
+-- stays out of the way instead of pressing through it. Activity rewards are the one
+-- exception: they are part of the settlement's own Task/ActivityReward steps and are
+-- closed through the page's currently bound listener (see act()), not through them.
+local function foreign()
+    local pages = {
+        { 'UI_GetReward', 'Inst' }, { 'UI_ErrorInfo', 'Inst' },
+    }
+    for _, page in ipairs(pages) do
+        local class = g(page[1])
+        local ui = class and class[page[2]]
+        if R.visible(ui) then return true end
+    end
+    return false
+end
+-- Cheap liveness gate: a settlement can only be driven while the game is still
+-- showing that match's result. No mode or network inspection here, so the walk
+-- stays harmless when called at any point of the match.
+function R.live()
+    local d = g('DesktopMgr') and g('DesktopMgr').Inst
+    local session = R.session
+    if not d or not session or session.stopped then return false end
+    local ui = session.ui
+    if R.visible(ui) then return true end
+    local popup = g('UI_AnotherGameConfirm') and g('UI_AnotherGameConfirm').Inst
+    return R.visible(popup) or false
+end
+-- Re-anchor the walk on the page that is actually up. Normally R.act() gets its
+-- session from the OnShow hook; when this module loaded after the page was already
+-- raised that hook never fired, so the live page (which still carries its
+-- game_end_result) is adopted here instead of waiting for a show that is over.
+-- UIBase:Inherit() instances reach class methods through the metatable, so Btn_Again
+-- and Btn_Next resolve through the same chain the game's own buttons use.
+function R.attachLive()
+    local session = R.session
+    if session and not session.stopped then return session end
+    local ui = g('UI_GameEnd') and g('UI_GameEnd').Inst
+    if R.visible(ui) then return R.observe(ui, nil) end
+    return nil
+end
+function R.observe(ui, data)
+    -- One show per result page; a stopped instance never becomes a session again.
+    if ui and R.stopped[ui] then R.session = nil; return nil end
+    R.generation = R.generation + 1
+    local value = data and data.game_end_result
+    -- The hook may be installed after the page was already raised (a module that
+    -- attaches mid-settlement): adopt the session from the live page instead of
+    -- waiting for a show that already happened.
+    if not value and ui then
+        local ok, current = pcall(function() return ui.game_end_result end)
+        if ok then value = current end
+    end
+    local next = value and type(value.players) == 'table' and #value.players > 0
+        and { ui = ui, generation = R.generation, seen = {} } or nil
+    if next and R.session and R.session.ui == ui and R.session.stopped then return R.session end
+    R.session = next
+    return R.session
+end
 function R.installHooks()
-    local c = UI_GameEnd
+    local c = g('UI_GameEnd')
     if c and type(c.OnShow) == 'function' and not c._majmaxRematchShow then
         c._majmaxRematchShow = true
         local original = c.OnShow
         function c:OnShow(callback, data, ...)
             local result = original(self, callback, data, ...)
-            if not (data and data.reopen) then
-                R.generation = R.generation + 1
-                local value = data and data.game_end_result
-                R.session = value and type(value.players) == 'table' and #value.players > 0
-                    and { ui = self, generation = R.generation, seen = {} } or nil
-            end
+            if not (data and data.reopen) then R.observe(self, data) end
             return result
         end
     end
-    local c = UI_AnotherGameConfirm
-    if c and not c._majmaxRematchHooks then
+    local p = g('UI_AnotherGameConfirm')
+    if p and not p._majmaxRematchHooks then
         -- Retry installation if this class is not fully loaded yet.
-        if type(c.Cancel) ~= 'function' or type(c.Confirm) ~= 'function' then return end
-        c._majmaxRematchHooks = true
-        local cancel, confirm = c.Cancel, c.Confirm
-        function c:Cancel(...)
+        if type(p.Cancel) ~= 'function' or type(p.Confirm) ~= 'function' then return end
+        p._majmaxRematchHooks = true
+        local cancel, confirm = p.Cancel, p.Confirm
+        function p:Cancel(...)
             R.cancel('manual_cancel')
             return cancel(self, ...)
         end
-        function c:Confirm(...)
+        function p:Confirm(...)
+            -- Confirming is terminal however it was started. A user confirm opts that
+            -- settlement out; it never re-arms the walk on the same page.
             if not R.executing then R.cancel('manual_confirm') end
             return confirm(self, ...)
         end
     end
 end
+-- Ranked-table identity of the current match, or nil. Called from the per-frame
+-- tick, so a half-initialized DesktopMgr must read as "not a ranked table yet",
+-- never as an exception.
 function R.mode(d)
-    local config = d and d.game_config
-    local mode = config and config.mode and config.mode.mode
-    return d and GameUtility and GameUtility.EMJ_Mode and d.mode == GameUtility.EMJ_Mode.play
-        and not d.duringReconnect and not d.time_stopped and config.category == 2
-        and (mode == 1 or mode == 2 or mode == 11 or mode == 12)
-        and config.meta and config.meta.mode_id
+    local ok, value = pcall(function()
+        local config = d and d.game_config
+        local mode = config and config.mode and config.mode.mode
+        local utility = g('GameUtility')
+        return utility ~= nil and d.mode == utility.EMJ_Mode.play
+            and not d.duringReconnect and not d.time_stopped and config.category == 2
+            and (mode == 1 or mode == 2 or mode == 11 or mode == 12)
+            and config.meta and config.meta.mode_id
+    end)
+    if not ok then R.misreads[#R.misreads + 1] = 'mode'; return nil end
+    return value
 end
 function R.delay(command)
     local lo, hi = command.delayMinMs, command.delayMaxMs
@@ -132,22 +222,34 @@ function R.delay(command)
 end
 function R.act(command, now)
     R.installHooks()
+    local session = R.session
     if not A.armed or command.autoRematch ~= true then
-        -- Revoking the lease cancels waiting actions, but never clears a manual stop.
-        if R.session then R.session.pending = nil end
+        -- Revoking the lease cancels waiting actions but never clears a manual stop.
+        if session then R.stop(session); A.revoked = session end
         return false
     end
-    local session = R.session
-    local d = DesktopMgr and DesktopMgr.Inst
-    local mode = R.mode(d)
-    local net = MJNetMgr and MJNetMgr.Inst
-    if not session or not now or not mode then return false end
+    -- A stopped result page is never driven again: re-enabling the option applies to
+    -- the next result page, not to the one the user already took over. The single
+    -- exception is a session that was merely revoked (switch off, empty heartbeat):
+    -- turning the switch back on while that page is still up picks it up again.
+    if session and R.stopped[session] and A.revoked ~= session then return false end
+    if not session or not now then return false end
+    -- Re-arming a revoked page: clear the stop so the page gets one more walk.
+    if R.stopped[session] then session.stopped = nil; R.stopped[session] = nil; A.revoked = nil end
+    -- `shown` is the settlement page and the only thing this walk ever drives. Every
+    -- other guard below is evaluated only once that page is actually up, so a
+    -- settlement elsewhere in the match cannot fault on unrelated globals.
     local ui = session.ui
-    local popup = UI_AnotherGameConfirm and UI_AnotherGameConfirm.Inst
     local shown = R.visible(ui)
-    if not shown and not R.visible(popup) then return false end
+    local shownPopup = g('UI_AnotherGameConfirm') and g('UI_AnotherGameConfirm').Inst
+    if not shown and not (session.againAt and R.visible(shownPopup)) then return false end
+    local d = g('DesktopMgr') and g('DesktopMgr').Inst
+    local mode = R.mode(d)
+    if not mode then return false end
+    local popup = g('UI_AnotherGameConfirm') and g('UI_AnotherGameConfirm').Inst
     -- Do not fall through to the old match's resync while final results are open.
     if session.stopped or session.done then return true end
+    local net = g('MJNetMgr') and g('MJNetMgr').Inst
     if not net or type(net.IsOK) ~= 'function' or not net:IsOK() then
         session.pending = nil; return true
     end
@@ -155,24 +257,30 @@ function R.act(command, now)
         if now - session.againAt > 15 then R.cancel('confirmation_timeout'); return true end
         if not R.visible(popup) or popup.locking or popup.enable ~= true then return true end
         if mode ~= session.mode or popup.match_id ~= session.mode then R.cancel('match_mismatch'); return true end
+        local confirm = popup.Confirm
+        if type(confirm) ~= 'function' then fault('confirm_unavailable'); session.pending = nil; return true end
         session.done = true -- latch before invoking: a callback can hide/destroy the UI
         R.executing = true
-        local ok = pcall(popup.Confirm, popup)
+        local ok = pcall(confirm, popup)
         R.executing = nil
         R.emit(ok and 'confirmed' or 'failed', ok and 'confirmation_invoked' or 'confirm_exception')
         return true
     end
     if R.visible(popup) then return true end -- never confirm a manually opened popup
-    if not shown or ui.locking or ui.isDoAnimation then session.pending = nil; return true end
-    if R.visible(UI_GetReward and UI_GetReward.Inst) then session.pending = nil; return true end
+    if ui.locking or ui.isDoAnimation then session.pending = nil; return true end
+    if foreign() then session.pending = nil; return true end
     local step = ui.step
     local known = { [0]=true,[30]=true,[31]=true,[50]=true,[51]=true,[60]=true,
         [70]=true,[80]=true,[90]=true,[91]=true,[100]=true }
-    if not known[step] then return true end
+    -- An unknown step is a page this build does not understand: stop, never press.
+    if not known[step] then session.pending = nil; return true end
     local again = ui.btn_again
-    local reward = UI_MJReward_Activity and UI_MJReward_Activity.Inst
+    local reward = g('UI_MJReward_Activity') and g('UI_MJReward_Activity').Inst
     if R.visible(reward) and reward.locking then session.pending = nil; return true end
-    local action = not R.visible(reward) and R.visible(again) and again.interactable ~= false and 'again' or 'next'
+    -- `again` is the ranked rematch opt-in: the result page offers it only when a
+    -- same-mode queue is still possible. Next pages the settlement forward.
+    local action = R.visible(reward) and 'next'
+        or (R.visible(again) and again.interactable ~= false and 'again' or 'next')
     local button = action == 'again' and again or ui.btn_next
     if not R.visible(button) or button.interactable == false then session.pending = nil; return true end
     local key = action .. ':' .. tostring(step) .. ':' .. tostring(ui._index or 0)
@@ -193,8 +301,13 @@ function R.act(command, now)
     local ok
     if action == 'again' then
         session.againAt, session.mode = now, mode
-        -- Btn_Again is the exact callback installed on the native Again button.
-        ok = pcall(ui.Btn_Again, ui)
+        -- Btn_Again is a UIBase class method; the instance reaches it through its
+        -- metatable, so it is copied to the instance only when the class provides it.
+        local method = ui.Btn_Again
+        if type(method) ~= 'function' then
+            session.againAt = nil; fault('again_unavailable'); return true
+        end
+        ok = pcall(method, ui)
     else
         -- Activity rewards rebind this listener to TryClose: preserve that binding.
         if not button.onClick or type(button.onClick.Invoke) ~= 'function' then
@@ -225,22 +338,28 @@ local function delaySeconds(command)
 end
 local function continuation(command)
     local t = seconds()
-    local d = DesktopMgr and DesktopMgr.Inst
-    local net = MJNetMgr and MJNetMgr.Inst
+    local dm = g('DesktopMgr')
+    local d = dm and dm.Inst
+    local net = g('MJNetMgr') and g('MJNetMgr').Inst
     local mode = d and d.game_config and d.game_config.mode and d.game_config.mode.mode
-    if not A.armed or not t or not d or not DesktopMgr.IsActive() or not GameUtility
+    if not A.armed or not t or not d or not dm.IsActive() or not g('GameUtility')
             or d.mode ~= GameUtility.EMJ_Mode.play or d.duringReconnect or d.time_stopped
             or not net or not net:IsOK() or (mode ~= 1 and mode ~= 2 and mode ~= 11 and mode ~= 12) then
         A.continuation = nil; A.resyncDue = nil; return
     end
+    -- A settlement walk is in charge from the moment the final ranking is up: the
+    -- previous match's continuation must not press through it (the result page's own
+    -- confirm closes the round and ends the match before the rematch can be given).
+    local rematch = R.session ~= nil and R.session.stopped ~= true and R.live()
     -- Only known game result/next-round controls; never starts a new match.
     local candidates = {
-        {UI_Win, '_onConfirm'}, {UI_HuleShow, 'Btn_Confirm'},
-        {UI_ScoreChange, 'Btn_Confirm'}, {UI_ConfirmNewRound, 'Btn_Confirm'},
-        {UI_HangUpWarn, 'Btn_Confirm', true}
+        { 'UI_Win', '_onConfirm' }, { 'UI_HuleShow', 'Btn_Confirm' },
+        { 'UI_ScoreChange', 'Btn_Confirm' }, { 'UI_ConfirmNewRound', 'Btn_Confirm' },
+        { 'UI_HangUpWarn', 'Btn_Confirm', true }
     }
     for _, item in ipairs(candidates) do
-        local class, method, root = item[1], item[2], item[3]
+        local name, method, root = item[1], item[2], item[3]
+        local class = g(name)
         if class and type(class.OnShow) == 'function' and not class._majmaxShowHook then
             class._majmaxShowHook = true
             local original = class.OnShow
@@ -255,6 +374,7 @@ local function continuation(command)
         if ui and owner and active(ui) and active(btn) and btn.interactable ~= false
                 and not ui.locking and not owner.locking and not ui.isDoAnimation
                 and type(owner[method]) == 'function' then
+            if rematch then A.continuation = nil; A.resyncDue = nil; return end
             local key = tostring(ui._majmaxShow or 0)..':'..tostring(ui.current_index or 0)
                 ..':'..tostring(ui.during_show_liujumanguan or false)
             local pending = A.continuation
@@ -272,7 +392,9 @@ local function continuation(command)
         end
     end
     A.continuation = nil
-    if command.control == 'mode' and command.resync and d.gameing
+    -- The ranked rematch needs a live socket: it confirms the queue through the
+    -- game's own buttons instead of rebuilding the matchmaking RPC.
+    if command.control == 'mode' and command.resync and d.gameing and not rematch
             and type(net._connectSuccess) == 'function' and t >= (A.nextResync or 0) then
         A.resyncDue = A.resyncDue or (t + delaySeconds(command))
         if t >= A.resyncDue then
@@ -294,13 +416,15 @@ local function execute(command)
         if claimKind then claimWaiting(id, 'capture_proof') else waiting(id, 'capture_proof') end
         return
     end
-    local d = DesktopMgr and DesktopMgr.Inst
+    local dm = g('DesktopMgr')
+    local d = dm and dm.Inst
     local r = d and d.mainrole
-    local enums = GameUtility and GameUtility.EMJ_Mode
-    local ops = GameUtility and GameUtility.E_PlayerOperation
-    if not d or not r or not enums or not ops or not d.gameing or not DesktopMgr.IsActive()
+    local enums = g('GameUtility') and GameUtility.EMJ_Mode
+    local ops = g('GameUtility') and GameUtility.E_PlayerOperation
+    local net = g('MJNetMgr')
+    if not d or not r or not enums or not ops or not d.gameing or not dm.IsActive()
             or d.mode ~= enums.play or d.duringReconnect or d.time_stopped
-            or not MJNetMgr or not MJNetMgr.Inst or not MJNetMgr.Inst:IsOK() then
+            or not net or not net.Inst or not net.Inst:IsOK() then
         waiting(id, claimKind and 'claim_game_window' or 'game_window'); return
     end
     -- The network snapshot arrives before the game's draw animation finishes.
@@ -376,11 +500,11 @@ local function execute(command)
         -- Unity property access may throw before the ordinary readiness check can report.
         -- Fixed stage codes only: do not transmit exception strings or game objects.
         local ok
-        ok, claim = pcall(function() return UI_ChiPengHu and UI_ChiPengHu.Inst end)
+        ok, claim = pcall(function() return g('UI_ChiPengHu') and g('UI_ChiPengHu').Inst end)
         if not ok then claimWaiting(id, 'ui_instance_exception'); return end
     else
-        own = UI_LiqiZimo and UI_LiqiZimo.Inst
-        claim = UI_ChiPengHu and UI_ChiPengHu.Inst
+        own = g('UI_LiqiZimo') and g('UI_LiqiZimo').Inst
+        claim = g('UI_ChiPengHu') and g('UI_ChiPengHu').Inst
     end
     local function ready(ui)
         return ui and ui.transform and ui.transform.gameObject.activeInHierarchy and not ui.on_do_operation
@@ -676,7 +800,8 @@ end
 -- UI_LiqiZimo covers the player's own turn), but each button is reported with its
 -- owning UI so a button that exists on both can still be told apart.
 local function reportButtonCoords()
-    local d = DesktopMgr and DesktopMgr.Inst
+    local dm = g('DesktopMgr')
+    local d = dm and dm.Inst
     local r = d and d.mainrole
     local Screen = UnityEngine and UnityEngine.Screen
     local screenW = Screen and Screen.width
@@ -689,8 +814,8 @@ local function reportButtonCoords()
     -- `active`/`seconds` are defined above; the button list below mirrors execute()'s
     -- button(name, method) lookups so the labels can never point at a button the
     -- autoplayer itself would not consider pressable.
-    local claim = UI_ChiPengHu and UI_ChiPengHu.Inst
-    local own = UI_LiqiZimo and UI_LiqiZimo.Inst
+    local claim = g('UI_ChiPengHu') and g('UI_ChiPengHu').Inst
+    local own = g('UI_LiqiZimo') and g('UI_LiqiZimo').Inst
     local screens = {}
     local function collect(ui, buttons)
         if not ui then return end
@@ -792,7 +917,8 @@ local function reportButtonCoords()
 end
 
 local function reportHandCoords()
-    local d = DesktopMgr and DesktopMgr.Inst
+    local dm = g('DesktopMgr')
+    local d = dm and dm.Inst
     local r = d and d.mainrole
     local Screen = UnityEngine and UnityEngine.Screen
     local screenW = Screen and Screen.width
@@ -977,7 +1103,9 @@ local function reportHandCoords()
     end
 end
 
-function __majmax_auto_tick()
+-- One tick body. Returns the decoded command so a caller can resume the work the
+-- settlement walk deferred without asking the controller twice.
+local function runTick()
     local ok = pcall(function()
         if not install() then return end
         pcall(reportHandCoords)
@@ -989,18 +1117,53 @@ function __majmax_auto_tick()
             if R.session then R.session.pending = nil end
             return
         end
-        local command = A.json.decode(text)
+        local command = A.json and A.json.decode(text) or nil
         if type(command) == 'table' then
             A.armed = (command.control == 'mode' and command.enabled == true) or command.unattended == true
+            -- Adopt a settlement page that was already up when this module attached.
+            pcall(R.attachLive)
             -- Rematch runs first: while a settlement is being walked, the previous
             -- match's own continuation/resync must not race the new match.
             local settled = false
-            local okTick = pcall(function() settled = R.act(command, seconds()) end)
-            if not okTick then R.cancel('adapter_exception'); return end
+            local okTick, tickError = pcall(function() settled = R.act(command, seconds()) end)
+            if not okTick then
+                -- The settlement walk owns only its own pages. When it raises, it
+                -- stops itself and defers the remaining work to the end of this
+                -- tick so the unattended continuation/execute path still runs: a
+                -- broken rematch step must never take card play down with it.
+                pcall(function()
+                    if R.session then R.session.stopped = true; R.session.pending = nil end
+                    if type(tickError) == 'string' and tickError:find('rawget', 1, true) then
+                        A.needsReinstall = true
+                    end
+                end)
+                ack('', 'rematch_failed', 'adapter_exception')
+                A.rematchDeferred = command
+                return
+            end
             if settled then return end
             continuation(command)
             if command.control ~= 'mode' then execute(command) end
         end
     end)
     if not ok then ack('', 'adapter_exception') end
+end
+function __majmax_auto_tick()
+    -- Rebuilt every tick because the shared state can be reset from outside. `g`
+    -- travels with the module so a later tick can still read globals safely.
+    A.g = g
+    if A.needsReinstall and R.installHooks then
+        A.needsReinstall = nil
+        pcall(R.installHooks)
+    end
+    runTick()
+    -- The native pump calls __majmax_auto_tick once per frame, so anything the
+    -- settlement walk deferred is resumed at the end of this same tick instead of
+    -- being skipped until the next one.
+    local command = A.rematchDeferred
+    if command then
+        A.rematchDeferred = nil
+        pcall(continuation, command)
+        if command.control ~= 'mode' then pcall(execute, command) end
+    end
 end
