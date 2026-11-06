@@ -249,10 +249,8 @@ function R.act(command, now)
     local popup = g('UI_AnotherGameConfirm') and g('UI_AnotherGameConfirm').Inst
     -- Do not fall through to the old match's resync while final results are open.
     if session.stopped or session.done then return true end
-    local net = g('MJNetMgr') and g('MJNetMgr').Inst
-    if not net or type(net.IsOK) ~= 'function' or not net:IsOK() then
-        session.pending = nil; return true
-    end
+    -- NotifyGameEndResult closes MJNetMgr after three seconds by design.
+    -- Final result buttons run locally; only live tile actions require that socket.
     if session.againAt then
         if now - session.againAt > 15 then R.cancel('confirmation_timeout'); return true end
         if not R.visible(popup) or popup.locking or popup.enable ~= true then return true end
@@ -310,10 +308,17 @@ function R.act(command, now)
         ok = pcall(method, ui)
     else
         -- Activity rewards rebind this listener to TryClose: preserve that binding.
-        if not button.onClick or type(button.onClick.Invoke) ~= 'function' then
-            R.cancel('listener_unavailable'); return true
+        if step == 70 and R.visible(reward) then
+            -- Only activity reward pages rebind Next to their TryClose handler.
+            if not button.onClick or type(button.onClick.Invoke) ~= 'function' then
+                R.cancel('listener_unavailable'); return true
+            end
+            ok = pcall(button.onClick.Invoke, button.onClick)
+        else
+            local method = ui.Btn_Next
+            if type(method) ~= 'function' then R.cancel('next_unavailable'); return true end
+            ok = pcall(method, ui)
         end
-        ok = pcall(button.onClick.Invoke, button.onClick)
     end
     if not ok then R.cancel(); R.emit('failed', action == 'again' and 'again_exception' or 'next_exception')
     else R.emit(action == 'again' and 'again' or 'step', action == 'again' and 'again_invoked' or 'next_invoked') end

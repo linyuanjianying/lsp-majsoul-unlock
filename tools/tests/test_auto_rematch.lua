@@ -609,4 +609,20 @@ test('a missing confirm method is a bounded refusal', function(s)
         'a missing confirm is a refusal, not a tick crash')
 end)
 
+test('normal final ranking advances after the game closes its table socket', function(s)
+    prime(s); command(s)
+    s.gameEnd.btn_again.activeInHierarchy = false
+    MJNetMgr.Inst.IsOK = function() return false end
+    tick(s, 0.1)
+    assert(#s.nextPushed == 1, 'rank confirmation must run without a live table connection')
+    assert(s.gameEnd.btn_next.clicks == 0, 'ranking uses its known Lua callback, not an empty UnityEvent')
+end)
+
+test('native rematch confirmation works after final table socket closure', function(s)
+    prime(s); command(s)
+    MJNetMgr.Inst.IsOK = function() return false end
+    drive(s, 0, 2)
+    assert(s.again == 1 and s.confirmAttempts == 1, 'old table socket is not a matchmaking prerequisite')
+end)
+
 print(string.format('%d auto rematch checks passed', count))
