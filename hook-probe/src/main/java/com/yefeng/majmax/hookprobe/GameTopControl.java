@@ -5,9 +5,13 @@ import android.app.Application;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -69,6 +73,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private static final int STAGE_CAPSULE = 1;
     private static final int STAGE_MENU = 2;
 
+    /** Sidebar sections of the expanded menu. */
+    private static final int TAB_CONTROL = 0;
+    private static final int TAB_STATUS = 1;
+
+    /* Plain tag keys for the card parts (no resource ids exist in this module). */
+    private static final int TAG_TITLE = 0x7E010001;
+    private static final int TAG_STATE = 0x7E010002;
+    private static final int TAG_NOTE = 0x7E010003;
+    private static final int TAG_SWITCH = 0x7E010004;
+
     private static final long POLL_MENU_MS = 1_000L;
     private static final long POLL_IDLE_MS = 3_000L;
     private static final long REQUEST_TIMEOUT_MS = 8_000L;
@@ -87,19 +101,58 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private final AtomicBoolean pollBusy = new AtomicBoolean();
 
     private WeakReference<Activity> active = new WeakReference<>(null);
-    private LinearLayout panel;
+    private FrameLayout panel;
+    private FrameLayout.LayoutParams panelParams;
+    private GameTopUi.DragController drag;
+
+    /** Collapsed floating bubble. Tapping it expands the menu, tapping again collapses. */
     private TextView handle;
+    /** Wide "collapsed but informative" pill between handle and menu. */
     private TextView capsule;
+
+    /** Expanded menu: light rounded panel with a left sidebar and two switch cards. */
     private LinearLayout menu;
     private TextView title;
-    private TextView toggle;
-    private TextView rematchRow;
-    private TextView detail;
-    private TextView manual;
-    private TextView collapse;
+    private View titleDot;
+    private LinearLayout tabControl;
+    private LinearLayout tabStatus;
+    private TextView tabControlLabel;
+    private TextView tabStatusLabel;
+
+    private LinearLayout pageControl;
+    private LinearLayout pageStatus;
+
+    /* Switch card 1: unattended mode (assistLaunch / autoSet). */
+    private LinearLayout unattendedCard;
+    private TextView unattendedTitle;
+    private TextView unattendedState;
+    private TextView unattendedNote;
+    private GameTopUi.Switch unattendedSwitch;
+
+    /* Switch card 2: auto-rematch (rematchSet), independent of card 1. */
+    private LinearLayout rematchCard;
+    private TextView rematchTitle;
+    private TextView rematchState;
+    private TextView rematchNote;
+    private GameTopUi.Switch rematchSwitch;
+
+    /* Status page: runtime facts and the start/stop/manual/collapse actions. */
+    private TextView statusMode;
+    private TextView statusDetail;
+    private TextView statusService;
+    private TextView statusRematch;
+    private TextView startStop;
+    private LinearLayout manualRow;
+    private LinearLayout collapseRow;
 
     /** Survives activity switches so the menu does not collapse on every transition. */
     private int stage = STAGE_HANDLE;
+    private int tab = TAB_CONTROL;
+    /**
+     * True once the user dragged the bubble. A pinned control keeps the user's corner
+     * and is only clamped to the window; an unpinned one stays top-centre as before.
+     */
+    private boolean pinned;
     private int generation;
     private final GameHintLayer hints = new GameHintLayer();
 
@@ -167,10 +220,17 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (!(decor instanceof ViewGroup)) return;
         active = new WeakReference<>(activity);
         panel = build(activity);
-        ((ViewGroup) decor).addView(panel, new FrameLayout.LayoutParams(
+        // Wrap-content child of the decor view: it never covers the game's own touch
+        // surface, and the only drag listener sits on the collapsed handle.
+        panelParams = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+            Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        ((ViewGroup) decor).addView(panel, panelParams);
+        drag = new GameTopUi.DragController(panel, panelParams);
+        drag.setOnDragged(() -> pinned = true);
+        handle.setOnTouchListener(drag);
         applyState();
+        drag.reflow(!pinned);
         hints.attach(activity);
         schedulePoll(0L);
     }
@@ -183,94 +243,373 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             ((ViewGroup) panel.getParent()).removeView(panel);
         }
         panel = null;
-        handle = capsule = title = toggle = rematchRow = detail = manual = collapse = null;
+        panelParams = null;
+        drag = null;
+        handle = null;
+        capsule = null;
         menu = null;
+        title = null;
+        titleDot = null;
+        tabControl = tabStatus = null;
+        tabControlLabel = tabStatusLabel = null;
+        pageControl = pageStatus = null;
+        unattendedCard = null;
+        unattendedTitle = unattendedState = unattendedNote = null;
+        unattendedSwitch = null;
+        rematchCard = null;
+        rematchTitle = rematchState = rematchNote = null;
+        rematchSwitch = null;
+        statusMode = statusDetail = statusService = statusRematch = null;
+        startStop = null;
+        manualRow = collapseRow = null;
         active.clear();
     }
 
     /* ---------------------------------------------------------------------- UI */
 
     private static int dp(Context context, int value) {
-        return (int) (value * context.getResources().getDisplayMetrics().density + .5f);
+        return GameTopUi.dp(context, value);
     }
 
-    private TextView label(Activity activity, int size, int height, int padding) {
-        TextView view = new TextView(activity);
-        view.setTextColor(Color.WHITE);
-        view.setTextSize(size);
+    /** Rounds a pressable background so taps get a ripple inside the rounded shape. */
+    private static void ripple(View view, GradientDrawable shape) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            view.setBackground(new RippleDrawable(
+                ColorStateList.valueOf(0x1F2F6FE4), shape, null));
+        } else {
+            view.setBackground(shape);
+        }
+    }
+
+    private TextView cell(Context context, float size, int color, boolean bold) {
+        TextView view = GameTopUi.text(context, size, color, bold);
         view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(activity, padding), 0, dp(activity, padding), 0);
-        view.setMinHeight(dp(activity, height));
+        view.setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6));
+        view.setMinHeight(dp(context, 32));
         return view;
     }
 
-    private LinearLayout build(Activity activity) {
-        LinearLayout root = new LinearLayout(activity);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER_HORIZONTAL);
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(Color.argb(225, 20, 31, 29));
-        background.setCornerRadii(new float[] {
-            0, 0, 0, 0, dp(activity, 16), dp(activity, 16), dp(activity, 16), dp(activity, 16)
-        });
-        root.setBackground(background);
-        root.setElevation(dp(activity, 8));
+    /** Small, round flat button used for the collapsed bubble and the collapse row. */
+    private TextView bubbleButton(Activity activity, String label, String description) {
+        TextView view = cell(activity, 15, GameTopUi.ACCENT, true);
+        view.setText(label);
+        view.setContentDescription(description);
+        GradientDrawable shape = GameTopUi.round(activity, 15, GameTopUi.CARD, 0x332F6FE4, 1);
+        ripple(view, shape);
+        view.setElevation(dp(activity, 6));
+        return view;
+    }
 
-        handle = label(activity, 14, 18, 14);
-        handle.setText("⌄");
-        handle.setContentDescription("展开雀魂助手胶囊");
+    /** Opens the menu on the control page and asks for a fresh status immediately. */
+    private void expand() {
+        stage = STAGE_MENU;
+        tab = TAB_CONTROL;
+        applyState();
+        schedulePoll(0L);
+    }
+
+    private FrameLayout build(Activity activity) {
+        FrameLayout root = new FrameLayout(activity);
+        root.setClipChildren(false);
+        root.setClipToPadding(false);
+
+        handle = bubbleButton(activity, "雀", "展开雀魂助手");
         handle.setOnClickListener(view -> {
-            stage = STAGE_CAPSULE;
-            applyState();
+            // Tap the bubble to expand, tap the collapse row to go back: one entry
+            // point, no hidden stage in between.
+            if (stage == STAGE_MENU) {
+                stage = STAGE_HANDLE;
+                applyState();
+            } else {
+                expand();
+            }
         });
-        root.addView(handle);
+        FrameLayout.LayoutParams handleParams = new FrameLayout.LayoutParams(
+            dp(activity, 40), dp(activity, 40), Gravity.TOP | Gravity.START);
+        root.addView(handle, handleParams);
 
-        capsule = label(activity, 14, 34, 14);
+        capsule = cell(activity, 13, GameTopUi.INK_MUTED, false);
         capsule.setContentDescription("打开雀魂助手菜单");
-        capsule.setOnClickListener(view -> {
-            stage = STAGE_MENU;
-            applyState();
-            schedulePoll(0L);
-        });
-        root.addView(capsule);
+        ripple(capsule, GameTopUi.round(activity, 14, GameTopUi.CARD, 0x332F6FE4, 1));
+        capsule.setElevation(dp(activity, 4));
+        capsule.setOnClickListener(view -> expand());
+        FrameLayout.LayoutParams capsuleParams = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP | Gravity.START);
+        capsuleParams.leftMargin = dp(activity, 48);
+        root.addView(capsule, capsuleParams);
 
-        menu = new LinearLayout(activity);
-        menu.setOrientation(LinearLayout.VERTICAL);
-        menu.setGravity(Gravity.CENTER_HORIZONTAL);
-        menu.setPadding(dp(activity, 4), dp(activity, 4), dp(activity, 4), dp(activity, 6));
-        root.addView(menu);
+        menu = buildMenu(activity);
+        root.addView(menu, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP | Gravity.START));
+        return root;
+    }
 
-        title = label(activity, 12, 22, 10);
-        title.setGravity(Gravity.CENTER);
-        menu.addView(title);
+    /**
+     * Vertical LinearLayout capped to a maximum height. Used for the expanded panel so
+     * it can never grow past the window in landscape; the inner pages are measured
+     * against the cap, and the top of the panel (header, sidebar) stays reachable.
+     */
+    private static final class CappedColumn extends LinearLayout {
+        private final int maxHeight;
 
-        toggle = label(activity, 14, 44, 16);
-        toggle.setOnClickListener(view -> onToggle());
-        menu.addView(toggle);
+        CappedColumn(Context context, int maxHeight) {
+            super(context);
+            this.maxHeight = Math.max(0, maxHeight);
+            setOrientation(VERTICAL);
+        }
 
-        // Independent of the unattended row above: this only flips the persisted
-        // auto-rematch preference, so it stays tappable while unattended mode is off.
-        rematchRow = label(activity, 14, 44, 16);
-        rematchRow.setOnClickListener(view -> onRematchToggle());
-        menu.addView(rematchRow);
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            boolean bounded = MeasureSpec.getMode(heightSpec) != MeasureSpec.UNSPECIFIED;
+            int limit = bounded
+                ? Math.min(MeasureSpec.getSize(heightSpec), maxHeight)
+                : maxHeight;
+            if (maxHeight > 0) {
+                heightSpec = MeasureSpec.makeMeasureSpec(limit, MeasureSpec.AT_MOST);
+            }
+            super.onMeasure(widthSpec, heightSpec);
+            int measured = getMeasuredHeight();
+            if (maxHeight > 0 && measured > limit) {
+                setMeasuredDimension(getMeasuredWidth(), limit);
+            }
+        }
+    }
 
-        detail = label(activity, 11, 16, 10);
-        menu.addView(detail);
+    /** The expanded panel: white rounded surface, sidebar, two pages. */
+    private LinearLayout buildMenu(Activity activity) {
+        int maxHeight = Math.round(activity.getResources().getDisplayMetrics().heightPixels
+            - 4 * GameTopUi.density(activity) * 8);
+        LinearLayout panelView = new CappedColumn(activity, maxHeight);
+        panelView.setBackground(GameTopUi.panel(activity));
+        panelView.setPadding(dp(activity, 12), dp(activity, 10), dp(activity, 12), dp(activity, 10));
+        panelView.setElevation(dp(activity, 12));
+        // Width is capped so a narrow portrait screen never pushes the panel off-screen;
+        // the status page scrolls instead of growing past the window height.
+        int width = Math.min(dp(activity, 272),
+            Math.max(dp(activity, 232), Math.round(screenWidthDp(activity) * 0.84f)));
+        panelView.setMinimumWidth(width);
 
-        manual = label(activity, 12, 32, 12);
-        manual.setTextColor(Color.rgb(140, 214, 186));
-        manual.setOnClickListener(view -> openManager());
-        menu.addView(manual);
 
-        collapse = label(activity, 12, 30, 14);
-        collapse.setText("收起  ⌃");
-        collapse.setTextColor(Color.rgb(170, 190, 185));
-        collapse.setOnClickListener(view -> {
+        panelView.addView(buildHeader(activity));
+        panelView.addView(GameTopUi.divider(activity));
+
+        LinearLayout body = new LinearLayout(activity);
+        body.setOrientation(LinearLayout.HORIZONTAL);
+        body.setGravity(Gravity.TOP);
+        LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        panelView.addView(body, bodyParams);
+
+        LinearLayout sidebar = new LinearLayout(activity);
+        sidebar.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams sidebarParams = new LinearLayout.LayoutParams(
+            dp(activity, 66), ViewGroup.LayoutParams.WRAP_CONTENT);
+        sidebarParams.rightMargin = dp(activity, 10);
+        body.addView(sidebar, sidebarParams);
+
+        tabControl = sidebarTab(activity, "控制", () -> selectTab(TAB_CONTROL));
+        tabControlLabel = (TextView) tabControl.getChildAt(0);
+        sidebar.addView(tabControl);
+        sidebar.addView(spacer(activity, 6));
+        tabStatus = sidebarTab(activity, "状态", () -> selectTab(TAB_STATUS));
+        tabStatusLabel = (TextView) tabStatus.getChildAt(0);
+        sidebar.addView(tabStatus);
+
+        FrameLayout pages = new FrameLayout(activity);
+        body.addView(pages, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        pageControl = buildControlPage(activity);
+        pages.addView(pageControl, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        pageStatus = buildStatusPage(activity);
+        pages.addView(pageStatus, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        panelView.addView(GameTopUi.divider(activity));
+        collapseRow = actionRow(activity, "收起面板", GameTopUi.INK_MUTED, null);
+        collapseRow.setOnClickListener(view -> {
             stage = STAGE_HANDLE;
             applyState();
         });
-        menu.addView(collapse);
-        return root;
+        panelView.addView(collapseRow);
+        return panelView;
+    }
+
+    private LinearLayout buildHeader(Activity activity) {
+        LinearLayout header = new LinearLayout(activity);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(activity, 2), 0, dp(activity, 2), 0);
+
+        titleDot = GameTopUi.dot(activity, GameTopUi.INK_FAINT);
+        header.addView(titleDot);
+
+        title = GameTopUi.text(activity, 13, GameTopUi.INK, true);
+        title.setText("雀魂助手");
+        header.addView(title, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        return header;
+    }
+
+    private LinearLayout sidebarTab(Activity activity, String label, Runnable action) {
+        LinearLayout tabView = new LinearLayout(activity);
+        tabView.setOrientation(LinearLayout.VERTICAL);
+        tabView.setGravity(Gravity.CENTER);
+        tabView.setPadding(dp(activity, 6), dp(activity, 8), dp(activity, 6), dp(activity, 8));
+        tabView.setMinimumHeight(dp(activity, 52));
+        tabView.setContentDescription(label);
+        TextView text = GameTopUi.text(activity, 12, GameTopUi.INK_MUTED, true);
+        text.setText(label);
+        text.setGravity(Gravity.CENTER);
+        tabView.addView(text);
+        tabView.setOnClickListener(view -> action.run());
+        tabView.setBackground(GameTopUi.quietPill(activity));
+        return tabView;
+    }
+
+    private static View spacer(Context context, int heightDp) {
+        View view = new View(context);
+        view.setLayoutParams(new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(context, heightDp)));
+        return view;
+    }
+
+    private LinearLayout vertical(Activity activity) {
+        LinearLayout view = new LinearLayout(activity);
+        view.setOrientation(LinearLayout.VERTICAL);
+        return view;
+    }
+
+    /** Page 1: the two independent switches the user asked for. */
+    private LinearLayout buildControlPage(Activity activity) {
+        LinearLayout page = vertical(activity);
+
+        unattendedCard = switchCard(activity, page, "无人值守",
+            "助手服务自动分析并出牌",
+            () -> onToggle());
+        unattendedTitle = (TextView) unattendedCard.getTag(TAG_TITLE);
+        unattendedState = (TextView) unattendedCard.getTag(TAG_STATE);
+        unattendedNote = (TextView) unattendedCard.getTag(TAG_NOTE);
+        unattendedSwitch = (GameTopUi.Switch) unattendedCard.getTag(TAG_SWITCH);
+
+        page.addView(spacer(activity, 6));
+
+        rematchCard = switchCard(activity, page, "自动下一局",
+            "整场牌局结束后自动继续",
+            () -> onRematchToggle());
+        rematchTitle = (TextView) rematchCard.getTag(TAG_TITLE);
+        rematchState = (TextView) rematchCard.getTag(TAG_STATE);
+        rematchNote = (TextView) rematchCard.getTag(TAG_NOTE);
+        rematchSwitch = (GameTopUi.Switch) rematchCard.getTag(TAG_SWITCH);
+        return page;
+    }
+
+    /**
+     * One switch card: title, live state, switch on the right, and a note line that
+     * explains why an enabled switch is not acting yet. The state is only ever painted
+     * from the latest provider reply ({@link #applyReply}); taps go through the same
+     * callbacks the old rows used.
+     */
+    private LinearLayout switchCard(Activity activity, LinearLayout page, String titleText,
+                                    String subtitle, Runnable action) {
+        LinearLayout card = vertical(activity);
+        card.setPadding(dp(activity, 10), dp(activity, 8), dp(activity, 10), dp(activity, 8));
+        ripple(card, GameTopUi.card(activity));
+        card.setClickable(true);
+        card.setContentDescription(titleText);
+        card.setOnClickListener(view -> action.run());
+
+        LinearLayout top = new LinearLayout(activity);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout labels = vertical(activity);
+        TextView titleView = GameTopUi.text(activity, 13, GameTopUi.INK, true);
+        titleView.setText(titleText);
+        labels.addView(titleView);
+        TextView stateView = GameTopUi.text(activity, 11, GameTopUi.INK_FAINT, false);
+        stateView.setText(subtitle);
+        stateView.setPadding(0, dp(activity, 2), 0, 0);
+        labels.addView(stateView);
+        top.addView(labels, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        GameTopUi.Switch toggle = new GameTopUi.Switch(activity);
+        toggle.setContentDescription(titleText + "开关");
+        LinearLayout.LayoutParams switchParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        switchParams.leftMargin = dp(activity, 8);
+        top.addView(toggle, switchParams);
+        card.addView(top);
+
+        TextView note = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        note.setPadding(0, dp(activity, 6), 0, 0);
+        card.addView(note);
+
+        // Filled by buildControlPage right after this call; no resource ids involved.
+        card.setTag(TAG_TITLE, titleView);
+        card.setTag(TAG_STATE, stateView);
+        card.setTag(TAG_NOTE, note);
+        card.setTag(TAG_SWITCH, toggle);
+        page.addView(card);
+        return card;
+    }
+
+    /** Page 2: runtime facts plus the manual / start-stop actions. */
+    private LinearLayout buildStatusPage(Activity activity) {
+        LinearLayout page = vertical(activity);
+
+        LinearLayout card = vertical(activity);
+        card.setPadding(dp(activity, 10), dp(activity, 8), dp(activity, 10), dp(activity, 8));
+        card.setBackground(GameTopUi.card(activity));
+
+        statusMode = GameTopUi.text(activity, 12, GameTopUi.INK, true);
+        card.addView(statusMode);
+        statusDetail = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        statusDetail.setPadding(0, dp(activity, 4), 0, 0);
+        card.addView(statusDetail);
+        statusService = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        statusService.setPadding(0, dp(activity, 4), 0, 0);
+        card.addView(statusService);
+        statusRematch = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        statusRematch.setPadding(0, dp(activity, 4), 0, 0);
+        card.addView(statusRematch);
+        page.addView(card);
+
+        page.addView(spacer(activity, 8));
+
+        startStop = cell(activity, 12, Color.WHITE, true);
+        startStop.setMinHeight(dp(activity, 40));
+        ripple(startStop, GameTopUi.round(activity, 12, GameTopUi.ACCENT, 0, 0));
+        startStop.setOnClickListener(view -> onToggle());
+        page.addView(startStop, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        manualRow = actionRow(activity, "打开管理应用", GameTopUi.ACCENT, null);
+        manualRow.setOnClickListener(view -> openManager());
+        page.addView(manualRow);
+        return page;
+    }
+
+    private LinearLayout actionRow(Activity activity, String label, int color, String description) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+        row.setMinimumHeight(dp(activity, 36));
+        row.setPadding(dp(activity, 8), dp(activity, 6), dp(activity, 8), dp(activity, 6));
+        TextView text = GameTopUi.text(activity, 12, color, true);
+        text.setText(label);
+        row.addView(text);
+        if (description != null) row.setContentDescription(description);
+        ripple(row, GameTopUi.round(activity, 12, GameTopUi.CARD, 0x262F6FE4, 1));
+        return row;
+    }
+
+    private static float screenWidthDp(Context context) {
+        return context.getResources().getDisplayMetrics().widthPixels / GameTopUi.density(context);
     }
 
     private static void setText(TextView view, String text) {
@@ -289,24 +628,19 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             show(menu, false);
             return;
         }
-        show(handle, stage == STAGE_HANDLE);
-        show(capsule, stage == STAGE_CAPSULE);
         show(menu, stage == STAGE_MENU);
-        if (stage == STAGE_CAPSULE) setText(capsule, "雀魂助手 · " + shortState() + "  ▾");
-        if (stage != STAGE_MENU) return;
-
-        setText(title, "实时模式：" + modeText());
-        setText(toggle, toggleText());
-        toggle.setAlpha(starting ? .55f : 1f);
-        setText(rematchRow, rematchText());
-        rematchRow.setTextColor(rematchActive ? Color.rgb(140, 214, 186) : Color.rgb(170, 190, 185));
-        setText(detail, detailText());
-        detail.setTextColor(noticeFailed ? Color.rgb(255, 158, 128) : Color.rgb(196, 206, 203));
-
-        String manualText = manualText();
-        setText(manual, manualText);
-        show(manual, manualText != null);
-        setText(collapse, "收起  ⌃");
+        show(handle, stage != STAGE_MENU);
+        show(capsule, stage == STAGE_CAPSULE);
+        if (stage == STAGE_CAPSULE) setText(capsule, "雀魂助手 · " + shortState() + "  ▸");
+        if (stage != STAGE_MENU) {
+            if (drag != null) drag.reflow(!pinned);
+            return;
+        }
+        paintTab();
+        paintSwitches();
+        paintStatusPage();
+        paintActions();
+        if (drag != null) drag.reflow(!pinned);
     }
 
     private static void show(View view, boolean visible) {
@@ -315,6 +649,171 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (view.getVisibility() != wanted) view.setVisibility(wanted);
     }
 
+    /** Paints a card line, reusing the card's pre-built text view when possible. */
+    private static void setCardText(View card, int key, TextView fallback, String text) {
+        TextView view = fallback;
+        if (card != null && card.getTag(key) instanceof TextView) view = (TextView) card.getTag(key);
+        setText(view, text);
+    }
+
+    private void selectTab(int wanted) {
+        if (tab == wanted) return;
+        tab = wanted;
+        applyState();
+    }
+
+    /** Blue capsule for the active sidebar entry, white capsule for the other one. */
+    private void paintTab() {
+        boolean control = tab == TAB_CONTROL;
+        styleTab(tabControl, tabControlLabel, control);
+        styleTab(tabStatus, tabStatusLabel, !control);
+        show(pageControl, control);
+        show(pageStatus, !control);
+    }
+
+    private static void styleTab(View pill, TextView label, boolean selected) {
+        if (pill == null || label == null) return;
+        Context context = pill.getContext();
+        pill.setBackground(selected ? GameTopUi.accentPill(context) : GameTopUi.quietPill(context));
+        int color = selected ? Color.WHITE : GameTopUi.INK_MUTED;
+        if (label.getCurrentTextColor() != color) label.setTextColor(color);
+    }
+
+    /** Live header: a coloured dot plus the current mode in one short phrase. */
+    private void paintSwitches() {
+        if (title == null) return;
+        setText(title, "雀魂助手 · " + headerState());
+        int dotColor = starting ? GameTopUi.INK_FAINT
+            : enabled ? GameTopUi.ACCENT
+            : available ? 0xFF43B581
+            : demo ? 0xFFE2A93B
+            : unreachable ? GameTopUi.DANGER
+            : GameTopUi.INK_FAINT;
+        Drawable dot = titleDot == null ? null : titleDot.getBackground();
+        if (dot instanceof GradientDrawable) {
+            ((GradientDrawable) dot).setColor(dotColor);
+        }
+
+        // Card 1 is a pure view of the mode: enabled only when the manager says so,
+        // and never editable while a start sequence or another action is in flight.
+        if (unattendedSwitch != null) {
+            unattendedSwitch.setOn(enabled, true);
+            unattendedSwitch.setBusy(starting || actionBusy.get());
+        }
+        String unattendedStateText = unattendedStateText();
+        setCardText(unattendedCard, TAG_STATE, unattendedState, unattendedStateText);
+        if (unattendedState != null) {
+            // The first line doubles as subtitle until the first reply arrives, so it
+            // always says what the card does or what it is doing right now.
+            unattendedState.setTextColor(available || starting || unreachable
+                ? GameTopUi.INK_MUTED : GameTopUi.INK_FAINT);
+        }
+        setText(unattendedNote, unattendedNoteText());
+        int unattendedTone = noticeFailed && noticeRefersToUnattended()
+            ? GameTopUi.DANGER : GameTopUi.INK_MUTED;
+        if (unattendedNote != null) unattendedNote.setTextColor(unattendedTone);
+
+        // Card 2 mirrors the stored rematch opt-in; it stays tappable while unattended
+        // mode is off, exactly like the old single row did.
+        if (rematchSwitch != null) {
+            rematchSwitch.setOn(rematch, true);
+            rematchSwitch.setBusy(actionBusy.get() && !starting);
+        }
+        setCardText(rematchCard, TAG_STATE, rematchState, rematch ? "已开启" : "已关闭");
+        if (rematchState != null) {
+            rematchState.setTextColor(rematchActive ? GameTopUi.ACCENT
+                : rematch ? 0xFFC08A1E : GameTopUi.INK_FAINT);
+        }
+        setText(rematchNote, rematchNoteText());
+        if (rematchNote != null) {
+            rematchNote.setTextColor(noticeFailed && !noticeRefersToUnattended()
+                ? GameTopUi.DANGER : GameTopUi.INK_MUTED);
+        }
+    }
+
+    /** True when the last failed notice came from the unattended path. */
+    private boolean noticeRefersToUnattended() {
+        return notice.contains("无人值守") || notice.contains("启动") || notice.contains("管理应用");
+    }
+
+    private void paintStatusPage() {
+        if (statusMode == null) return;
+        setText(statusMode, modeText());
+        if (statusMode != null) {
+            statusMode.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.INK);
+        }
+        setText(statusDetail, detailText());
+        setText(statusService, serviceText());
+        setText(statusRematch, rematchText());
+        if (statusRematch != null) {
+            statusRematch.setTextColor(rematchActive ? GameTopUi.ACCENT : GameTopUi.INK_MUTED);
+        }
+    }
+
+    private void paintActions() {
+        if (startStop != null) {
+            setText(startStop, toggleText());
+            startStop.setAlpha(starting ? .55f : 1f);
+        }
+        String manualText = manualText();
+        if (manualRow != null) {
+            show(manualRow, manualText != null);
+            manualRow.setContentDescription(manualText == null ? "打开管理应用" : manualText);
+            if (manualRow.getChildCount() > 0 && manualRow.getChildAt(0) instanceof TextView) {
+                TextView label = (TextView) manualRow.getChildAt(0);
+                setText(label, manualText == null ? "打开管理应用" : manualText);
+                label.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.ACCENT);
+            }
+        }
+    }
+
+    private String headerState() {
+        if (starting) return "启动中";
+        if (overlayMode) return "悬浮窗模式";
+        if (enabled) return "无人值守开";
+        if (available) return "待机";
+        if (demo) return "自检中";
+        if (unreachable) return "未连接";
+        return "未启动";
+    }
+
+    private String unattendedStateText() {
+        if (starting) return "启动中…";
+        if (enabled) return "运行中";
+        if (demo) return "自检中 · 暂不可开";
+        if (!available) return "未启动";
+        return "已关闭";
+    }
+
+    /**
+     * Why an "on" switch is not acting yet, or what a tap will do. Kept short: the
+     * card is narrow and the line must never wrap into the collapse row.
+     */
+    private String unattendedNoteText() {
+        if (!notice.isEmpty() && noticeRefersToUnattended()) return notice;
+        if (starting) return "正在启动分析与无人值守…";
+        if (enabled) return "点按关闭 · 助手服务继续运行";
+        if (demo) return "模型自检中，结束后可开启";
+        if (!available) return "点按开启，自动拉起管理应用服务";
+        return "点按开启 AI 自动出牌";
+    }
+
+    private String rematchNoteText() {
+        if (demo && rematch) return "自检中不生效";
+        if (rematch && !enabled) return "待无人值守开启";
+        if (rematch && !rematchActive) return "待条件满足";
+        if (rematch) return "仅按下一局原按钮";
+        return "牌局结束后自动继续，与上项独立";
+    }
+
+    private String serviceText() {
+        if (unreachable) return managerMissing ? "管理应用 · 未安装" : "管理应用 · 无响应";
+        if (!available && demo) return "前台服务 · 自检中";
+        if (!available) return "前台服务 · 未运行";
+        return "前台服务 · 运行中" + (remoteMessage.isEmpty() ? "" : " · " + clip(remoteMessage, 14));
+    }
+
+    /** One-phrase state for the collapsed capsule. */
     private String shortState() {
         if (starting) return "启动中";
         if (enabled) return "无人值守 开";
@@ -337,9 +836,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     /**
-     * The row doubles as switch and explanation: the tap target is one line, so the
-     * available state (why an enabled opt-in is not acting yet, or why it cannot be
-     * armed) is folded into the label instead of a second view.
+     * Full auto-rematch line for the status page; the switch card shows the same
+     * facts split over its state and note lines.
      */
     private String rematchText() {
         String state = rematch ? "开" : "关";
@@ -349,7 +847,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         else if (rematch && !rematchActive) note = "待条件满足";
         else if (rematch) note = "仅按下一局原按钮";
         else note = "点按开启";
-        return "整场后续局 · " + state + "（" + note + "）";
+        return "自动下一局 · " + state + "（" + note + "）";
     }
 
     private String detailText() {
@@ -358,6 +856,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return enabled ? "点击关闭只关闭无人值守，助手服务继续运行" : "开启后按 AI 首选操作，可随时在此关闭";
     }
 
+    /** Label of the hand-off action; null hides the row. */
     private String manualText() {
         if (starting) return null;
         if (unreachable) return managerMissing ? "未安装管理应用 · 点击打开" : "管理应用无响应 · 点击打开";
