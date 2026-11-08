@@ -144,9 +144,8 @@ internal fun AiScreen(padding: PaddingValues) {
                 })
             }
             Text(if (!autoRematch) "当前未开启；也可在悬浮窗或游戏内顶部菜单直接切换。"
-                else if (!autoStatus.enabled) "已开启，但无人值守模式关闭，暂不生效；开启无人值守后按上条规则执行。"
-                else "已开启，且无人值守模式已开启。", style = MaterialTheme.typography.bodySmall)
-            Text("默认关闭。仅在无人值守模式开启时生效，模型自检和关闭无人值守时都不会自动匹配。只调用游戏已有的结算、收益和下一局原按钮，不新增或伪造请求；遇到未知界面、对局中断或手动操作时暂停并等待。本场自动匹配失败或手动取消后不再重试；未知收益弹窗可能需要手动处理。",
+                else "已开启，与无人值守开关独立。", style = MaterialTheme.typography.bodySmall)
+            Text("默认关闭。与无人值守开关独立；手动打牌也可自动续局，模型自检时不生效。只调用游戏已有的结算、收益和下一局原按钮，不新增或伪造请求；遇到未知界面、对局中断或手动操作时暂停并等待。本场自动匹配失败或手动取消后不再重试；未知收益弹窗可能需要手动处理。",
                 style = MaterialTheme.typography.bodySmall)
         }
         Text("实验性 Mortal v4 支持四麻和三麻，可手动开启无人值守；特征含近似计算，尚未完成与上游的完整一致性验证。", style = MaterialTheme.typography.bodySmall)

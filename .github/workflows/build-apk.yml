@@ -68,6 +68,9 @@ jobs:
       - name: Test automatic operation safeguards
         run: lua5.1 tools/tests/test_auto_discard.lua
 
+      - name: Test independent automatic rematch
+        run: lua5.1 tools/tests/test_auto_rematch.lua
+
       - name: Verify versioned unlock catalog
         run: python3 tools/update_unlock_catalog.py --check
 

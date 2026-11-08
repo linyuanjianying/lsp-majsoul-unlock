@@ -384,13 +384,12 @@ object AssistLaunch {
         bundle.putString("displayMode", mode.wire)
         bundle.putBoolean("overlayMode", AssistantDisplayModeSettings.overlayActive(context))
         // Auto-rematch opt-in, read-only projection. `rematch` is the stored setting,
-        // `rematchActive` is the effective gate (stored AND unattended AND not demo) and
+        // `rematchActive` is the effective gate (stored AND not demo) and
         // matches the `autoRematch` field of the next autoPoll heartbeat exactly, so the
         // in-game control, the manager UI and the floating window never disagree.
         val rematch = AutoRematchSettings.read(context)
-        val unattended = bundle.getBoolean("enabled") && !bundle.getBoolean("demo")
         bundle.putBoolean("rematch", rematch)
-        bundle.putBoolean("rematchActive", AutoRematchSettings.active(context, unattended,
+        bundle.putBoolean("rematchActive", AutoRematchSettings.active(context,
             bundle.getBoolean("demo")))
         return bundle
     }

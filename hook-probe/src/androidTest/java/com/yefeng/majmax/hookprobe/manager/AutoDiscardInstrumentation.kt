@@ -82,9 +82,59 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.invalidate("new session"); check(gate.poll(null) == null && AutoDiscardState.mutable.value.enabled)
                 gate.observe(live().put("sourceGeneration",4)); check(gate.poll(null) != null)
             }
-            test("manual operation pauses") { gate, _ ->
+            test("rematch is independent of unattended") { _, _ ->
+                check(RematchState(enabled=true, unattended=false).active)
+                check(!RematchState(enabled=false, unattended=true).active)
+                check(!RematchState(enabled=true, unattended=true, demo=true).active)
+            }
+            test("manual operation yields without disabling") { gate, _ ->
                 gate.observe(live()); gate.toggle()
-                gate.poll(ack("", "manual")); check(gate.poll(null) == null && !AutoDiscardState.mutable.value.enabled)
+                gate.poll(ack("", "manual")); check(gate.poll(null) == null && AutoDiscardState.mutable.value.enabled)
+            }
+            test("manual handover keeps the opt-in but never replays the same decision") { gate, _ ->
+                gate.observe(live()); gate.toggle()
+                gate.poll(ack("", "manual"))
+                check(AutoDiscardState.mutable.value.enabled && gate.isEnabled())
+                check(gate.poll(null) == null)
+                gate.observe(live()); check(gate.poll(null) == null) { "same revision must not be resent" }
+                gate.observe(live().put("sourceSequence",9)); check(gate.poll(null) == null)
+                gate.observe(live(2)); check(gate.poll(null) != null) { "a new revision resumes" }
+            }
+            test("manual before the decision window is queued still claims that window") { gate, _ ->
+                gate.toggle()
+                gate.observe(live(2).put("canAct",false))
+                gate.poll(ack("", "manual")) // armed, before a command can queue
+                check(gate.poll(null) == null) { "the window the user played must not be replayed" }
+                gate.observe(live(2)); check(gate.poll(null) == null)
+                gate.observe(live(3)); check(gate.poll(null) != null)
+            }
+            test("manual observed as an unmatched uplink keeps the opt-in") { gate, _ ->
+                gate.observe(live()); gate.toggle()
+                gate.observe(live().put("input",JSONObject("""
+                    {"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"5m","moqie":false}}
+                """)))
+                check(AutoDiscardState.mutable.value.enabled && gate.poll(null) == null)
+                gate.observe(live()); check(gate.poll(null) == null)
+                gate.observe(live(2)); check(gate.poll(null) != null)
+            }
+            test("explicit switch-off is never undone by a new decision") { gate, _ ->
+                gate.observe(live()); gate.toggle()
+                gate.setEnabled(false); check(!AutoDiscardState.mutable.value.enabled)
+                gate.observe(live(2)); check(gate.poll(null) == null && !gate.isEnabled())
+                gate.poll(ack("", "manual")); check(!gate.isEnabled())
+                gate.observe(live(3)); check(gate.poll(null) == null)
+                gate.toggle(); check(gate.poll(null) != null) { "only the user may re-arm" }
+            }
+            test("out-of-order ack from an older command does not cancel the pending one") { gate, _ ->
+                gate.observe(live()); gate.toggle(); val first=JSONObject(gate.poll(null)!!).getString("id")
+                gate.poll(ack(first,"submitted")); gate.poll(ack(first,"accepted")); gate.observe(live(2))
+                val second=JSONObject(checkNotNull(gate.poll(null))).getString("id")
+                check(second != first)
+                gate.poll(ack(first,"accepted")); gate.poll(ack(first,"stale"))
+                gate.poll(ack("$first-stale","round_mismatch"))
+                check(gate.isEnabled())
+                gate.poll(ack(second,"submitted")); gate.poll(ack(second,"accepted"))
+                gate.observe(live(3)); check(gate.poll(null) != null) { "the live command survived stale acks" }
             }
             test("manual input while disabled does not alter paused state") { gate, _ ->
                 gate.observe(live())
@@ -122,12 +172,12 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.poll(ack(id,"accepted")); val next=JSONObject(checkNotNull(gate.poll(null)))
                 check(next.getString("id") != id && next.getInt("revision") == 2)
             }
-            test("unmatched uplink pauses") { gate, _ ->
+            test("unmatched uplink yields") { gate, _ ->
                 gate.observe(live()); gate.toggle()
                 gate.observe(live().put("input",JSONObject("""
                     {"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"5m","moqie":false}}
                 """)))
-                check(gate.poll(null) == null && !AutoDiscardState.mutable.value.enabled)
+                check(gate.poll(null) == null && AutoDiscardState.mutable.value.enabled)
             }
             fun actionCase(kind: String, type: Int, tile: String = "", consumed: List<String> = emptyList(),
                            combo: List<String> = emptyList(), hand: List<String> = listOf("5mr"), target: Int = 3,
@@ -214,7 +264,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
             test("changed combination index cannot confirm another call") { gate, _ ->
                 gate.observe(actionCase("chi",2,"3m",listOf("4m","5mr"),listOf("4m|5m","4m|0m"),listOf("4m","5mr"))); gate.toggle()
                 gate.observe(live().put("input",JSONObject("""{"method":".lq.FastTest.inputChiPengGang","payload":{"type":2,"index":0}}""")))
-                check(!AutoDiscardState.mutable.value.enabled)
+                check(AutoDiscardState.mutable.value.enabled && gate.poll(null) == null)
             }
             test("riichi locks ordinary discard to drawn tile") { _, _ ->
                 val state=live(); state.getJSONObject("autoContext").put("riichi",true)
@@ -368,7 +418,9 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.observe(live().put("modelExperimental",true)); check(gate.poll(null)==null)
                 gate.observe(live(2).put("modelExperimental",true)); check(gate.poll(null)!=null)
                 gate.poll(ack("","manual"))
-                check(!gate.isEnabled() && gate.poll(null)==null)
+                check(gate.isEnabled() && gate.poll(null)==null) { "manual input keeps the opt-in" }
+                gate.observe(live(2).put("modelExperimental",true)); check(gate.poll(null)==null)
+                gate.observe(live(3).put("modelExperimental",true)); check(gate.poll(null)!=null)
             }
             // TileBadgeOverlay coordinate filtering is pure; exercise it directly so a
             // camera/projection fault that sends every tile off-screen is observable.

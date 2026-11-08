@@ -28,6 +28,31 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     private var wireConfirmed = false
     private var submitted = false
     private var accepted = false
+    /** Decision windows already claimed by the user; kept even when the window closed before arming. */
+    private val manual = mutableSetOf<String>()
+
+    /** generation:connection:revision — the only identity a fresh decision may be matched on. */
+    private fun decisionKey(source: JSONObject) =
+        "${source.optLong("sourceGeneration")}:${source.optString("connection")}:${source.optLong("revision")}"
+
+    /** A manual input claims the window it happened in, so neither observe nor offer replays it. */
+    private fun markManual(source: JSONObject?) {
+        if (source != null) decisionKey(source).let { manual.add(it) }
+        pending = null; latest = null; accepted = false
+    }
+
+    /**
+     * Detected manual operation: gives up the current decision but keeps the opt-in.
+     * Nothing is sent until a brand-new decision arrives; the explicit switch and the
+     * in-game toggle still go through [pause].
+     */
+    @Synchronized fun yieldManually(reason: String) {
+        if (!enabled) return
+        log("HANDOVER: $reason")
+        markManual(pending ?: latest)
+        if (manual.size > 64) manual.remove(manual.first())
+        AutoDiscardState.mutable.value = AutoDiscardStatus(true, reason)
+    }
 
     @Synchronized fun pause(reason: String) {
         if (enabled || pending != null) log("PAUSED: $reason")
@@ -87,7 +112,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             if (payload != null && (payload.optBoolean("auto_operation") || payload.optLong("timeuse") >= 1_000_000)) {
                 suspend("游戏已自动处理超时窗口，等待下一次同步")
             } else if (command == null || payload == null || !matchesInput(command, input.optString("method"), payload)) {
-                pause("检测到手动操作，无人值守模式已关闭")
+                yieldManually("检测到手动操作 · 等待新的一回合")
             } else {
                 wireConfirmed = true
                 log("UPLINK_CONFIRMED id=${command.optString("id")}")
@@ -126,8 +151,8 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
         val first = result.optJSONArray("recommendations")?.optJSONObject(0) ?: return
         // No server prompt (for example after restoration): wait for the next synchronized action.
         if (result.optJSONArray("legalOperations")?.length() == 0) return
-        val key = "${result.optLong("sourceGeneration")}:${result.optString("connection")}:${result.optLong("revision")}"
-        if (key == attempted || result.optLong("sourceSequence") <= 0) return
+        val key = decisionKey(result)
+        if (key == attempted || key in manual || result.optLong("sourceSequence") <= 0) return
         attempted = key
         val action = prepareAction(result, first) ?: run {
             suspend("AI 动作与合法操作未能匹配，等待新的操作窗口")
@@ -169,10 +194,20 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                     "resync" -> { log("RESYNC_REQUESTED"); continue }
                 }
                 if (ack.optString("state") == "manual") {
-                    if (enabled) pause("检测到手动操作，无人值守模式已关闭")
+                    // The ack carries no id: any armed mode hands the current window over,
+                    // otherwise the user's input would be replayed on the next sync.
+                    val id = ack.optString("id")
+                    if (id.isNotEmpty() && id != pending?.optString("id")) continue
+                    yieldManually("检测到手动操作 · 等待新的一回合")
                     continue
                 }
-                if (ack.optString("id") != pending?.optString("id")) continue
+                // Out-of-order acknowledgement from an older command never disturbs the
+                // pending one; an empty id is a network-level manual signal instead.
+                val ackId = ack.optString("id")
+                if (ackId.isNotEmpty() && ackId != pending?.optString("id")) continue
+                if (ackId.isEmpty() && pending != null && ack.optString("state") != "manual") {
+                    log("ACK_UNMATCHED ${ack.optString("state")}"); continue
+                }
                 when (ack.optString("state")) {
                     "probe" -> { log("CLAIM_PROBE ${ack.optString("reason")}") }
                     "waiting" -> { log("GAME_WAITING ${ack.optString("reason")}") }

@@ -2,6 +2,9 @@
 // Uses -Xfriend-paths so Kotlin `internal` members are reachable without patching sources.
 // No Android stubs: only the pure companion functions are touched (no Context/View instances).
 import org.json.JSONArray
+import org.json.JSONObject
+import com.yefeng.majmax.hookprobe.manager.AutoDiscardController
+import com.yefeng.majmax.hookprobe.manager.RematchState
 import com.yefeng.majmax.hookprobe.manager.TileBadgeOverlay as TBO
 import com.yefeng.majmax.hookprobe.manager.TileBadgeOverlay.DiscardHint
 import com.yefeng.majmax.hookprobe.manager.TileBadgeOverlay.HookedTile
@@ -118,6 +121,28 @@ fun main() {
             TBO.Companion.resolveButtonHints(JSONArray(), setOf("pon")).isEmpty())
         check("button hints: nothing visible -> empty",
             TBO.Companion.resolveButtonHints(rows, emptySet()).isEmpty())
+    }
+
+    run {
+        fun state(rev: Int = 1) = JSONObject("""{"status":"live","canAct":true,"connection":"7","revision":$rev,"sourceGeneration":3,"sourceSequence":8,"seat":0,"players":4,"hand":["5mr"],"legalOperations":[{"type":1,"combination":[]}],"autoContext":{"riichi":false},"recommendations":[{"kind":"discard","tile":"5mr","tsumogiri":false}]}""")
+        fun ack(id: String = "") = JSONArray().put(JSONObject().put("id",id).put("state","manual")).toString()
+        val gate = AutoDiscardController({}, {0L}, {0L})
+        gate.observe(state()); gate.toggle()
+        check("auto queued before handover", gate.poll(null) != null)
+        gate.poll(ack()); check("manual preserves enabled",gate.isEnabled())
+        gate.observe(state()); check("manual decision never replays",gate.poll(null)==null)
+        gate.observe(state(2)); check("new decision resumes",gate.poll(null)!=null)
+        val next=gate.poll(null)
+        gate.poll(ack("old-command")); check("old manual ack ignored",gate.poll(null)==next)
+        gate.setEnabled(false); gate.observe(state(3))
+        check("explicit off remains off",!gate.isEnabled() && gate.poll(null)==null)
+        val early=AutoDiscardController({}, {0L}, {0L}, initialEnabled=true)
+        early.observe(state().put("canAct",false)); early.poll(ack()); early.observe(state())
+        check("manual before offer blocks same decision",early.isEnabled() && early.poll(null)==null)
+        early.observe(state(2)); check("early handover resumes new decision",early.poll(null)!=null)
+        check("rematch without unattended", RematchState(enabled=true,unattended=false).active)
+        check("rematch off stays off", !RematchState(enabled=false,unattended=true).active)
+        check("demo never rematches", !RematchState(enabled=true,demo=true).active)
     }
 
     println("\n=== ${passed} passed, ${failed} failed ===")

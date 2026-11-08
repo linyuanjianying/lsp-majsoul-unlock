@@ -605,9 +605,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
 
     private fun rematchText(): String = when {
         rematchState.demo -> "模型自检中不会自动匹配"
-        rematchState.enabled && !rematchState.unattended -> "已开启，但无人值守关闭时不生效"
         rematchState.enabled -> "仅调用游戏的“下一局”原按钮；可随时在此关闭"
-        else -> "默认关闭。开启后仍需无人值守模式，不新增或伪造请求"
+        else -> "默认关闭。与无人值守独立，开启后自动续局"
     }
 
     /**

@@ -111,7 +111,7 @@ class AiOverlayService : Service() {
          * The auto-rematch opt-in as the user can see it right now: the persisted value
          * plus whether this session may actually act on it. The stored flag always
          * survives (it is a setting, not a session state); only *active* is gated by
-         * unattended mode and demo mode, exactly like the heartbeat in [autoRematchWanted].
+         * demo mode, exactly like the heartbeat in [autoRematchWanted].
          */
         private fun rematchState(): RematchState {
             val service = instance
@@ -400,16 +400,16 @@ class AiOverlayService : Service() {
             .put("resync", auto.needsSync()).put("nonce", SystemClock.elapsedRealtime())
         // Experimental auto-rematch opt-in. Sent on every heartbeat (action frame and
         // mode frame alike) so the game observes a revocation on the next poll. Gated
-        // by the same switches as unattended mode: the stored opt-in alone never arms
-        // anything, and a self-test session must never drive the live game.
+        // independently from unattended mode. A self-test session never drives
+        // the live game.
         val rematch = autoRematchWanted()
         return response.put("delayMinMs", delay.minTenths * 100).put("delayMaxMs", delay.maxTenths * 100)
             .put("autoRematch", rematch).toString()
     }
 
-    /** Opt-in AND unattended AND not in demo: the only state where rematch may be true. */
+    /** Opt-in AND not in demo: the only state where rematch may be true. */
     private fun autoRematchWanted(): Boolean =
-        AutoRematchSettings.active(this, auto.isEnabled(), demoMode.get())
+        AutoRematchSettings.active(this, demoMode.get())
 
     /**
      * Bounded diagnostics for the experimental rematch acks. Only the adapter's fixed

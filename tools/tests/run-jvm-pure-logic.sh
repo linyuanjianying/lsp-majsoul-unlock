@@ -13,6 +13,7 @@ find_jar() { find "$1" -name "$2" ! -name '*sources*' | head -1; }
 KOTLINC=$(find_jar "$GC/org.jetbrains.kotlin/kotlin-compiler-embeddable" 'kotlin-compiler-embeddable-*.jar')
 STDLIB=$(find_jar "$GC/org.jetbrains.kotlin/kotlin-stdlib" 'kotlin-stdlib-2.*.jar')
 JSON=$(find_jar "$GC/org.json/json" 'json-*.jar')
+COROUTINES=$(find_jar "$GC/org.jetbrains.kotlinx/kotlinx-coroutines-core-jvm" "kotlinx-coroutines-core-jvm-*.jar")
 KCP="$OUT/compiler-classpath.txt"
 mkdir -p "$OUT"
 [ -s "$KCP" ] || find "$GC/org.jetbrains.kotlin" "$GC/org.jetbrains.intellij.deps" "$GC/org.jetbrains" \
@@ -24,11 +25,11 @@ JAVA=/usr/lib/jvm/java-21-openjdk-arm64/bin/java
 
 run_kotlinc() {
   "$JAVA" -cp "$KOTLINC:$(cat "$KCP")" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
-    -no-stdlib -classpath "$CLASSES:$STDLIB:$JSON:$ANDROID_JAR" \
+    -no-stdlib -classpath "$CLASSES:$STDLIB:$JSON:$ANDROID_JAR:$COROUTINES" \
     -Xfriend-paths="$CLASSES" -jvm-target 21 -nowarn \
     -d "$OUT/classes" "$PROJ/tools/tests/JvmPureLogicProbe.kt"
 }
 
 rm -rf "$OUT/classes"
 run_kotlinc
-"$JAVA" -cp "$OUT/classes:$CLASSES:$STDLIB:$JSON:$ANDROID_JAR" JvmPureLogicProbeKt
+"$JAVA" -cp "$OUT/classes:$CLASSES:$STDLIB:$JSON:$ANDROID_JAR:$COROUTINES" JvmPureLogicProbeKt

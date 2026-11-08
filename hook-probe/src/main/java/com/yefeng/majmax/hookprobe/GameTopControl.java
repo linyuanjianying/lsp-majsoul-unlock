@@ -1096,7 +1096,6 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     private String rematchNoteText() {
         if (demo && rematch) return "自检中不生效";
-        if (rematch && !enabled) return "待无人值守开启";
         if (rematch && !rematchActive) return "待条件满足";
         if (rematch) return "仅按下一局原按钮";
         return "牌局结束后自动继续，与上项独立";
@@ -1139,7 +1138,6 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         String state = rematch ? "开" : "关";
         String note;
         if (demo && rematch) note = "自检中不生效";
-        else if (rematch && !enabled) note = "待无人值守开启";
         else if (rematch && !rematchActive) note = "待条件满足";
         else if (rematch) note = "仅按下一局原按钮";
         else note = "点按开启";

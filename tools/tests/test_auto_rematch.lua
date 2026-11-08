@@ -241,6 +241,14 @@ test('rematch is opt in: the boolean true is required', function(s)
     assert(s.again == 0, 'only the boolean true may enable rematch')
 end)
 
+test('rematch runs with unattended disabled', function(s)
+    prime(s); command(s, { enabled = false, autoRematch = true })
+    drive(s, 0, 8)
+    assert(s.again == 1, 'independent rematch must press again')
+    assert(s.confirmAttempts >= 1, 'independent rematch must confirm')
+    assert(__majmax_auto.armed == false, 'rematch must not arm automatic card play')
+end)
+
 test('an unobserved settlement page is never clicked before its show', function(s)
     command(s)
     drive(s, 0, 2)
@@ -275,10 +283,10 @@ end)
 test('turning the switch off revokes a queued step', function(s)
     prime(s)
     command(s)
-    s.command.enabled = false
+    s.command.autoRematch = false
     drive(s, 0, 8)
-    assert(s.again == 0, 'enabled=false must revoke a queued step')
-    s.command.enabled = true
+    assert(s.again == 0, 'autoRematch=false must revoke a queued step')
+    s.command.autoRematch = true
     -- Same page, same settlement: re-enabling picks the still-open result page back up.
     drive(s, 0, 8)
     assert(s.again >= 1, 'a re-enabled switch re-arms the page')

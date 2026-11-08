@@ -223,7 +223,7 @@ end
 function R.act(command, now)
     R.installHooks()
     local session = R.session
-    if not A.armed or command.autoRematch ~= true then
+    if command.autoRematch ~= true then
         -- Revoking the lease cancels waiting actions but never clears a manual stop.
         if session then R.stop(session); A.revoked = session end
         return false

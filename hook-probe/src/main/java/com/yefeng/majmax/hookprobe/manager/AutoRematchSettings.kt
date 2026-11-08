@@ -22,21 +22,20 @@ internal object AutoRematchState {
 /**
  * What one surface shows for the auto-rematch switch.
  *
- * [enabled] is the persisted opt-in (what the user tapped). [unattended] and [demo]
- * say whether this session can act on it; the footer text uses them to explain why a
- * switched-on opt-in is not doing anything yet, instead of silently showing "off".
+ * [enabled] is the persisted opt-in. [unattended] is presentation context only;
+ * rematch is independent of it. Demo sessions never act on a live game.
  */
 internal data class RematchState(val enabled: Boolean = false, val unattended: Boolean = false,
     val demo: Boolean = false) {
-    /** Opt-in AND unattended AND not a self-test: the only state that arms the game. */
-    val active: Boolean get() = enabled && unattended && !demo
+    /** Opt-in AND not a self-test: the only state that arms the game. */
+    val active: Boolean get() = enabled && !demo
 }
 
 /**
  * Persisted opt-in for the experimental auto-rematch helper.
  *
  * The flag only ever travels to the game inside a `pollAuto` heartbeat, and only
- * while unattended mode is enabled and the service is not in demo (self-test) mode,
+ * while the service is not in demo (self-test) mode,
  * so a stale `true` in preferences can never drive the game on its own. It lives in
  * its own preferences file so it cannot collide with the unrelated `unattended`
  * opt-in, the delay range, the model slots or the display mode.
@@ -70,10 +69,10 @@ internal object AutoRematchSettings {
 
     /**
      * The only value that may arm the game, as reported by the shared status bundle:
-     * opt-in AND unattended AND not a self-test session. Identical to the heartbeat
+     * opt-in AND not a self-test session. Identical to the heartbeat
      * gating in [AiOverlayService], so both surfaces always show the same effective
-     * state; the stored opt-in alone never arms anything.
+     * state; unattended mode does not gate rematch.
      */
-    fun active(context: Context, unattendedEnabled: Boolean, demo: Boolean): Boolean =
-        !demo && unattendedEnabled && read(context)
+    fun active(context: Context, demo: Boolean): Boolean =
+        !demo && read(context)
 }
