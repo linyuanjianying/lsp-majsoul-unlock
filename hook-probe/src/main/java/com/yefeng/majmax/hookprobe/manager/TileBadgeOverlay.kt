@@ -1446,7 +1446,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
 
             val actionText = hint.displayName
             val weightText =
-                if (hint.weight > 0.0) String.format(Locale.ROOT, "%.0f", hint.weight) else "—"
+                if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
 
             // One cat chip per button hint; size is the frame-normalized label box
             // and the width bound keeps it compact over the button it annotates.
@@ -1503,9 +1503,9 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         hint: DiscardHint,
     ): CatHintView {
         val isRiichi = hint.kind == "riichi"
-        val actionText = if (isRiichi) "立" else "切"
+        val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
         val weightText =
-            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.0f", hint.weight) else "—"
+            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
         return createBadgeCard(
             action = actionText,
             percent = weightText,

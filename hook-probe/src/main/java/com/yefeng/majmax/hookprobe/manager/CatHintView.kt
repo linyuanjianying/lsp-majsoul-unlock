@@ -128,12 +128,17 @@ internal class CatHintView(context: Context) : View(context) {
         canvas.restore()
 
         textPaint.color = if (gold) 0xFF2B2C2E.toInt() else 0xFFF4FBFF.toInt()
-        val label = "$action $percent"
-        textPaint.textSize = min(10f * resources.displayMetrics.scaledDensity, (h - chipTop) * 0.65f)
-        val textWidth = textPaint.measureText(label)
-        if (textWidth > w - 4f && textWidth > 0f) textPaint.textSize *= (w - 4f).coerceAtLeast(1f) / textWidth
-        val baseline = (chipTop + h) / 2f - (textPaint.ascent() + textPaint.descent()) / 2f
-        canvas.drawText(label, w / 2f, baseline, textPaint)
+        // Two centered rows share one font size, fitted to the longer row.
+        // Keeping the same size avoids a short action looking larger than its weight.
+        val rowHeight = (h - chipTop - 2f).coerceAtLeast(1f) / 2f
+        textPaint.textSize = min(10f * resources.displayMetrics.scaledDensity, rowHeight * 0.86f)
+        val longest = maxOf(textPaint.measureText(action), textPaint.measureText(percent))
+        if (longest > w - 6f && longest > 0f) {
+            textPaint.textSize *= (w - 6f).coerceAtLeast(1f) / longest
+        }
+        val baselineOffset = -(textPaint.ascent() + textPaint.descent()) / 2f
+        canvas.drawText(action, w / 2f, chipTop + rowHeight * 0.5f + baselineOffset, textPaint)
+        canvas.drawText(percent, w / 2f, chipTop + rowHeight * 1.5f + baselineOffset, textPaint)
         if (gold && isAttachedToWindow && windowVisibility == VISIBLE) postInvalidateDelayed(40L)
     }
 }
