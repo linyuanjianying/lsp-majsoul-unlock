@@ -239,14 +239,14 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val circle = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            background = style.shape(style.panelColor(opacity), style.bubbleRadius().coerceAtMost(dp(26).toFloat()),
-                style.panelStroke(), 1)
+            background = style.shape(style.bubbleColor(opacity), style.bubbleRadius().coerceAtMost(dp(26).toFloat()),
+                0xFF485565.toInt(), 1)
             contentDescription = bubbleDescription()
             isClickable = true
             isFocusable = true
         }
         val caption = style.text("雀", 15f,
-            if (auto.enabled) style.danger else style.accent, true).apply {
+            if (auto.enabled) 0xFFE6B783.toInt() else 0xFFD6E1ED.toInt(), true).apply {
             gravity = Gravity.CENTER
             maxLines = 1
             includeFontPadding = false
@@ -254,7 +254,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         bubbleCaption = caption
         circle.addView(caption, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT))
-        val badge = style.text(autoSummary(), 9f, style.muted, true).apply {
+        val badge = style.text(autoSummary(), 9f, 0xFFA8B6C7.toInt(), true).apply {
             gravity = Gravity.CENTER
             maxLines = 1
         }
@@ -408,9 +408,9 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
 
     private fun renderHeader() {
         bubbleCaption?.text = "雀"
-        bubbleCaption?.setTextColor(if (auto.enabled) style.danger else style.accent)
+        bubbleCaption?.setTextColor(if (auto.enabled) 0xFFE6B783.toInt() else 0xFFD6E1ED.toInt())
         bubbleBadge?.text = autoSummary()
-        bubbleBadge?.setTextColor(if (auto.enabled) style.muted else style.faint)
+        bubbleBadge?.setTextColor(0xFFA8B6C7.toInt())
         bubble?.contentDescription = bubbleDescription()
         title?.text = caption()
         subtitle?.text = subCaption()

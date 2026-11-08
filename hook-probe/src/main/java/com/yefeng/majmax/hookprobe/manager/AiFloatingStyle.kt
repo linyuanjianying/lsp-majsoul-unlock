@@ -44,6 +44,9 @@ internal class FloatingStyle(private val context: Context) {
     fun panelColor(alphaPercent: Int): Int =
         Color.argb((255 * alphaPercent.coerceIn(25, 100) / 100f).roundToInt(), 246, 247, 249)
 
+    fun bubbleColor(alphaPercent: Int): Int =
+        Color.argb((255 * alphaPercent.coerceIn(65, 100) / 100f).roundToInt(), 24, 33, 44)
+
     fun panelStroke(): Int = Color.argb(150, 255, 255, 255)
 
     /** Raised card fill (settings rows, detail blocks): a touch whiter than the panel. */
@@ -92,8 +95,9 @@ internal class FloatingStyle(private val context: Context) {
 
     /** Panel background; the opacity slider only changes [fill], never the geometry. */
     fun panelBackground(alphaPercent: Int, collapsed: Boolean): Drawable =
-        shape(panelColor(alphaPercent), if (collapsed) bubbleRadius() else panelRadius(),
-            panelStroke(), 1)
+        shape(if (collapsed) bubbleColor(alphaPercent) else panelColor(alphaPercent),
+            if (collapsed) bubbleRadius() else panelRadius(),
+            if (collapsed) 0xFF485565.toInt() else panelStroke(), 1)
 
     /**
      * Clickable surface with a ripple. The ripple mask is the same rounded shape, so

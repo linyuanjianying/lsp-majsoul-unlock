@@ -356,10 +356,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        // Reference proportions: ~18.5% of screen width, ~4.4% of height visible.
+        // Compact dark handle matching the reference top-centre entry.
         // The capsule body is drawn above the viewport; only its curved bottom remains.
         handleTab = new TabView(activity,
-            GameTopUi.round(activity, 26, GameTopUi.CARD, 0xCCFFFFFF, 1));
+            GameTopUi.round(activity, 26, 0xDD141E25, 0x553F505C, 1));
         handleTab.setContentDescription("展开雀魂助手");
         handleTab.setOnClickListener(view -> {
             stage = STAGE_CAPSULE;
@@ -373,12 +373,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.addView(handleTab, handleParams);
 
         // Full "雀魂助手" capsule, ~160x44dp, just below the top edge.
-        capsule = cell(activity, 13, GameTopUi.INK_MUTED, false);
+        capsule = cell(activity, 13, 0xFFE3EAF0, false);
         capsule.setGravity(Gravity.CENTER);
         capsule.setPadding(dp(activity, 16), 0, dp(activity, 16), 0);
         capsule.setMinHeight(dp(activity, 44));
         capsule.setContentDescription("打开雀魂助手菜单");
-        ripple(capsule, GameTopUi.round(activity, 22, GameTopUi.CARD, 0x332F6FE4, 1));
+        ripple(capsule, GameTopUi.round(activity, 22, 0xEE1C2732, 0x66536373, 1));
         capsule.setElevation(dp(activity, 4));
         // openMenu() arms the idle window, so the capsule needs no touch listener of its
         // own; a plain click keeps the ripple and the accessibility tap working.
@@ -604,9 +604,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             int availableHeight = metrics.heightPixels;
             if (getRootView().getWidth() > 0) availableWidth = getRootView().getWidth();
             if (getRootView().getHeight() > 0) availableHeight = getRootView().getHeight();
-            int width = Math.max(GameTopUi.dp(getContext(), 72), Math.round(availableWidth * .185f));
-            int height = Math.max(GameTopUi.dp(getContext(), 12), Math.round(availableHeight * .044f));
-            height = Math.min(height, GameTopUi.dp(getContext(), 22));
+            int width = Math.max(GameTopUi.dp(getContext(), 28), Math.round(availableWidth * .0445f));
+            int height = Math.max(GameTopUi.dp(getContext(), 12), Math.round(availableHeight * .054f));
+            height = Math.min(height, GameTopUi.dp(getContext(), 28));
             setMeasuredDimension(resolveSize(width, widthSpec), resolveSize(height, heightSpec));
         }
 
@@ -616,6 +616,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             int fullHeight = Math.max(getHeight() * 3, GameTopUi.dp(getContext(), 48));
             background.setBounds(0, getHeight() - fullHeight, getWidth(), getHeight());
             background.draw(canvas);
+            android.graphics.Paint mark = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+            mark.setColor(0xFFE3EAF0);
+            mark.setStyle(android.graphics.Paint.Style.STROKE);
+            mark.setStrokeWidth(Math.max(2f, getHeight() * .045f));
+            mark.setStrokeCap(android.graphics.Paint.Cap.ROUND);
+            android.graphics.Path chevron = new android.graphics.Path();
+            chevron.moveTo(getWidth() * .44f, getHeight() * .58f);
+            chevron.lineTo(getWidth() * .50f, getHeight() * .78f);
+            chevron.lineTo(getWidth() * .56f, getHeight() * .58f);
+            canvas.drawPath(chevron, mark);
         }
 
         @Override public void setPressed(boolean pressed) {

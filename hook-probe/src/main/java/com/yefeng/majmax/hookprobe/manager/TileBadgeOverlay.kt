@@ -129,8 +129,8 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         private const val BADGE_GAP_DP = 1
 
         /** Compact two-line label above the tile, sized relative to the hand pitch. */
-        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.0420f
-        private const val BADGE_WIDTH_TO_TILE_PITCH = 0.70f
+        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.0650f
+        private const val BADGE_WIDTH_TO_TILE_PITCH = 0.94f
 
         /**
          * Card pitch fallbacks, as a fraction of the frame *width*, used only when the
@@ -426,7 +426,8 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             // (or, without a sample, by the same fraction band).
             val minH = BADGE_HEIGHT_MIN_OF_FRAME * frameHeight
             val maxH = BADGE_HEIGHT_MAX_OF_FRAME * frameHeight
-            val faceH = TILE_FACE_HEIGHT_OF_FRAME * frameHeight
+            // Keep the reference silhouette stable as the measured tile face changes.
+            val faceH = width * 0.80f
             val height = faceH.coerceIn(minH, maxH)
 
             return BadgeSize(
@@ -1364,6 +1365,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
             )
+            params.width = badgeWidth
             params.leftMargin = desiredLeft
             params.topMargin = probe.top
             params.height = probe.height
@@ -1435,7 +1437,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         val edgeInset = pxFromReference(EDGE_INSET_REF, frameHeight)
         // Buttons have no tile-pitch reference, so size the label from the frame
         // height like the tile badge's fallback, keeping the same compact style.
-        val labelH = (TILE_FACE_HEIGHT_OF_FRAME * frameHeight).roundToInt()
+        val labelH = (frameWidth * 0.0376f * 0.80f).roundToInt()
             .coerceIn(pxFromReference(MIN_BADGE_HEIGHT_REF, frameHeight), (BADGE_HEIGHT_MAX_OF_FRAME * frameHeight).roundToInt())
 
         var placed = 0
@@ -1460,7 +1462,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             // Measure with a reasonable width bound so the label stays compact and
             // never wider than a small multiple of the button it annotates.
             card.measure(
-                View.MeasureSpec.makeMeasureSpec((frameWidth * 0.028f).roundToInt(), View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec((frameWidth * 0.0376f).roundToInt(), View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(labelH, View.MeasureSpec.EXACTLY),
             )
             val cardW = card.measuredWidth.coerceAtLeast(1)
@@ -1502,10 +1504,10 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
     private fun createBadgeCard(
         hint: DiscardHint,
     ): CatHintView {
-        val isRiichi = hint.kind == "riichi"
-        val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
+        // Tile identity is conveyed by the anchor, as in the reference screenshot.
+        val actionText = "切"
         val weightText =
-            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
+            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.0f", hint.weight) else "—"
         return createBadgeCard(
             action = actionText,
             percent = weightText,

@@ -665,10 +665,10 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2256, 1080)
                     ?: error("expected a derived card size")
                 // 0.0398 * 2376 = 94.6 px pitch (screenshot: 94-95 px).
-                check(size.width in 65..68) { "expected a 65-68 px label width, got ${size.width}" }
-                // Reference label height: 5% of a 1080 px frame.
-                check(size.height in 44..47) {
-                    "expected a ~54 px label height, got ${size.height}"
+                check(size.width in 88..91) { "expected a 88-91 px label width, got ${size.width}" }
+                // Reference silhouette: height follows width, capped at 6.5% frame height.
+                check(size.height in 69..71) {
+                    "expected a ~70 px label height, got ${size.height}"
                 }
                 check(size.source == "pitch") { "expected pitch sizing, got ${size.source}" }
             }
@@ -683,24 +683,24 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 )
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 2376, 1080)
                     ?: error("expected a derived card size")
-                check(size.width in 65..68) {
+                check(size.width in 88..91) {
                     "drawn-tile step leaked into the width: ${size.width}"
                 }
             }
             test("deriveBadgeSizePx falls back to a card-width pitch without a sample") { _, _ ->
                 // One anchored hint: no neighbour, so no pitch can be measured. The
-                // label remains 70% of a hand tile pitch.
+                // label remains 94% of a hand tile pitch.
                 val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
                 val single = listOf(view("1m", 0.5, 0.92))
                 val fallback = TileBadgeOverlay.deriveBadgeSizePx(single, m, 2376, 1080)
                     ?: error("expected the normalized fallback")
                 check(fallback.source == "fallback") { "expected fallback, got ${fallback.source}" }
-                check(fallback.width in 65..68) { "expected ~67 px, got ${fallback.width}" }
-                check(fallback.height in 44..47) { "expected ~54 px, got ${fallback.height}" }
+                check(fallback.width in 88..91) { "expected ~89 px, got ${fallback.width}" }
+                check(fallback.height in 69..71) { "expected ~70 px, got ${fallback.height}" }
                 // No mapping: use the same compact fallback.
                 val noMapping = TileBadgeOverlay.deriveBadgeSizePx(single, null, 2376, 1080)
                     ?: error("expected a size even without a mapping")
-                check(noMapping.width in 65..68 && noMapping.height in 44..47)
+                check(noMapping.width in 88..91 && noMapping.height in 69..71)
             }
             test("deriveBadgeSizePx clamps a distorted or single-tile hand") { _, _ ->
                 val m = mapping(2000, 1000, viewportW = 2000, viewportH = 1000)
@@ -708,18 +708,18 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val wide = listOf(view("1m", 0.10, 0.9), view("2m", 0.40, 0.9))
                 val clamped = TileBadgeOverlay.deriveBadgeSizePx(wide, m, 2000, 1000)
                     ?: error("expected a size")
-                check(clamped.width == (0.055 * 2000 * 0.70).toInt()) {
+                check(clamped.width == kotlin.math.round(0.055 * 2000 * 0.94).toInt()) {
                     "expected the scaled max pitch clamp, got ${clamped.width}"
                 }
                 // A near-zero step cannot become a sliver either.
                 val tiny = listOf(view("1m", 0.10, 0.9), view("2m", 0.1005, 0.9))
                 val sliver = TileBadgeOverlay.deriveBadgeSizePx(tiny, m, 2000, 1000)!!
-                check(sliver.width == (0.03 * 2000 * 0.70).toInt()) {
+                check(sliver.width == kotlin.math.round(0.03 * 2000 * 0.94).toInt()) {
                     "expected the scaled min pitch clamp, got ${sliver.width}"
                 }
             }
             test("deriveBadgeSizePx scales with the frame height") { _, _ ->
-                // 1440p: label height ~72 px; width ~89 px at 70% tile pitch.
+                // 1440p: label height ~94 px; width ~119 px at 94% tile pitch.
                 val m = mapping(3168, 1440, viewportW = 3168, viewportH = 1440)
                 val views = listOf(
                     view("1p", 0.20, 0.92), view("2p", 0.2399, 0.92),
@@ -727,8 +727,8 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 )
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 3168, 1440)
                     ?: error("expected a size")
-                check(size.width in 87..90) { "expected ~89 px, got ${size.width}" }
-                check(size.height in 59..62) { "expected ~72 px, got ${size.height}" }
+                check(size.width in 118..120) { "expected ~119 px, got ${size.width}" }
+                check(size.height in 93..95) { "expected ~94 px, got ${size.height}" }
                 // Degenerate frame: no card size, the caller keeps the text measurement.
                 check(TileBadgeOverlay.deriveBadgeSizePx(views, m, 0, 0) == null)
             }

@@ -12,7 +12,6 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.view.View
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /** Native rendering of the cat silhouette and gold/blue palettes supplied in 猫头素材.zip. */
@@ -36,7 +35,7 @@ internal class CatHintView(context: Context) : View(context) {
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
         textAlign = Paint.Align.CENTER
     }
     private var action = ""
@@ -57,9 +56,9 @@ internal class CatHintView(context: Context) : View(context) {
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val density = resources.displayMetrics.density
         textPaint.textSize = 10f * resources.displayMetrics.scaledDensity
-        val naturalWidth = (textPaint.measureText("$action $percent") + 4f * density).roundToInt()
+        val naturalWidth = (42f * density).roundToInt()
         setMeasuredDimension(resolveSize(naturalWidth, widthMeasureSpec),
-            resolveSize((30f * density).roundToInt(), heightMeasureSpec))
+            resolveSize((35f * density).roundToInt(), heightMeasureSpec))
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -72,21 +71,28 @@ internal class CatHintView(context: Context) : View(context) {
         val bottom = if (gold) 0xFFFFD258.toInt() else 0xFF2F79BD.toInt()
         val edge = if (gold) 0xFFFFFBE4.toInt() else 0xFF9AD8FF.toInt()
         // Reserve space INSIDE the view for the crest, so Android clipping cannot hide it.
-        val crestH = h * 0.42f
-        val crestW = min(w * 0.46f, crestH * 1.4f)
-        val chipTop = crestH * 0.95f
+        // Size the cat against the chip width: the reference crest is prominent,
+        // tucked into its upper-right edge rather than a tiny detached ornament.
+        val crestW = w * 0.66f
+        val crestScale = crestW / 76f
+        val crestH = crestScale * 56f
+        // Keep the existing body and text geometry while enlarging only the cat.
+        val chipTop = h * 0.38f
+
         val rect = RectF(1f, chipTop, w - 1f, h - 1f)
         paint.style = Paint.Style.FILL
         paint.shader = LinearGradient(0f, chipTop, 0f, h, top, bottom, Shader.TileMode.CLAMP)
-        canvas.drawRoundRect(rect, h * 0.08f, h * 0.08f, paint)
+        canvas.drawRoundRect(rect, h * 0.10f, h * 0.10f, paint)
         paint.shader = null
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 1f
         paint.color = edge
-        canvas.drawRoundRect(rect, h * 0.08f, h * 0.08f, paint)
+        canvas.drawRoundRect(rect, h * 0.10f, h * 0.10f, paint)
+
+
 
         canvas.save()
-        val crestLeft = w - crestW - w * 0.08f
+        val crestLeft = w - crestW - w * 0.025f
         if (gold) {
             val pulse = (0.5 + 0.5 * kotlin.math.sin(SystemClock.uptimeMillis() * Math.PI * 2.0 / 2100.0)).toFloat()
             val cx = crestLeft + crestW / 2f
@@ -100,9 +106,9 @@ internal class CatHintView(context: Context) : View(context) {
             canvas.drawCircle(cx,cy,radius,paint)
             paint.shader = null
         }
-        canvas.translate(crestLeft, 2f)
+        canvas.translate(crestLeft, 0f)
         // Leave room for the SVG's five-unit outline inside the crest bounds.
-        canvas.scale(crestW / 76f, (crestH - 2f).coerceAtLeast(1f) / 56f)
+        canvas.scale(crestScale, crestScale)
         canvas.translate(3f, 3f)
         paint.style = Paint.Style.FILL
         paint.color = when (palette) {
@@ -128,17 +134,15 @@ internal class CatHintView(context: Context) : View(context) {
         canvas.restore()
 
         textPaint.color = if (gold) 0xFF2B2C2E.toInt() else 0xFFF4FBFF.toInt()
-        // Two centered rows share one font size, fitted to the longer row.
-        // Keeping the same size avoids a short action looking larger than its weight.
-        val rowHeight = (h - chipTop - 2f).coerceAtLeast(1f) / 2f
-        textPaint.textSize = min(10f * resources.displayMetrics.scaledDensity, rowHeight * 0.86f)
-        val longest = maxOf(textPaint.measureText(action), textPaint.measureText(percent))
-        if (longest > w - 6f && longest > 0f) {
-            textPaint.textSize *= (w - 6f).coerceAtLeast(1f) / longest
-        }
+        // One row: discard chips read "切 83" (integer probability, no tile name).
+        val label = "$action $percent"
+        val bodyHeight = (h - chipTop - 2f).coerceAtLeast(1f)
+        textPaint.textSize = bodyHeight * 0.80f
+        val labelWidth = textPaint.measureText(label)
+        val availableWidth = (w - 8f).coerceAtLeast(1f)
+        if (labelWidth > availableWidth) textPaint.textSize *= availableWidth / labelWidth
         val baselineOffset = -(textPaint.ascent() + textPaint.descent()) / 2f
-        canvas.drawText(action, w / 2f, chipTop + rowHeight * 0.5f + baselineOffset, textPaint)
-        canvas.drawText(percent, w / 2f, chipTop + rowHeight * 1.5f + baselineOffset, textPaint)
+        canvas.drawText(label, w / 2f, chipTop + bodyHeight * 0.5f + baselineOffset, textPaint)
         if (gold && isAttachedToWindow && windowVisibility == VISIBLE) postInvalidateDelayed(40L)
     }
 }
