@@ -165,6 +165,18 @@ fun main() {
         check("current command advances after all confirmations",gate.poll(null)!=null)
     }
 
+    run {
+        fun panel(json: String) = com.yefeng.majmax.hookprobe.manager.RecommendationPanelOverlay.dataFor(JSONObject(json))
+        val missing = panel("""{"analysis":{"hand14":{}},"recommendations":[{"kind":"discard","tile":"E"}]}""")
+        check("missing shanten preserves recommendations", missing.getJSONArray("rows").length() == 1 && missing.getInt("shanten") == -99)
+        val fallback = panel("""{"analysis":{"hand13":{},"hand14":{"shanten":2}}}""")
+        check("missing hand13 shanten falls back to hand14", fallback.getInt("shanten") == 2)
+        val ready = panel("""{"analysis":{"hand13":{"shanten":0,"win_scores":[{"tile":"5s"}]}},"recommendations":[{"kind":"discard","tile":"E"}]}""")
+        check("explicit zero shanten shows wait scores", ready.getJSONArray("rows").length() == 0 && ready.getJSONArray("scores").length() == 1)
+        val unknown = panel("""{"recommendations":[{"kind":"discard","tile":"E"}]}""")
+        check("absent analysis preserves recommendations", unknown.getInt("shanten") == -99 && unknown.getJSONArray("rows").length() == 1)
+    }
+
     println("\n=== ${passed} passed, ${failed} failed ===")
     if (failed != 0) kotlin.system.exitProcess(1)
 }

@@ -142,7 +142,9 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
             val analysis = result.optJSONObject("analysis")
             val hand13 = analysis?.optJSONObject("hand13")
             val hand14 = analysis?.optJSONObject("hand14")
-            val shanten = hand13?.optInt("shanten") ?: hand14?.optInt("shanten") ?: -99
+            val shanten = sequenceOf(hand13, hand14)
+                .mapNotNull { it?.optInt("shanten", -99)?.takeUnless { value -> value == -99 } }
+                .firstOrNull() ?: -99
             val rows = JSONArray()
             if (shanten != 0) {
                 val seen = mutableSetOf<String>()
