@@ -580,7 +580,6 @@ using Close = void (*)(void *, const void *);
 Send originalBestSend = nullptr;
 BinaryCallback originalBestBinary = nullptr;
 Close originalBestClose = nullptr;
-Close originalBestDispose = nullptr;
 
 void hookedBestSend(void *socket, void *data, const void *method) {
     Processed processed = process(socket, true, data);
@@ -611,11 +610,6 @@ void hookedBestBinary(void *socket, void *response, void *data, const void *meth
 void hookedBestClose(void *socket, const void *method) {
     forgetConnection(socket);
     originalBestClose(socket, method);
-}
-
-void hookedBestDispose(void *socket, const void *method) {
-    forgetConnection(socket);
-    originalBestDispose(socket, method);
 }
 
 void *bootstrap(void *) {
@@ -678,12 +672,12 @@ void *bootstrap(void *) {
                 hookMethod(method, reinterpret_cast<void *>(hookedBestClose),
                         reinterpret_cast<void **>(&originalBestClose),
                         "BestHTTP.WebSocket.WebSocket.Close()");
-            } else if (std::strcmp(name, "Dispose") == 0 && parameters == 0) {
-                hookMethod(method, reinterpret_cast<void *>(hookedBestDispose),
-                        reinterpret_cast<void **>(&originalBestDispose),
-                        "BestHTTP.WebSocket.WebSocket.Dispose()");
             }
         }
+        // Do not inline-hook Dispose(): the observed game entry is a 12-byte
+        // tail-call wrapper adjacent to another method. Two device tombstones
+        // show SIGSEGV at 0x22cb254 through our Dispose trampoline on the IL2CPP
+        // thread pool. Leave native disposal untouched; Close() still cleans up.
         hooksReady.store(messageHooks == 2);
         if (messageHooks == 2) {
             INFO("BestHTTP Modder ready; array header=%u", api.arrayHeaderSize());

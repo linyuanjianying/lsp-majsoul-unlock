@@ -26,6 +26,8 @@ class GameHintLayer {
     private var previousResult = ""
     private var previousCoords = ""
     private var previousButtons = ""
+    private var previousSource = ""
+    private var previousButtonSource = ""
 
     private val tick = object : Runnable {
         override fun run() {
@@ -63,27 +65,34 @@ class GameHintLayer {
                             val sourceH = snapshot.getInt("sourceH")
                             val buttonSourceW = snapshot.getInt("buttonSourceW")
                             val buttonSourceH = snapshot.getInt("buttonSourceH")
+                            val source = "${sourceW}x${sourceH}"
+                            val buttonSource = "${buttonSourceW}x${buttonSourceH}"
                             if (result.isNotEmpty() && result != previousResult) {
                                 val parsed = runCatching { JSONObject(result) }.getOrNull()
                                 if (parsed != null) {
-                                    runCatching { badge?.update(parsed) }
-                                    previousResult = result
+                                    runCatching { badge?.update(parsed) }.onSuccess {
+                                        previousResult = result
+                                    }
                                 }
                             }
-                            if (coords.isNotEmpty() && coords != previousCoords) {
+                            if (coords.isNotEmpty() && (coords != previousCoords || source != previousSource)) {
                                 val parsed = runCatching { JSONArray(coords) }.getOrNull()
                                 if (parsed != null) {
-                                    runCatching { badge?.updateHookedCoords(parsed, sourceW, sourceH) }
-                                    previousCoords = coords
+                                    runCatching { badge?.updateHookedCoords(parsed, sourceW, sourceH) }.onSuccess {
+                                        previousCoords = coords
+                                        previousSource = source
+                                    }
                                 }
                             }
-                            if (buttons.isNotEmpty() && buttons != previousButtons) {
+                            if (buttons.isNotEmpty() && (buttons != previousButtons || buttonSource != previousButtonSource)) {
                                 val parsed = runCatching { JSONArray(buttons) }.getOrNull()
                                 if (parsed != null) {
                                     runCatching {
                                         badge?.updateHookedButtons(parsed, buttonSourceW, buttonSourceH)
+                                    }.onSuccess {
+                                        previousButtons = buttons
+                                        previousButtonSource = buttonSource
                                     }
-                                    previousButtons = buttons
                                 }
                             }
                         }
@@ -111,5 +120,7 @@ class GameHintLayer {
         previousResult = ""
         previousCoords = ""
         previousButtons = ""
+        previousSource = ""
+        previousButtonSource = ""
     }
 }

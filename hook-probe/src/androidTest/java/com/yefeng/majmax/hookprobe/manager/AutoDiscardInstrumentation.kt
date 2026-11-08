@@ -524,13 +524,19 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val emptyViews = TileBadgeOverlay.computeBadgePlacement(hints, emptyList(), valid)
                 check(emptyViews.placed.isEmpty())
             }
-            test("computeBadgePlacement reports ambiguous duplicate tiles") { _, _ ->
+            test("cat palettes preserve recommendation ranks") { _, _ ->
+                check(CatHintView.paletteIndex(0, true) == 0)
+                check(CatHintView.paletteIndex(1, true) == 1)
+                check(CatHintView.paletteIndex(2, true) == 2)
+                check(CatHintView.paletteIndex(0, false) == 2)
+            }
+            test("computeBadgePlacement keeps the top hint on duplicate tiles") { _, _ ->
                 val m = mapping(2376, 1080, viewportW = 2376, viewportH = 1080)
                 val views = listOf(view("5m", 0.20, 0.90), view("5m", 0.30, 0.90))
                 val hints = listOf(hint("discard", "5m", 0))
                 val placement = TileBadgeOverlay.computeBadgePlacement(hints, views, m)
-                check(placement.ambiguous == 1 && placement.placed.isEmpty())
-                check(placement.pairingTrace.contains("5m=5m:2")) { "expected ambiguity trace" }
+                check(placement.ambiguous == 0 && placement.placed[0]?.first == 475)
+                check(placement.pairingTrace.contains("5m=5m:2")) { "expected duplicate pairing trace" }
             }
             // buildMapping is the pure decision behind BADGE_HIDDEN. Each failure must
             // name its own cause, so an unset source viewport is never reported as a

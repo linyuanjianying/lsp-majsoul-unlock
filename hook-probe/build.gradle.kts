@@ -6,7 +6,7 @@ plugins {
 
 val upstreamDir = rootProject.projectDir.resolve("../external/MajsoulMax-rs")
 val stagedAssets = layout.buildDirectory.dir("generated/upstreamAssets")
-val updateOwner = providers.gradleProperty("updateOwner").orElse("YeFeng233").get()
+val updateOwner = providers.gradleProperty("updateOwner").orElse("linyuanjianying").get()
 val updateRepo = providers.gradleProperty("updateRepo").orElse("lsp-majsoul-unlock").get()
 val updateChannel = providers.gradleProperty("updateChannel").orElse("stable").get()
 val buildSha = providers.gradleProperty("buildSha")
@@ -56,8 +56,8 @@ android {
         applicationId = "com.yefeng.majmax.hookprobe"
         minSdk = 29
         targetSdk = 35
-        versionCode = 30
-        versionName = "0.14.2"
+        versionCode = 31
+        versionName = "0.14.3"
         testInstrumentationRunner = "com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation"
         buildConfigField("String", "UPDATE_OWNER", "\"${updateOwner.replace("\"", "\\\"")}\"")
         buildConfigField("String", "UPDATE_REPO", "\"${updateRepo.replace("\"", "\\\"")}\"")

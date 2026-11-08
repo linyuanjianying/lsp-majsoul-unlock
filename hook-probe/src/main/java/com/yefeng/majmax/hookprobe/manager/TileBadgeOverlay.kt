@@ -4,14 +4,12 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
@@ -260,6 +258,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
                         key = key,
                         weight = rawWeight.coerceIn(0.0, 100.0),
                         displayName = KIND_DISPLAY_NAME[kind] ?: kind,
+                        rank = i,
                     )
                 )
             }
@@ -511,27 +510,18 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             for (hint in hints) {
                 val key = canonicalTile(hint.tile)
                 val count = viewCounts[key] ?: 0
-                // Ambiguity is only relevant for the tile we actually want to point at.
-                if (count > 1) {
-                    ambiguous++
+                // Equivalent copies are valid manual discard targets; red fives
+                // remain distinct through canonicalTile. Use each view at most once.
+                val idx = views.indices.firstOrNull {
+                    it !in usedViews && canonicalTile(views[it].tile) == key
+                }
+                if (idx == null) {
+                    missing++
                 } else {
-                    var view: HookedTile? = null
-                    var idx = -1
-                    for ((i, v) in views.withIndex()) {
-                        if (i in usedViews) continue
-                        if (canonicalTile(v.tile) == key) { view = v; idx = i; break }
-                    }
-                    if (view == null) {
-                        missing++
-                    } else {
-                        usedViews.add(idx)
-                        val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
-                        if (local != null) {
-                            placed[hint.handIndex] = local.first to local.second
-                        } else {
-                            missing++
-                        }
-                    }
+                    usedViews.add(idx)
+                    val view = views[idx]
+                    val local = HandCoordinateMapper.toLocalPx(view.normX, view.normY, mapping)
+                    if (local != null) placed[hint.handIndex] = local else missing++
                 }
                 if (pairingTrace.length < 112) {
                     if (pairingTrace.isNotEmpty()) pairingTrace.append(' ')
@@ -619,7 +609,8 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         val kind: String,
         val tile: String,
         val weight: Double,
-        val handIndex: Int
+        val handIndex: Int,
+        val rank: Int = 0
     )
 
     internal data class HookedButton(
@@ -632,16 +623,15 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         val kind: String,
         val key: String,
         val weight: Double,
-        val displayName: String
+        val displayName: String,
+        val rank: Int = 0
     )
 
     private val windows = context.getSystemService(WindowManager::class.java)
     private val display = context.resources.displayMetrics
 
-    // High-visibility solid colors matching reference
-    private val primaryColor = Color.rgb(255, 140, 0)   // Vivid Deep Orange for top recommendation
-    private val secondaryColor = Color.rgb(33, 150, 243) // Bright Blue for secondary recommendations
-    private val subtleColor = Color.rgb(41, 128, 185)    // Muted Steel Blue for minor suggestions
+    // Hint chips are drawn by [CatHintView]; its palette (gold / navy / cyan) is
+    // copied from the reference cat-hud.js HUD and keyed by rank, not by weight.
 
     private var root: FrameLayout? = null
     private var hand: List<String> = emptyList()
@@ -992,7 +982,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             val rawWeight = row.optDouble("weight", Double.NaN).takeIf { it.isFinite() }
                 ?: (row.optDouble("policyProbability", 0.0) * 100).takeIf { it.isFinite() } ?: 0.0
 
-            hints.add(DiscardHint(kind, normalizedTile, rawWeight.coerceIn(0.0, 100.0), targetIndex))
+            hints.add(DiscardHint(kind, normalizedTile, rawWeight.coerceIn(0.0, 100.0), targetIndex, i))
         }
         return hints
     }
@@ -1009,9 +999,9 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
      * The protocol hand (AI `tehai`) and the game view list (`_handpai`, after the
      * Lua side drops melds and the wildcard) are two independent orderings. They
      * are known to carry the same multiset of tiles, but their relative order is
-     * not guaranteed. Only the *hinted* tile type needs to be unique; a duplicated
-     * tile that is not being recommended cannot move a badge, so it never
-     * suppresses one (with hand `1m 1m 9s`, a hint on `9s` still lands correctly).
+     * not guaranteed. Equal canonical tiles are interchangeable manual discard
+     * targets, so duplicate views are consumed left to right. Red fives remain
+     * distinct from ordinary fives.
      * Without any hook coordinates there is no reliable anchor, so nothing is
      * drawn. The old calibrated-row fallback has been removed rather than kept as
      * a wrong-but-plausible default.
@@ -1254,7 +1244,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         val edgeInset = pxFromReference(EDGE_INSET_REF, frameHeight)
         val minBadgeHeight = pxFromReference(MIN_BADGE_HEIGHT_REF, frameHeight)
 
-        val badgeTargets = ArrayList<Triple<LinearLayout, Pair<Int, Int>, DiscardHint>>()
+        val badgeTargets = ArrayList<Triple<CatHintView, Pair<Int, Int>, DiscardHint>>()
         var skippedHeight = 0
         // Measure each badge synchronously with real constraints *before* adding it to
         // the frame: a freshly attached view still reports width = height = 0, and the
@@ -1266,9 +1256,10 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         // One compact label per hint; null only for a degenerate frame.
         val badgeSize = deriveBadgeSizePx(hookedTiles, mapping, frameWidth, frameHeight)
         var textOverflow = 0
-        for ((rank, hint) in hints.withIndex()) {
+        for (hint in hints) {
             val target = placement.placed[hint.handIndex] ?: continue
-            val badgeView = createBadgeCard(hint, rank, badgeSize)
+            val badgeView: CatHintView =
+                createBadgeCard(hint)
             if (badgeSize != null) {
                 val cardW = badgeSize.width
                 val cardH = badgeSize.height
@@ -1446,10 +1437,9 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         // height like the tile badge's fallback, keeping the same compact style.
         val labelH = (TILE_FACE_HEIGHT_OF_FRAME * frameHeight).roundToInt()
             .coerceIn(pxFromReference(MIN_BADGE_HEIGHT_REF, frameHeight), (BADGE_HEIGHT_MAX_OF_FRAME * frameHeight).roundToInt())
-        val density = context.resources.displayMetrics.scaledDensity
 
         var placed = 0
-        for ((rank, hint) in buttonHints.withIndex()) {
+        for (hint in buttonHints) {
             val button = hookedButtons[hint.key] ?: continue
             val local = HandCoordinateMapper.toLocalPx(button.normX, button.normY, mapping) ?: continue
             val (centerX, centerY) = local
@@ -1458,59 +1448,14 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             val weightText =
                 if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
 
-            val card = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                isClickable = false
-                isFocusable = false
-                clipChildren = true
-                clipToPadding = true
-                setPadding(dp(2), dp(1), dp(2), dp(1))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dp(4).toFloat()
-                    setColor(
-                        when {
-                            hint.weight <= 0.0 -> subtleColor
-                            rank == 0 -> primaryColor
-                            rank == 1 -> secondaryColor
-                            else -> subtleColor
-                        }
-                    )
-                    setStroke(dp(1), Color.argb(130, 255, 255, 255))
-                }
-            }
-            val heightLimit = (labelH / (2.45f * density)).coerceAtLeast(5f)
-            val actionSp = minOf(BADGE_ACTION_TEXT_SP, heightLimit).coerceAtLeast(5f)
-            val weightSp = minOf(BADGE_WEIGHT_TEXT_SP, heightLimit, actionSp).coerceAtLeast(5f)
-
-            card.addView(TextView(context).apply {
-                text = actionText
-                textSize = actionSp
-                setTextColor(Color.WHITE)
-                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                includeFontPadding = false
-                gravity = Gravity.CENTER
-                isSingleLine = true
-                ellipsize = TextUtils.TruncateAt.END
-                maxLines = 1
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-                )
-            })
-            card.addView(TextView(context).apply {
-                text = weightText
-                textSize = weightSp
-                setTextColor(Color.WHITE)
-                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                includeFontPadding = false
-                gravity = Gravity.CENTER
-                isSingleLine = true
-                maxLines = 1
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-                )
-            })
+            // One cat chip per button hint; size is the frame-normalized label box
+            // and the width bound keeps it compact over the button it annotates.
+            val card = createBadgeCard(
+                action = actionText,
+                percent = weightText,
+                rank = hint.rank,
+                hasWeight = hint.weight > 0.0,
+            )
 
             // Measure with a reasonable width bound so the label stays compact and
             // never wider than a small multiple of the button it annotates.
@@ -1544,73 +1489,40 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         }
     }
 
-    /** A two-line badge fitted inside a short label above its tile. */
-    private fun createBadgeCard(hint: DiscardHint, rank: Int, size: BadgeSize?) = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-        isClickable = false
-        isFocusable = false
-        clipChildren = true
-        clipToPadding = true
-        setPadding(dp(2), dp(1), dp(2), dp(1))
-
-        val bgColor = when (rank) {
-            0 -> primaryColor   // Solid Orange/Amber for #1
-            1 -> secondaryColor // Solid Bright Blue for #2
-            else -> subtleColor // Solid Steel Blue for #3 / #4
-        }
-
-        background = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = dp(4).toFloat()
-            setColor(bgColor)
-            setStroke(dp(1), Color.argb(130, 255, 255, 255))
-        }
-
+    /**
+     * One cat-crest hint chip sized by the caller: [createBadgeCard] for a discard
+     * hint (hand tile) and [createBadgeCard] for an action-button hint both go
+     * through the same native view.
+     *
+     * The chip color comes from [CatHintView.Palette.forRank]: **rank first, never a
+     * weight threshold**, so the top-ranked recommendation is gold even when its
+     * weight is low, and a hint with no usable weight falls back to the neutral
+     * cyan chip. Text (operation name + percentage) is unchanged.
+     */
+    private fun createBadgeCard(
+        hint: DiscardHint,
+    ): CatHintView {
         val isRiichi = hint.kind == "riichi"
         val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
         val weightText =
             if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
-        val density = context.resources.displayMetrics.scaledDensity
-        val widthLimit = if (size == null) BADGE_ACTION_TEXT_SP else
-            (size.width - dp(4)).coerceAtLeast(1) / (actionText.length * 0.85f * density)
-        val heightLimit = if (size == null) BADGE_ACTION_TEXT_SP else
-            size.height / (2.45f * density)
-        val actionSp = minOf(BADGE_ACTION_TEXT_SP, widthLimit, heightLimit).coerceAtLeast(5f)
-        val weightSp = minOf(BADGE_WEIGHT_TEXT_SP, heightLimit, actionSp).coerceAtLeast(5f)
+        return createBadgeCard(
+            action = actionText,
+            percent = weightText,
+            rank = hint.rank,
+            hasWeight = hint.weight > 0.0,
+        )
+    }
 
-        addView(TextView(context).apply {
-            text = actionText
-            textSize = actionSp
-            setTextColor(Color.WHITE)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            includeFontPadding = false
-            gravity = Gravity.CENTER
-            isSingleLine = true
-            ellipsize = TextUtils.TruncateAt.END
-            maxLines = 1
-            isClickable = false
-            isFocusable = false
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-        })
+    /** Builds a cat chip bound to [action]/[percent] with the rank-selected palette. */
+    private fun createBadgeCard(
+        action: String,
+        percent: String,
+        rank: Int,
+        hasWeight: Boolean,
+    ): CatHintView = CatHintView(context).apply {
+        bind(action = action, percent = percent, rank = rank, hasWeight = hasWeight)
 
-        addView(TextView(context).apply {
-            text = weightText
-            textSize = weightSp
-            setTextColor(Color.WHITE)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            includeFontPadding = false
-            gravity = Gravity.CENTER
-            isSingleLine = true
-            maxLines = 1
-            isClickable = false
-            isFocusable = false
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-        })
     }
 
     private fun tileDisplayName(tile: String): String {
