@@ -667,7 +667,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 // 0.0398 * 2376 = 94.6 px pitch (screenshot: 94-95 px).
                 check(size.width in 65..68) { "expected a 65-68 px label width, got ${size.width}" }
                 // Reference label height: 5% of a 1080 px frame.
-                check(size.height in 52..56) {
+                check(size.height in 44..47) {
                     "expected a ~54 px label height, got ${size.height}"
                 }
                 check(size.source == "pitch") { "expected pitch sizing, got ${size.source}" }
@@ -696,11 +696,11 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     ?: error("expected the normalized fallback")
                 check(fallback.source == "fallback") { "expected fallback, got ${fallback.source}" }
                 check(fallback.width in 65..68) { "expected ~67 px, got ${fallback.width}" }
-                check(fallback.height in 52..56) { "expected ~54 px, got ${fallback.height}" }
+                check(fallback.height in 44..47) { "expected ~54 px, got ${fallback.height}" }
                 // No mapping: use the same compact fallback.
                 val noMapping = TileBadgeOverlay.deriveBadgeSizePx(single, null, 2376, 1080)
                     ?: error("expected a size even without a mapping")
-                check(noMapping.width in 65..68 && noMapping.height in 52..56)
+                check(noMapping.width in 65..68 && noMapping.height in 44..47)
             }
             test("deriveBadgeSizePx clamps a distorted or single-tile hand") { _, _ ->
                 val m = mapping(2000, 1000, viewportW = 2000, viewportH = 1000)
@@ -728,7 +728,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 3168, 1440)
                     ?: error("expected a size")
                 check(size.width in 87..90) { "expected ~89 px, got ${size.width}" }
-                check(size.height in 70..74) { "expected ~72 px, got ${size.height}" }
+                check(size.height in 59..62) { "expected ~72 px, got ${size.height}" }
                 // Degenerate frame: no card size, the caller keeps the text measurement.
                 check(TileBadgeOverlay.deriveBadgeSizePx(views, m, 0, 0) == null)
             }

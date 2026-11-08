@@ -129,7 +129,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         private const val BADGE_GAP_DP = 1
 
         /** Compact two-line label above the tile, sized relative to the hand pitch. */
-        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.0500f
+        private const val TILE_FACE_HEIGHT_OF_FRAME = 0.0420f
         private const val BADGE_WIDTH_TO_TILE_PITCH = 0.70f
 
         /**
@@ -150,7 +150,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         private const val MAX_TILE_PITCH_OF_FRAME_WIDTH = 0.0550f
 
         /** Height bounds for compact labels on unusual aspect ratios. */
-        private const val BADGE_HEIGHT_MIN_OF_FRAME = 0.035f
+        private const val BADGE_HEIGHT_MIN_OF_FRAME = 0.030f
         private const val BADGE_HEIGHT_MAX_OF_FRAME = 0.065f
 
         /** Maximum text sizes; each label also fits its measured pixel box. */
@@ -1446,7 +1446,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
 
             val actionText = hint.displayName
             val weightText =
-                if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
+                if (hint.weight > 0.0) String.format(Locale.ROOT, "%.0f", hint.weight) else "—"
 
             // One cat chip per button hint; size is the frame-normalized label box
             // and the width bound keeps it compact over the button it annotates.
@@ -1460,7 +1460,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             // Measure with a reasonable width bound so the label stays compact and
             // never wider than a small multiple of the button it annotates.
             card.measure(
-                View.MeasureSpec.makeMeasureSpec((frameWidth * 0.22f).roundToInt(), View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.makeMeasureSpec((frameWidth * 0.028f).roundToInt(), View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(labelH, View.MeasureSpec.EXACTLY),
             )
             val cardW = card.measuredWidth.coerceAtLeast(1)
@@ -1503,9 +1503,9 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         hint: DiscardHint,
     ): CatHintView {
         val isRiichi = hint.kind == "riichi"
-        val actionText = (if (isRiichi) "立·" else "切") + tileDisplayName(hint.tile)
+        val actionText = if (isRiichi) "立" else "切"
         val weightText =
-            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.1f%%", hint.weight) else "—"
+            if (hint.weight > 0.0) String.format(Locale.ROOT, "%.0f", hint.weight) else "—"
         return createBadgeCard(
             action = actionText,
             percent = weightText,

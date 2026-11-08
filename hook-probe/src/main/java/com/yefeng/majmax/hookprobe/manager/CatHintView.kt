@@ -3,6 +3,8 @@ package com.yefeng.majmax.hookprobe.manager
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.RadialGradient
+import android.os.SystemClock
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
@@ -55,7 +57,7 @@ internal class CatHintView(context: Context) : View(context) {
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val density = resources.displayMetrics.density
         textPaint.textSize = 10f * resources.displayMetrics.scaledDensity
-        val naturalWidth = (textPaint.measureText("$action $percent") + 8f * density).roundToInt()
+        val naturalWidth = (textPaint.measureText("$action $percent") + 4f * density).roundToInt()
         setMeasuredDimension(resolveSize(naturalWidth, widthMeasureSpec),
             resolveSize((30f * density).roundToInt(), heightMeasureSpec))
     }
@@ -70,9 +72,9 @@ internal class CatHintView(context: Context) : View(context) {
         val bottom = if (gold) 0xFFFFD258.toInt() else 0xFF2F79BD.toInt()
         val edge = if (gold) 0xFFFFFBE4.toInt() else 0xFF9AD8FF.toInt()
         // Reserve space INSIDE the view for the crest, so Android clipping cannot hide it.
-        val crestH = h * 0.48f
-        val crestW = min(w * 0.55f, crestH * 1.4f)
-        val chipTop = crestH * 0.7f
+        val crestH = h * 0.42f
+        val crestW = min(w * 0.46f, crestH * 1.4f)
+        val chipTop = crestH * 0.95f
         val rect = RectF(1f, chipTop, w - 1f, h - 1f)
         paint.style = Paint.Style.FILL
         paint.shader = LinearGradient(0f, chipTop, 0f, h, top, bottom, Shader.TileMode.CLAMP)
@@ -84,7 +86,21 @@ internal class CatHintView(context: Context) : View(context) {
         canvas.drawRoundRect(rect, h * 0.08f, h * 0.08f, paint)
 
         canvas.save()
-        canvas.translate((w - crestW) / 2f, 2f)
+        val crestLeft = w - crestW - w * 0.08f
+        if (gold) {
+            val pulse = (0.5 + 0.5 * kotlin.math.sin(SystemClock.uptimeMillis() * Math.PI * 2.0 / 2100.0)).toFloat()
+            val cx = crestLeft + crestW / 2f
+            val cy = crestH * 0.60f
+            val radius = crestW * 0.80f
+            paint.style = Paint.Style.FILL
+            paint.shader = RadialGradient(cx, cy, radius,
+                intArrayOf(Color.argb((150 + 70 * pulse).toInt(),255,255,224),
+                    Color.argb((80 + 65 * pulse).toInt(),255,192,54),Color.TRANSPARENT),
+                floatArrayOf(0f,0.45f,1f), Shader.TileMode.CLAMP)
+            canvas.drawCircle(cx,cy,radius,paint)
+            paint.shader = null
+        }
+        canvas.translate(crestLeft, 2f)
         // Leave room for the SVG's five-unit outline inside the crest bounds.
         canvas.scale(crestW / 76f, (crestH - 2f).coerceAtLeast(1f) / 56f)
         canvas.translate(3f, 3f)
@@ -118,5 +134,6 @@ internal class CatHintView(context: Context) : View(context) {
         if (textWidth > w - 4f && textWidth > 0f) textPaint.textSize *= (w - 4f).coerceAtLeast(1f) / textWidth
         val baseline = (chipTop + h) / 2f - (textPaint.ascent() + textPaint.descent()) / 2f
         canvas.drawText(label, w / 2f, baseline, textPaint)
+        if (gold && isAttachedToWindow && windowVisibility == VISIBLE) postInvalidateDelayed(40L)
     }
 }
