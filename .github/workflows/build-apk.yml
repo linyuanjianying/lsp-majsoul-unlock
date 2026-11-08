@@ -149,7 +149,7 @@ jobs:
             ACTUAL_SHA256="$(awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}' <<< "$CERTS" | tr -d '[:space:]:' | tr 'A-F' 'a-f')"
             echo "$APK signing certificate SHA-256: $ACTUAL_SHA256"
             if [ -n "$ANDROID_DEBUG_KEYSTORE_BASE64" ]; then
-              test "$ACTUAL_SHA256" = '375638284d8b7d9889ab3c0ed7afd0d597d2c648144813bb4936f37daa665c0f'
+              test "$ACTUAL_SHA256" = '92cf41d1f5b7dba7e22793794cc1c07d358c23d3b897044e91d1412c7d08d3f2'
             else
               test -n "$ACTUAL_SHA256"
             fi
