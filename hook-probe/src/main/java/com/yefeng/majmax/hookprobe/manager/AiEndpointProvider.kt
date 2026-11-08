@@ -72,6 +72,18 @@ class AiEndpointProvider : ContentProvider() {
             AiOverlayService.publishRematch(app, requested)
             return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
         }
+        if (method == "panelSet") {
+            // Single boolean preference for the click-through fixed panel's
+            // recommendation / honour-points block. It is deliberately isolated:
+            // writing it never starts or stops the service, never flips unattended
+            // mode or auto-rematch, never changes the display mode and never touches
+            // the cat-head hints. The reply carries the value that was actually
+            // stored, so the in-game control can tell a lost write from a saved one.
+            val requested = extras?.takeIf { it.containsKey("enabled") }?.getBoolean("enabled")
+                ?: throw IllegalArgumentException("Missing enabled")
+            RecommendationPanelSettings.save(app, requested)
+            return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
+        }
         if (method == "displayMode") {
             // Read-only projection of the persisted presentation mode. The game process
             // reads this so its in-game control can hide itself (while still polling)
@@ -391,6 +403,11 @@ object AssistLaunch {
         bundle.putBoolean("rematch", rematch)
         bundle.putBoolean("rematchActive", AutoRematchSettings.active(context,
             bundle.getBoolean("demo")))
+        // Click-through fixed panel: recommendation / honour-points block opt-in,
+        // defaults to on. Read-only projection like the mode above; the only writer
+        // from the game side is the `panelSet` method. It is independent of
+        // unattended mode, auto-rematch, the display mode and the cat-head hints.
+        bundle.putBoolean("recommendationPanel", RecommendationPanelSettings.read(context))
         return bundle
     }
 

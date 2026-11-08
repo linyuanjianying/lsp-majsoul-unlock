@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use super::agari_rate;
 use super::data::point::{RON_POINT_DAMA, RON_POINT_RIICHI};
 use super::hand::PlayerInfo34;
-use super::result::{Hand13Result, ImproveEntry, WaitInfo};
+use super::result::{Hand13Result, ImproveEntry, WaitInfo, WaitScore};
 use super::score;
 use super::shanten;
 use super::tile::{Tile34, TILE_COUNT};
@@ -248,12 +248,18 @@ pub fn analyze_13(info: &PlayerInfo34) -> Hand13Result {
     let mut dama_point = 0.0;
     let mut riichi_point = 0.0;
     let mut yaku_ids: Vec<u32> = Vec::new();
+    let mut win_scores: Vec<WaitScore> = Vec::new();
     if cur_shanten == 0 && !current_waits.is_empty() {
         // Compute dora set from indicators.
         let dora: Vec<_> = info.dora_indicators.iter().map(|d| d.dora_next()).collect();
         is_furiten = agari_rate::is_furiten(&current_waits, &info.own_discards);
         tile_rates = agari_rate::per_wait(&current_waits, &info.own_discards, &dora, is_furiten);
         avg_agari_rate = agari_rate::average(&current_waits, &info.own_discards, &dora, is_furiten);
+
+        // Per-tile han / fu / points. This is the exact, engine-derived
+        // scoreboard; the `dama_point` / `riichi_point` fields below stay as
+        // the weighted expectation used by the attack ranking.
+        win_scores = score::wait_scores(info, &current_waits, !is_open);
 
         let est = score::expectation(info, &current_waits, !is_open);
         dama_point = est.dama_point;
@@ -318,6 +324,7 @@ pub fn analyze_13(info: &PlayerInfo34) -> Hand13Result {
         riichi_point,
         mixed_round_point,
         yaku_ids,
+        win_scores,
     }
 }
 

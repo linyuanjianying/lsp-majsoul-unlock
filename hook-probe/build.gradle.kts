@@ -56,8 +56,8 @@ android {
         applicationId = "com.yefeng.majmax.hookprobe"
         minSdk = 29
         targetSdk = 35
-        versionCode = 39
-        versionName = "0.14.11"
+        versionCode = 45
+        versionName = "0.14.17"
         testInstrumentationRunner = "com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation"
         buildConfigField("String", "UPDATE_OWNER", "\"${updateOwner.replace("\"", "\\\"")}\"")
         buildConfigField("String", "UPDATE_REPO", "\"${updateRepo.replace("\"", "\\\"")}\"")

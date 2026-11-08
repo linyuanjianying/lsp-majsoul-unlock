@@ -29,7 +29,8 @@ pub mod waits;
 pub use hand::{Counts34, Meld34, Meld34Kind, OpponentInfo, PlayerInfo34};
 pub use improves::analyze_13;
 pub use result::{
-    AnalysisResult, DiscardCandidate, Hand13Result, Hand14Result, HandState, OpponentRisk, WaitInfo,
+    AnalysisResult, DiscardCandidate, Hand13Result, Hand14Result, HandState, OpponentRisk,
+    WaitInfo, WaitScore, WaitScoreValue,
 };
 pub use risk::RiskVec;
 pub use search::analyze_14;

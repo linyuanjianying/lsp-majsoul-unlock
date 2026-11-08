@@ -428,7 +428,7 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
             val maxH = BADGE_HEIGHT_MAX_OF_FRAME * frameHeight
             // Keep the reference silhouette stable as the measured tile face changes.
             val faceH = width * 0.80f
-            val height = faceH.coerceIn(minH, maxH)
+            val height = faceH.coerceIn(minH, maxH) + width * 0.20f
 
             return BadgeSize(
                 width = kotlin.math.round(width).toInt().coerceAtLeast(1),
@@ -1437,9 +1437,10 @@ internal class TileBadgeOverlay(private val context: Context, private val host: 
         val edgeInset = pxFromReference(EDGE_INSET_REF, frameHeight)
         // Buttons have no tile-pitch reference, so size the label from the frame
         // height like the tile badge's fallback, keeping the same compact style.
-        val labelH = (frameWidth * 0.0376f * 0.80f).roundToInt()
+        val labelBodyH = (frameWidth * 0.0376f * 0.80f).roundToInt()
             .coerceIn(pxFromReference(MIN_BADGE_HEIGHT_REF, frameHeight), (BADGE_HEIGHT_MAX_OF_FRAME * frameHeight).roundToInt())
 
+        val labelH = labelBodyH + (frameWidth * 0.0376f * 0.20f).roundToInt()
         var placed = 0
         for (hint in buttonHints) {
             val button = hookedButtons[hint.key] ?: continue

@@ -172,6 +172,7 @@ pub fn to_player_info(snap: &GameStateSnapshot, seat: u8) -> Result<PlayerInfo34
         opponents,
         left_tiles: None,
         own_discards,
+        kita_count: if snap.num_players == 3 { me.kita_tiles.len() as u8 } else { 0 },
     })
 }
 

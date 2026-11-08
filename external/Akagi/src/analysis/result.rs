@@ -10,7 +10,63 @@ use serde::Serialize;
 use super::tile::Tile34;
 use super::waits::Waits;
 
-/// One wait entry: tile + remaining count + agari rate.
+/// One legal winning shape for a single wait tile, as produced by
+/// `riichienv-core`'s hand evaluator.
+///
+/// "Legal" means the engine reported `is_win` (agari shape + at least one
+/// non-dora yaku), so a `Some(..)` slot is always a hand the player could
+/// actually declare. A slot that is absent (`None`) is *not* the same as
+/// "0 points": it means this situation can't be won at all (no yaku there),
+/// or is out of scope (open hands have no riichi slots).
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitScoreValue {
+    /// Han counted by the evaluator (dora included, ura-dora excluded).
+    pub han: u16,
+    /// Fu counted by the evaluator.
+    pub fu: u16,
+    /// Payment total received by the winner, in points.
+    /// For `ron` / `riichi_ron` this is the discarder's single payment.
+    /// For `tsumo` / `riichi_tsumo` it is the sum over every payer
+    /// (so a 3-player tsumo sums 2 payers, a 4-player one sums 3).
+    pub points: u32,
+    /// Whether the han count is yakuman-driven (han is then bucketed at 13+).
+    pub yakuman: bool,
+    /// Yaku ids reported by the evaluator (riichienv yaku id space).
+    pub yaku_ids: Vec<u32>,
+}
+
+/// Score breakdown for one wait tile of a 13-tile hand.
+///
+/// Produced by `analysis::score::wait_scores`. Emitted for every wait tile,
+/// including tiles where nothing is winnable — in that case every slot is
+/// `None` and the caller should surface "无役" (no yaku).
+///
+/// Deliberate simplifications (see `score::wait_scores` docs):
+/// no ura-dora, no ippatsu, no haitei/houtei/rinshan/chankan, no honba or
+/// riichi sticks. Sanma kita count is included.
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitScore {
+    /// The wait tile (mjai notation, never a red-five suffix).
+    pub tile: String,
+    /// Copies of `tile` still unseen (same value as the matching `WaitInfo.left`).
+    pub left: u8,
+    /// Summary han of the best-available situation (riichi-ron when the hand
+    /// is closed, plain ron otherwise). `None` when nothing is winnable.
+    pub han: Option<u16>,
+    /// Summary fu, matching the same situation as `han`.
+    pub fu: Option<u16>,
+    /// Summary points, matching the same situation as `han`.
+    pub points: Option<u32>,
+    /// Dama (no-riichi) ron. `None` when the hand has no yaku without riichi.
+    pub ron: Option<WaitScoreValue>,
+    /// Dama tsumo. `None` when the hand has no yaku without riichi.
+    pub tsumo: Option<WaitScoreValue>,
+    /// Riichi ron. Always `None` for open hands (no riichi possible).
+    pub riichi_ron: Option<WaitScoreValue>,
+    /// Riichi tsumo. Always `None` for open hands (no riichi possible).
+    pub riichi_tsumo: Option<WaitScoreValue>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WaitInfo {
     pub tile: String,
@@ -102,6 +158,11 @@ pub struct Hand13Result {
     pub mixed_round_point: f64,
     /// Yaku ids encountered across waits (riichienv yaku ids).
     pub yaku_ids: Vec<u32>,
+    /// Per-wait score breakdown: damaten / riichi × ron / tsumo for every
+    /// waiting tile. Empty unless the hand is tenpai with at least one wait.
+    /// Open hands carry no riichi slots; a tile that can't win at all is
+    /// still listed with every optional field `null`.
+    pub win_scores: Vec<WaitScore>,
 }
 
 /// One discard option from a 14-tile state.

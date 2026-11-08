@@ -56,6 +56,10 @@ import java.util.function.Consumer;
  *   <li>{@code rematchSet} writes the single auto-rematch preference. It never changes
  *       unattended mode, the service lifetime or the display mode; revoking it only
  *       removes the lease the next heartbeat carries.</li>
+ *   <li>{@code panelSet} writes the single "recommendation / honour-points panel"
+ *       preference of the click-through fixed panel. It never changes unattended
+ *       mode, auto-rematch, the service lifetime, the display mode or the cat-head
+ *       hints; the reply carries the stored value plus {@code recommendationPanel}.</li>
  * </ul>
  *
  * Surface behaviour: the control is a fixed, top-centre tab, never a draggable
@@ -124,7 +128,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private StageRoot panel;
     private FrameLayout.LayoutParams panelParams;
 
-    /** Expanded menu: light rounded panel with a left sidebar and two switch cards. */
+    /** Expanded menu: light rounded panel with a left sidebar and three switch cards. */
     private LinearLayout menu;
     private TextView title;
     private View titleDot;
@@ -149,6 +153,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private TextView rematchState;
     private TextView rematchNote;
     private GameTopUi.Switch rematchSwitch;
+
+    /* 开关卡 3：推荐与番点面板（panelSet），与卡 1、卡 2 完全独立。 */
+    private LinearLayout panelCard;
+    private TextView panelTitle;
+    private TextView panelState;
+    private TextView panelNote;
+    private GameTopUi.Switch panelSwitch;
 
     /* Status page: runtime facts and the start/stop/manual/collapse actions. */
     private TextView statusMode;
@@ -218,6 +229,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      */
     private boolean rematch;
     private boolean rematchActive;
+
+    /**
+     * 推荐与番点面板开关，取自状态回复的 {@code recommendationPanel}（缺省为开）。
+     * 只读字段：卡片的点按是唯一写入方，走 {@code panelSet}，且从不改无人值守、
+     * 自动下一局、显示模式或猫头提示。
+     */
+    private boolean recommendationPanel = true;
 
     /* Local, transient start sequence. */
     private boolean starting;
@@ -308,6 +326,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         rematchCard = null;
         rematchTitle = rematchState = rematchNote = null;
         rematchSwitch = null;
+        panelCard = null;
+        panelTitle = panelState = panelNote = null;
+        panelSwitch = null;
         statusMode = statusDetail = statusService = statusRematch = null;
         startStop = null;
         manualRow = collapseRow = null;
@@ -786,7 +807,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return view;
     }
 
-    /** Page 1: the two independent switches the user asked for. */
+    /** Page 1: the independent switches the user asked for. */
     private LinearLayout buildControlPage(Activity activity) {
         LinearLayout page = vertical(activity);
 
@@ -807,6 +828,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         rematchState = (TextView) rematchCard.getTag(TAG_STATE);
         rematchNote = (TextView) rematchCard.getTag(TAG_NOTE);
         rematchSwitch = (GameTopUi.Switch) rematchCard.getTag(TAG_SWITCH);
+
+        page.addView(spacer(activity, 6));
+
+        // Click-through fixed panel content: recommendation / honour points. Its own
+        // switch, live via `panelSet`; it never closes any other feature.
+        panelCard = switchCard(activity, page, "推荐与番点",
+            "点击穿透固定面板上的推荐与番点",
+            () -> onPanelToggle());
+        panelTitle = (TextView) panelCard.getTag(TAG_TITLE);
+        panelState = (TextView) panelCard.getTag(TAG_STATE);
+        panelNote = (TextView) panelCard.getTag(TAG_NOTE);
+        panelSwitch = (GameTopUi.Switch) panelCard.getTag(TAG_SWITCH);
         return page;
     }
 
@@ -1032,14 +1065,36 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
         setText(rematchNote, rematchNoteText());
         if (rematchNote != null) {
-            rematchNote.setTextColor(noticeFailed && !noticeRefersToUnattended()
+            rematchNote.setTextColor(panelNoticeFailed()
                 ? GameTopUi.DANGER : GameTopUi.INK_MUTED);
+        }
+
+        // Card 3 mirrors the persisted "recommendation / honour-points panel" opt-in.
+        // It stays tappable whatever the other two cards say: it only controls the
+        // click-through fixed panel content and never closes any other feature.
+        if (panelSwitch != null) {
+            panelSwitch.setOn(recommendationPanel, true);
+            panelSwitch.setBusy(actionBusy.get() && !starting);
+        }
+        setCardText(panelCard, TAG_STATE, panelState,
+            recommendationPanel ? "已开启" : "已关闭");
+        if (panelState != null) {
+            panelState.setTextColor(recommendationPanel ? GameTopUi.ACCENT : GameTopUi.INK_FAINT);
+        }
+        setText(panelNote, panelNoteText());
+        if (panelNote != null) {
+            panelNote.setTextColor(panelNoticeFailed() ? GameTopUi.DANGER : GameTopUi.INK_MUTED);
         }
     }
 
     /** True when the last failed notice came from the unattended path. */
     private boolean noticeRefersToUnattended() {
         return notice.contains("无人值守") || notice.contains("启动") || notice.contains("管理应用");
+    }
+
+    /** True when the last failed notice came from the panel (recommendation) path. */
+    private boolean panelNoticeFailed() {
+        return noticeFailed && notice.contains("面板");
     }
 
     private void paintStatusPage() {
@@ -1109,6 +1164,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (rematch && !rematchActive) return "待条件满足";
         if (rematch) return "仅按下一局原按钮";
         return "牌局结束后自动继续，与上项独立";
+    }
+
+    /** Note line of card 3: why it does or does not draw, in one short phrase. */
+    private String panelNoteText() {
+        if (panelNoticeFailed()) return notice;
+        if (recommendationPanel) return "固定面板显示建议牌与番点 · 不影响其他功能";
+        return "已隐藏建议牌与番点 · 其他功能不受影响";
     }
 
     private String serviceText() {
@@ -1257,6 +1319,37 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         });
     }
 
+    /**
+     * 通过 UID 校验过的 provider 实时切换「推荐与番点面板」。发送的是*目标值*
+     * （对上一次回复值的取反），回复像普通轮询一样被应用，所以卡片不可能显示一个
+     * 管理器没有真正保存的值。它只写这一个偏好：不启停服务、不改无人值守 /
+     * 自动下一局 / 显示模式，也不影响猫头提示。
+     */
+    private void onPanelToggle() {
+        if (!actionBusy.compareAndSet(false, true)) return;
+        boolean wanted = !recommendationPanel;
+        notice = wanted ? "正在显示推荐与番点面板…" : "正在隐藏推荐与番点面板…";
+        noticeFailed = false;
+        applyState();
+        Bundle args = new Bundle();
+        args.putBoolean("enabled", wanted);
+        call("panelSet", args, REQUEST_TIMEOUT_MS, reply -> {
+            actionBusy.set(false);
+            if (reply == null) {
+                noticeFailed = true;
+                notice = "管理应用无响应 · 面板设置可能未保存";
+            } else {
+                applyReply(reply);
+                noticeFailed = recommendationPanel != wanted;
+                notice = recommendationPanel != wanted
+                    ? "面板设置未保存 · 当前" + (recommendationPanel ? "开" : "关")
+                    : wanted ? "推荐与番点面板已开启" : "推荐与番点面板已关闭 · 其他功能未变";
+            }
+            applyState();
+            schedulePoll(POLL_MENU_MS);
+        });
+    }
+
     private void disable() {
         if (!actionBusy.compareAndSet(false, true)) return;
         notice = "正在关闭无人值守…";
@@ -1379,6 +1472,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         overlayMode = reply.getBoolean("overlayMode", false);
         rematch = reply.getBoolean("rematch", rematch);
         rematchActive = reply.getBoolean("rematchActive", false);
+        // Persisted click-through panel opt-in; defaults to on like the manager side.
+        recommendationPanel = reply.getBoolean("recommendationPanel", recommendationPanel);
         unreachable = false;
         managerMissing = false;
     }

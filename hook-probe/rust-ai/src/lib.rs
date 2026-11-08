@@ -222,7 +222,7 @@ impl Assistant {
             "inputPending":self.input_pending, "seat":seat, "players":snap.num_players,
             "round":format!("{}{}局 · {}本场", snap.bakaze, snap.kyoku, snap.honba),
             "turn":snap.turn_count, "hand":own.tehai, "canAct":can_act,
-            "analysis":analysis, "recommendations":recommendations,
+            "analysis":analysis, "kitaCount":own.kita_tiles.len(), "recommendations":recommendations,
             "elapsedMs":begin.elapsed().as_millis() as u64,
             "model":model_label,
             "modelFallback":custom_fallback, "modelExperimental":self.engine.as_ref().is_some_and(Engine::uses_experimental_policy), "estimated":true,

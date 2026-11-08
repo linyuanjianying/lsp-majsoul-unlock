@@ -78,6 +78,7 @@ class AiOverlayService : Service() {
                     !AssistantDisplayModeSettings.overlayActive(svc)
             } == true
             putBoolean("running", running)
+            putBoolean("recommendationPanel", service?.let { RecommendationPanelSettings.read(it) } ?: false)
             if (running) {
                 putString("result", hintResult)
                 putString("coords", hintCoords)
@@ -104,6 +105,7 @@ class AiOverlayService : Service() {
             .put("hand", result.optJSONArray("hand"))
             .put("recommendations", result.optJSONArray("recommendations"))
             .put("legalOperations", result.optJSONArray("legalOperations"))
+            .put("recommendationPanel", RecommendationPanelOverlay.dataFor(result))
 
         fun toggleAuto() { instance?.auto?.toggle() }
 
@@ -226,12 +228,14 @@ class AiOverlayService : Service() {
     private var worker: Thread? = null
     private var overlay: AiFloatingWindow? = null
     private var badges: TileBadgeOverlay? = null
+    private var recommendationPanel: RecommendationPanelOverlay? = null
     @Volatile private var fallbackLogged = false
     /** One diagnostics record per rematch ack state, for the lifetime of the service. */
     private val autoUiTick = object : Runnable {
         override fun run() {
             if (!alive.get()) return
             applyDisplayMode()
+            recommendationPanel?.update(fullResult.takeIf { it.isNotBlank() }?.let { JSONObject(it) }, RecommendationPanelSettings.read(this@AiOverlayService))
             overlay?.updateAuto(AutoDiscardState.mutable.value)
             // Pushed on the same 200 ms tick as the mode: the switch follows a change made
             // in the manager UI or in-game without waiting for the overlay to be rebuilt.
@@ -310,6 +314,7 @@ class AiOverlayService : Service() {
     private fun applyDisplayMode() {
         val overlayActive = AssistantDisplayModeSettings.overlayActive(this)
         if (overlayActive) {
+            if (recommendationPanel == null) recommendationPanel = RecommendationPanelOverlay(this)
             val needsReplay = overlay == null || badges == null
             if (overlay == null) {
                 runCatching {
@@ -334,6 +339,7 @@ class AiOverlayService : Service() {
             // poll. Idempotent when the overlays already carried the same state.
             if (needsReplay) replayHintSurface()
         } else {
+            recommendationPanel?.close(); recommendationPanel = null
             overlay?.close(); overlay = null
             badges?.close(); badges = null
         }
@@ -670,6 +676,7 @@ class AiOverlayService : Service() {
             fullResult = result.toString()
             overlay?.update(result)
             badges?.update(result)
+            recommendationPanel?.update(result, RecommendationPanelSettings.read(this))
             AiStatus.mutable.value = AiServiceStatus(true, connected, result.optString("message"))
         }
     }
@@ -678,6 +685,7 @@ class AiOverlayService : Service() {
         super.onConfigurationChanged(newConfig)
         overlay?.configurationChanged()
         badges?.configurationChanged()
+        recommendationPanel?.close()
         // A rotation/resize clears every captured badge anchor; the Lua side will not
         // re-send the same coordinates (its dedup signature is unchanged), so replay
         // the cached coords/buttons/result here to restore the hints immediately.
@@ -705,6 +713,7 @@ class AiOverlayService : Service() {
         queue.clear()
         main.removeCallbacksAndMessages(null)
         badges?.close()
+        recommendationPanel?.close(); recommendationPanel = null
         overlay?.close()
         runCatching { revokeUriPermission(ENDPOINT_URI, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         AiStatus.mutable.value = AiServiceStatus()

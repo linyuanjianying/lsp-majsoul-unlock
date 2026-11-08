@@ -64,8 +64,12 @@ internal class CatHintView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val w = width.toFloat()
-        val h = height.toFloat()
+        // Extra crest-only space above the original chip; body dimensions stay unchanged.
+        val crestInset = width * 0.20f
+        val h = height.toFloat() - crestInset
         if (w <= 0f || h <= 0f) return
+        canvas.save()
+        canvas.translate(0f, crestInset)
         val gold = palette == 0
         val top = if (gold) 0xFFFFE47A.toInt() else 0xFF58AEEE.toInt()
         val bottom = if (gold) 0xFFFFD258.toInt() else 0xFF2F79BD.toInt()
@@ -78,11 +82,21 @@ internal class CatHintView(context: Context) : View(context) {
         val crestH = crestScale * 56f
         // Keep the existing body and text geometry while enlarging only the cat.
         val chipTop = h * 0.38f
+        val crestTop = chipTop - crestH + 2f
 
         val rect = RectF(1f, chipTop, w - 1f, h - 1f)
         paint.style = Paint.Style.FILL
-        paint.shader = LinearGradient(0f, chipTop, 0f, h, top, bottom, Shader.TileMode.CLAMP)
-        canvas.drawRoundRect(rect, h * 0.10f, h * 0.10f, paint)
+        // A dark lower rim and a translucent offset shadow give the chip thickness.
+        paint.shader = null
+        paint.color = 0x500B1726
+        canvas.drawRoundRect(RectF(2f, chipTop + h * .045f, w - 2f, h - .5f), h * .10f, h * .10f, paint)
+        paint.color = if (gold) 0xFFAA7425.toInt() else 0xFF20517D.toInt()
+        canvas.drawRoundRect(rect, h * .10f, h * .10f, paint)
+        val front = RectF(rect.left, rect.top, rect.right, rect.bottom - h * .045f)
+        paint.shader = LinearGradient(0f, chipTop, 0f, h,
+            intArrayOf(top, if (gold) 0xFFFFD969.toInt() else 0xFF4598D6.toInt(), bottom),
+            floatArrayOf(0f, .45f, 1f), Shader.TileMode.CLAMP)
+        canvas.drawRoundRect(front, h * 0.10f, h * 0.10f, paint)
         paint.shader = null
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 1f
@@ -91,12 +105,18 @@ internal class CatHintView(context: Context) : View(context) {
 
 
 
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = (h * .018f).coerceAtLeast(1f)
+        paint.color = if (gold) 0xBFFFFFF0.toInt() else 0x99D8F2FF.toInt()
+        canvas.drawLine(w * .11f, chipTop + 2f, w * .65f, chipTop + 2f, paint)
+        paint.style = Paint.Style.FILL
+
         canvas.save()
         val crestLeft = w - crestW - w * 0.025f
         if (gold) {
             val pulse = (0.5 + 0.5 * kotlin.math.sin(SystemClock.uptimeMillis() * Math.PI * 2.0 / 2100.0)).toFloat()
             val cx = crestLeft + crestW / 2f
-            val cy = crestH * 0.60f
+            val cy = crestTop + crestH * 0.60f
             val radius = crestW * 0.80f
             paint.style = Paint.Style.FILL
             paint.shader = RadialGradient(cx, cy, radius,
@@ -106,7 +126,7 @@ internal class CatHintView(context: Context) : View(context) {
             canvas.drawCircle(cx,cy,radius,paint)
             paint.shader = null
         }
-        canvas.translate(crestLeft, 0f)
+        canvas.translate(crestLeft, crestTop)
         // Leave room for the SVG's five-unit outline inside the crest bounds.
         canvas.scale(crestScale, crestScale)
         canvas.translate(3f, 3f)
@@ -116,7 +136,18 @@ internal class CatHintView(context: Context) : View(context) {
             1 -> 0xFF3E568B.toInt()
             else -> 0xFF53B6E2.toInt()
         }
+        val faceColor = paint.color
+        canvas.save()
+        canvas.translate(0f, 2.8f)
+        paint.color = if (gold) 0xFF9B651F.toInt() else 0xFF203B60.toInt()
         canvas.drawPath(face, paint)
+        canvas.restore()
+        paint.shader = LinearGradient(0f, 6f, 0f, 50f,
+            intArrayOf(if (gold) 0xFFFFD976.toInt() else if (palette == 1) 0xFF7195C3.toInt() else 0xFF93E2FA.toInt(), faceColor,
+                if (gold) 0xFFCF8527.toInt() else if (palette == 1) 0xFF2D416F.toInt() else 0xFF3895C4.toInt()),
+            floatArrayOf(0f, .52f, 1f), Shader.TileMode.CLAMP)
+        canvas.drawPath(face, paint)
+        paint.shader = null
         paint.style = Paint.Style.STROKE
         paint.strokeJoin = Paint.Join.ROUND
         paint.strokeCap = Paint.Cap.ROUND
@@ -143,6 +174,7 @@ internal class CatHintView(context: Context) : View(context) {
         if (labelWidth > availableWidth) textPaint.textSize *= availableWidth / labelWidth
         val baselineOffset = -(textPaint.ascent() + textPaint.descent()) / 2f
         canvas.drawText(label, w / 2f, chipTop + bodyHeight * 0.5f + baselineOffset, textPaint)
+        canvas.restore()
         if (gold && isAttachedToWindow && windowVisibility == VISIBLE) postInvalidateDelayed(40L)
     }
 }

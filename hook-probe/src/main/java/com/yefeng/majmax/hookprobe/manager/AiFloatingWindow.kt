@@ -28,7 +28,7 @@ import kotlin.math.roundToInt
 /**
  * System floating window, styled like an assistant panel: a translucent light
  * grey-white rounded card with a blue capsule navigation ("助手" / "设置"), two
- * switch cards ("无人值守" / "自动下一局"), the live recommendation block, dark text,
+ * switch cards ("无人值守" / "自动下一局" / "推荐与番点"), the live recommendation block, dark text,
  * pale blue separators and a red destructive stop action. Collapsed it is a small
  * round bubble; tapping it re-opens the panel, long-pressing it toggles unattended
  * mode, dragging moves it and the position/width/opacity are remembered.
@@ -85,6 +85,10 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private var rematchName: TextView? = null
     private var rematchStateLabel: TextView? = null
     private var rematchDetail: TextView? = null
+    private var panelSwitch: Switch? = null
+    private var panelName: TextView? = null
+    private var panelStateLabel: TextView? = null
+    private var panelDetail: TextView? = null
     /** Title-bar drag bookkeeping, shared by the grab handle and the capsule tabs. */
     private var dragging = false
 
@@ -131,6 +135,10 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         rematchName = null
         rematchStateLabel = null
         rematchDetail = null
+        panelSwitch = null
+        panelName = null
+        panelStateLabel = null
+        panelDetail = null
     }
 
     fun configurationChanged() { rebuild() }
@@ -149,6 +157,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * directly, which does not notify the listener.
      */
     fun updateRematch(value: RematchState) {
+        applyPanel(RecommendationPanelSettings.read(context))
         if (rematchState == value) return
         rematchState = value
         applyRematch()
@@ -448,6 +457,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         content.addView(autoCard())
         content.addView(style.spacer(8))
         content.addView(rematchCard())
+        content.addView(style.spacer(8))
+        content.addView(recommendationPanelCard())
         content.addView(style.spacer(10))
         renderStatus(content)
     }
@@ -569,6 +580,78 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         applyRematch()
         return card
     }
+
+    /**
+     * 推荐与番点面板开关（点击穿透固定面板上的推荐 / 番点内容）。
+     *
+     * 它自成一体：只在用户点按时实时读写 [RecommendationPanelSettings]，从不启停
+     * 服务、不改无人值守 / 自动下一局、不切换显示模式，也不影响猫头提示。与
+     * [autoCard] / [rematchCard] 一样，`update` 重建本卡片时会重新读取已保存的值，
+     * 因此管理器界面、游戏内控制与这里始终一致。
+     */
+    private fun recommendationPanelCard(): LinearLayout {
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = style.card(opacity)
+            setPadding(dp(12), dp(8), dp(10), dp(10))
+        }
+        card.addView(style.text("固定面板", 10f, style.muted, true))
+        val name = style.text("推荐与番点", 14f, style.ink, true).apply { maxLines = 1 }
+        panelName = name
+        val row = style.row(44)
+        row.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val stored = runCatching { RecommendationPanelSettings.read(context) }.getOrDefault(true)
+        val stateLabel = style.text(panelSummary(stored), 11f, style.muted, true).apply {
+            maxLines = 1
+            includeFontPadding = false
+        }
+        panelStateLabel = stateLabel
+        row.addView(stateLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
+        val toggle = switchOn(stored, "推荐与番点面板开关")
+        panelSwitch = toggle
+        toggle.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
+            onPanelTap(checked)
+        }
+        row.addView(toggle, LinearLayout.LayoutParams(dp(52), dp(32)).apply {
+            gravity = Gravity.CENTER_VERTICAL
+        })
+        card.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44)))
+        val detail = style.text("", 11f, style.muted).apply { maxLines = 3 }
+        panelDetail = detail
+        card.addView(detail)
+        val hint = style.text("只控制点击穿透固定面板的内容；猫头提示与其他开关各自独立",
+            10f, style.faint).apply {
+            maxLines = 2
+            setPadding(0, dp(4), 0, 0)
+        }
+        card.addView(hint)
+        applyPanel(stored)
+        return card
+    }
+
+    /** One tap = one preference write; the thumb always snaps to the *stored* value. */
+    private fun onPanelTap(checked: Boolean) {
+        val saved = runCatching { RecommendationPanelSettings.save(context, checked) }
+            .getOrDefault(checked)
+        applyPanel(saved)
+    }
+
+    /** Keeps switch, caption and explanation in one place so they can never disagree. */
+    private fun applyPanel(enabled: Boolean) {
+        panelSwitch?.let { applyChecked(it, enabled) }
+        switchColors(panelSwitch, enabled, enabled)
+        panelSwitch?.refreshDrawableState()
+        panelName?.setTextColor(if (enabled) style.accentText else style.ink)
+        panelStateLabel?.text = panelSummary(enabled)
+        panelStateLabel?.setTextColor(if (enabled) style.accentText else style.muted)
+        panelDetail?.text = if (enabled) "固定面板显示建议牌与番点；可随时在此关闭"
+            else "已隐藏建议牌与番点，其他功能不受影响"
+        panelDetail?.setTextColor(if (enabled) style.inkSoft else style.muted)
+        panelDetail?.setPadding(0, dp(2), 0, 0)
+    }
+
+    private fun panelSummary(enabled: Boolean) = if (enabled) "开" else "关"
 
     /**
      * Sets the thumb without notifying the listener. [CompoundButton.setChecked] only

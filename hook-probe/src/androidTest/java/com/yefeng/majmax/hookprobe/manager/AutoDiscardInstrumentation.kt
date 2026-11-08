@@ -667,8 +667,8 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 // 0.0398 * 2376 = 94.6 px pitch (screenshot: 94-95 px).
                 check(size.width in 88..91) { "expected a 88-91 px label width, got ${size.width}" }
                 // Reference silhouette: height follows width, capped at 6.5% frame height.
-                check(size.height in 69..71) {
-                    "expected a ~70 px label height, got ${size.height}"
+                check(size.height in 87..90) {
+                    "expected a ~88 px label height, got ${size.height}"
                 }
                 check(size.source == "pitch") { "expected pitch sizing, got ${size.source}" }
             }
@@ -696,11 +696,11 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     ?: error("expected the normalized fallback")
                 check(fallback.source == "fallback") { "expected fallback, got ${fallback.source}" }
                 check(fallback.width in 88..91) { "expected ~89 px, got ${fallback.width}" }
-                check(fallback.height in 69..71) { "expected ~70 px, got ${fallback.height}" }
+                check(fallback.height in 87..90) { "expected ~88 px, got ${fallback.height}" }
                 // No mapping: use the same compact fallback.
                 val noMapping = TileBadgeOverlay.deriveBadgeSizePx(single, null, 2376, 1080)
                     ?: error("expected a size even without a mapping")
-                check(noMapping.width in 88..91 && noMapping.height in 69..71)
+                check(noMapping.width in 88..91 && noMapping.height in 87..90)
             }
             test("deriveBadgeSizePx clamps a distorted or single-tile hand") { _, _ ->
                 val m = mapping(2000, 1000, viewportW = 2000, viewportH = 1000)
@@ -719,7 +719,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 }
             }
             test("deriveBadgeSizePx scales with the frame height") { _, _ ->
-                // 1440p: label height ~94 px; width ~119 px at 94% tile pitch.
+                // 1440p: label height ~118 px; width ~119 px at 94% tile pitch.
                 val m = mapping(3168, 1440, viewportW = 3168, viewportH = 1440)
                 val views = listOf(
                     view("1p", 0.20, 0.92), view("2p", 0.2399, 0.92),
@@ -728,7 +728,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 val size = TileBadgeOverlay.deriveBadgeSizePx(views, m, 3168, 1440)
                     ?: error("expected a size")
                 check(size.width in 118..120) { "expected ~119 px, got ${size.width}" }
-                check(size.height in 93..95) { "expected ~94 px, got ${size.height}" }
+                check(size.height in 116..119) { "expected ~118 px, got ${size.height}" }
                 // Degenerate frame: no card size, the caller keeps the text measurement.
                 check(TileBadgeOverlay.deriveBadgeSizePx(views, m, 0, 0) == null)
             }
@@ -815,7 +815,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     view("2s", 0.7406, 0.92),
                 )
                 val h = TileBadgeOverlay.estimateCardHeightPx(views, m)
-                check(h != null && h in 60..90) { "expected ~70 px via pitch, got $h" }
+                check(h != null && h in 60..90) { "expected ~88 px via pitch, got $h" }
                 // The frame-normalized offset is independent of that estimate and keeps
                 // the reference distance (75 px at 1080p).
                 check(TileBadgeOverlay.tileTopOffsetPx(1080) == 75)
@@ -914,6 +914,33 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 check(!trimmed.has("message") && !trimmed.has("round") && !trimmed.has("players")) {
                     "badge hint must not carry floating-window chrome"
                 }
+            }
+            test("panel probability uses native policy fraction and legacy percentage") { _, _ ->
+                check(RecommendationPanelOverlay.probabilityPercent(JSONObject("""{"policyProbability":0.83}""")) == 83.0)
+                check(RecommendationPanelOverlay.probabilityPercent(JSONObject("""{"weight":83}""")) == 83.0)
+                check(RecommendationPanelOverlay.probabilityPercent(JSONObject()) == null)
+                check(RecommendationPanelOverlay.probabilityPercent(JSONObject("""{"policyProbability":0}""")) == 0.0)
+            }
+            test("fixed panel shows recommendations before tenpai and scores after tenpai") { _, _ ->
+                val value = JSONObject("""{"players":4,"recommendations":[
+                    {"kind":"discard","tile":"E","weight":0.8},
+                    {"kind":"riichi","tile":"E","weight":0.1},
+                    {"kind":"discard","tile":"F","weight":0.05}],
+                    "analysis":{"hand14":{"maintain":[{"discard":"E","result":{
+                    "is_furiten":true,"win_scores":[{"tile":"5s","ron":{"han":2,"fu":30,"points":2000}}]}}]}}}""")
+                val data = RecommendationPanelOverlay.dataFor(value)
+                check(data.getJSONArray("rows").length() == 2)
+                check(data.getJSONArray("scores").length() == 0)
+                val ready = JSONObject("""{"players":3,"kitaCount":2,"recommendations":[],
+                    "analysis":{"hand13":{"shanten":0,"is_furiten":true,
+                    "win_scores":[{"tile":"5s","ron":{"han":2,"fu":30,"points":2000}}]}}}""")
+                val scored = RecommendationPanelOverlay.dataFor(ready)
+                check(scored.getJSONArray("rows").length() == 0)
+                check(scored.getJSONArray("scores").getJSONObject(0).getString("tile") == "5s")
+                check(scored.getString("scoreLabel").contains("振听"))
+                check(scored.getInt("kitaCount") == 2)
+                val trimmed = AiOverlayService.trimHint(value)
+                check(trimmed.has("recommendationPanel") && !trimmed.has("analysis"))
             }
             test("full result keeps analysis so the floating window can re-render it") { _, _ ->
                 // The floating window's re-render reads `analysis`, `round` and

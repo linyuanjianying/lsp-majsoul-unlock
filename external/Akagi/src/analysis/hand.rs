@@ -137,6 +137,8 @@ pub struct PlayerInfo34 {
     /// Own discards in order (used when this struct represents the post-tsumo
     /// state — the engine inspects the count to derive the turn).
     pub own_discards: Vec<Tile34>,
+    /// Number of north tiles extracted as kita in sanma.
+    pub kita_count: u8,
 }
 
 impl PlayerInfo34 {
@@ -225,6 +227,7 @@ impl Default for PlayerInfo34 {
             opponents: Vec::new(),
             left_tiles: None,
             own_discards: Vec::new(),
+            kita_count: 0,
         }
     }
 }
