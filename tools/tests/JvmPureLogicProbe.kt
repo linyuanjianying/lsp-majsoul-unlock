@@ -145,6 +145,26 @@ fun main() {
         check("demo never rematches", !RematchState(enabled=true,demo=true).active)
     }
 
+    run {
+        fun state(rev: Int = 1) = JSONObject("""{"status":"live","canAct":true,"connection":"7","revision":$rev,"sourceGeneration":3,"sourceSequence":8,"seat":0,"players":4,"hand":["5mr"],"legalOperations":[{"type":1,"combination":[]}],"autoContext":{"riichi":false},"recommendations":[{"kind":"discard","tile":"5mr","tsumogiri":false}]}""")
+        fun ack(id: String, status: String) = JSONArray().put(JSONObject().put("id",id).put("state",status)).toString()
+        fun wire(rev: Int) = state(rev).put("input", JSONObject("""{"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"0m","moqie":false}}"""))
+        val gate = AutoDiscardController({}, {0L}, {0L})
+        gate.observe(state()); gate.toggle()
+        val first=JSONObject(checkNotNull(gate.poll(null))).getString("id")
+        gate.poll(ack(first,"submitted")); gate.poll(ack(first,"accepted"))
+        gate.observe(state(2))
+        check("accepted ack alone cannot advance without wire confirmation",gate.poll(null)==null)
+        gate.observe(wire(1)); gate.observe(state(2))
+        val second=JSONObject(checkNotNull(gate.poll(null))).getString("id")
+        check("wire confirmation advances to a new command", first!=second)
+        gate.poll(ack(first,"accepted")); gate.poll(ack(first,"stale")); gate.poll(ack(first,"manual"))
+        check("stale acknowledgements preserve current command",JSONObject(checkNotNull(gate.poll(null))).getString("id")==second)
+        gate.poll(ack(second,"submitted")); gate.poll(ack(second,"accepted"))
+        gate.observe(wire(2)); gate.observe(state(3))
+        check("current command advances after all confirmations",gate.poll(null)!=null)
+    }
+
     println("\n=== ${passed} passed, ${failed} failed ===")
     if (failed != 0) kotlin.system.exitProcess(1)
 }

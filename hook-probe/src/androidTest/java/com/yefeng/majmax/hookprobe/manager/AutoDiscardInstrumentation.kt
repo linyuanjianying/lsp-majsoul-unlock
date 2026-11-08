@@ -127,13 +127,16 @@ class AutoDiscardInstrumentation : Instrumentation() {
             }
             test("out-of-order ack from an older command does not cancel the pending one") { gate, _ ->
                 gate.observe(live()); gate.toggle(); val first=JSONObject(gate.poll(null)!!).getString("id")
-                gate.poll(ack(first,"submitted")); gate.poll(ack(first,"accepted")); gate.observe(live(2))
+                gate.poll(ack(first,"submitted")); gate.poll(ack(first,"accepted"))
+                gate.observe(live().put("input", JSONObject("""{"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"0m","moqie":false}}""")))
+                gate.observe(live(2))
                 val second=JSONObject(checkNotNull(gate.poll(null))).getString("id")
                 check(second != first)
                 gate.poll(ack(first,"accepted")); gate.poll(ack(first,"stale"))
                 gate.poll(ack("$first-stale","round_mismatch"))
                 check(gate.isEnabled())
                 gate.poll(ack(second,"submitted")); gate.poll(ack(second,"accepted"))
+                gate.observe(live(2).put("input", JSONObject("""{"method":".lq.FastTest.inputOperation","payload":{"type":1,"tile":"0m","moqie":false}}""")))
                 gate.observe(live(3)); check(gate.poll(null) != null) { "the live command survived stale acks" }
             }
             test("manual input while disabled does not alter paused state") { gate, _ ->
