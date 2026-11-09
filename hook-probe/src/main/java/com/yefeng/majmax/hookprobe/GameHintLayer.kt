@@ -25,6 +25,7 @@ class GameHintLayer {
     private var badge: TileBadgeOverlay? = null
     private var panel: RecommendationPanelOverlay? = null
     private var generation = 0
+    private var presentationEnabled = true
     private var previousPanelResult: String? = null
     private var previousPanelEnabled = true
     private var previousResult = ""
@@ -46,6 +47,10 @@ class GameHintLayer {
                     main.post {
                         busy.set(false)
                         if (token != generation || host !== container) return@post
+                        if (!presentationEnabled || snapshot?.getBoolean("overlayMode", false) == true) {
+                            clearSurfaces()
+                            return@post
+                        }
                         if (snapshot == null) {
                             panel?.update(null, false)
                             previousPanelResult = null
@@ -116,6 +121,24 @@ class GameHintLayer {
             }
             main.postDelayed(this, 120)
         }
+    }
+
+    /** Called by the control's mode projection, independently of hint delivery. */
+    fun setPresentationEnabled(enabled: Boolean) {
+        if (presentationEnabled == enabled) return
+        presentationEnabled = enabled
+        if (!enabled) clearSurfaces()
+    }
+
+    private fun clearSurfaces() {
+        panel?.close()
+        badge?.close()
+        previousPanelResult = null
+        previousResult = ""
+        previousCoords = ""
+        previousButtons = ""
+        previousSource = ""
+        previousButtonSource = ""
     }
 
     fun attach(activity: Activity) {

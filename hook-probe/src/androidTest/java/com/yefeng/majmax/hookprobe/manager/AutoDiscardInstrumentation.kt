@@ -915,6 +915,36 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     "badge hint must not carry floating-window chrome"
                 }
             }
+            test("overlay mode removes every in-game hint surface and clears replay caches") { _, _ ->
+                runOnMainSync {
+                    val host = android.widget.FrameLayout(targetContext)
+                    val panel = RecommendationPanelOverlay(targetContext, host)
+                    panel.update(JSONObject("""{"status":"live","recommendations":[{"kind":"discard","tile":"E","weight":83}]}"""), true)
+                    check(host.childCount == 1)
+                    val layer = com.yefeng.majmax.hookprobe.GameHintLayer()
+                    fun field(name: String) = layer.javaClass.getDeclaredField(name).apply { isAccessible = true }
+                    field("panel").set(layer, panel)
+                    field("badge").set(layer, TileBadgeOverlay(targetContext, host))
+                    listOf("previousResult", "previousCoords", "previousButtons", "previousSource", "previousButtonSource")
+                        .forEach { field(it).set(layer, "stale") }
+                    field("previousPanelResult").set(layer, "stale")
+                    layer.setPresentationEnabled(false)
+                    check(host.childCount == 0)
+                    check(field("previousPanelResult").get(layer) == null)
+                    listOf("previousResult", "previousCoords", "previousButtons", "previousSource", "previousButtonSource")
+                        .forEach { check(field(it).get(layer) == "") }
+                    repeat(3) { layer.setPresentationEnabled(false) }
+                    check(host.childCount == 0)
+                    layer.setPresentationEnabled(true)
+                    check(field("previousResult").get(layer) == "")
+                    panel.update(JSONObject("""{"status":"live","recommendations":[{"kind":"discard","tile":"E","weight":83}]}"""), true)
+                    field("previousResult").set(layer, "replayed")
+                    check(host.childCount == 1)
+                    layer.setPresentationEnabled(false)
+                    check(host.childCount == 0 && field("previousResult").get(layer) == "")
+                    layer.detach()
+                }
+            }
             test("panel reuses its window and text views across updates and waiting") { _, _ ->
                 runOnMainSync {
                     val host = android.widget.FrameLayout(targetContext)

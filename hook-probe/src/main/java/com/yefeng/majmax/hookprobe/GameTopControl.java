@@ -954,6 +954,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     private void applyState() {
+        hints.setPresentationEnabled(!overlayMode);
         if (panel == null) return;
         if (overlayMode) {
             // The user switched to the system-overlay surface in the manager. Hide the

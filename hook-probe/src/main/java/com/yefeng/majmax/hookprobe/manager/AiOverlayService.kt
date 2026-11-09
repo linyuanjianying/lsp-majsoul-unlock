@@ -73,10 +73,11 @@ class AiOverlayService : Service() {
             // the system tile-badge overlay renders the same hints, so report
             // "not running" here to make the in-game layer clear itself and stop
             // painting, without tearing down the service or its polling.
+            val overlayMode = service?.let { AssistantDisplayModeSettings.overlayActive(it) } == true
             val running = service?.let { svc ->
-                svc.alive.get() && !svc.demoMode.get() &&
-                    !AssistantDisplayModeSettings.overlayActive(svc)
+                svc.alive.get() && !svc.demoMode.get() && !overlayMode
             } == true
+            putBoolean("overlayMode", overlayMode)
             putBoolean("running", running)
             putBoolean("recommendationPanel", service?.let { RecommendationPanelSettings.read(it) } ?: false)
             if (running) {
