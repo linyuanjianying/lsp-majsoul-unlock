@@ -214,8 +214,9 @@ internal fun AiScreen(padding: PaddingValues) {
                 first = {
                     ManagerOutlinedButton(onClick = {
                         displayMode = AssistantDisplayMode.HOOK
-                        AssistantDisplayModeSettings.save(context, displayMode)
-                        AiOverlayService.refreshDisplayMode()
+                        // The save itself asks the service to rebuild; passing the local
+                        // rebuild here keeps one code path for both.
+                        AssistantDisplayModeSettings.save(context, displayMode) { AiOverlayService.refreshDisplayMode() }
                     }, modifier = it) {
                         Text(if (displayMode == AssistantDisplayMode.HOOK) "已选：游戏内 Hook" else "游戏内 Hook")
                     }
@@ -223,8 +224,7 @@ internal fun AiScreen(padding: PaddingValues) {
                 second = {
                     ManagerOutlinedButton(onClick = {
                         displayMode = AssistantDisplayMode.OVERLAY
-                        AssistantDisplayModeSettings.save(context, displayMode)
-                        AiOverlayService.refreshDisplayMode()
+                        AssistantDisplayModeSettings.save(context, displayMode) { AiOverlayService.refreshDisplayMode() }
                     }, modifier = it) {
                         Text(if (displayMode == AssistantDisplayMode.OVERLAY) "已选：系统悬浮窗" else "系统悬浮窗")
                     }

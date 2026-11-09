@@ -7,10 +7,14 @@ import org.json.JSONObject
 
 /** Runs against Android's real JSONObject, clock supplied explicitly; no game input. */
 class AutoDiscardInstrumentation : Instrumentation() {
+    private var ackOnly = false
+    private var exportOnly = false
     private var controllerOnly = false
     private var importFile: String? = null
     private var verifySelectedModels = false
     override fun onCreate(arguments: Bundle?) {
+        ackOnly = arguments?.getString("ackOnly") == "true"
+        exportOnly = arguments?.getString("exportOnly") == "true"
         controllerOnly = arguments?.getString("controllerOnly") == "true"
         importFile = arguments?.getString("importFile")
         verifySelectedModels = arguments?.getString("verifySelectedModels") == "true"
@@ -19,6 +23,21 @@ class AutoDiscardInstrumentation : Instrumentation() {
     override fun onStart() {
         val output = Bundle()
         runCatching {
+            if (ackOnly) {
+                TelemetryRegressionChecks.run()
+                AutoAckDiagnosticsChecks.run(targetContext)
+                output.putString("stream", "PASS coordinate telemetry preserves pending command; PASS real verdict chain; PASS paused telemetry; PASS structured diagnostics\n")
+                finish(-1, output)
+                return
+            }
+            if (exportOnly) {
+                FileProviderWiringChecks.run(targetContext)
+                DiagnosticsExportChecks.run(targetContext)
+                AutoAckDiagnosticsChecks.run(targetContext)
+                output.putString("stream", "PASS distinct providers and actual URI ZIP reads; PASS diagnostic export\n")
+                finish(-1, output)
+                return
+            }
             if (verifySelectedModels) {
                 val before = targetContext.getSharedPreferences("onnx-policy-models", 0).all.toMap()
                 val unattended = targetContext.getSharedPreferences("unattended", 0).all.toMap()
@@ -66,7 +85,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
                  "autoContext":{"riichi":false},
                  "recommendations":[{"kind":"$kind","tile":"5mr","tsumogiri":false}]}
             """.trimIndent())
-            fun ack(id: String, state: String) = JSONArray().put(JSONObject().put("id",id).put("state",state)).toString()
+            fun ack(id: String, state: String, reason: String = "") = JSONArray().put(JSONObject().put("id",id).put("state",state).put("reason",reason)).toString()
             test("default off and explicit enable") { gate, _ ->
                 gate.observe(live()); check(gate.poll(null) == null)
                 gate.toggle(); val command = JSONObject(checkNotNull(gate.poll(null)))
@@ -372,6 +391,70 @@ class AutoDiscardInstrumentation : Instrumentation() {
                 gate.observe(live()); check(gate.poll(null)!=null)
                 gate.pause("explicit stop"); gate.observe(live(2))
                 check(!gate.isEnabled() && gate.poll(null)==null && saved.last()==false)
+            }
+            test("coordinate telemetry is never classified as a rejection") { _, _ ->
+                val records=mutableListOf<AutoDiscardEvent>()
+                val logs=mutableListOf<String>()
+                var clock=0L
+                val gate=AutoDiscardController({logs.add(it)}, { clock }, { 0L }, event={records.add(it)})
+                gate.observe(live()); gate.toggle()
+                val command=JSONObject(checkNotNull(gate.poll(null)))
+                val id=command.getString("id")
+                val geometry="""{"screenW":2414,"screenH":1080,"handpai":13,"concealed":0,"cams":"UICamera|ortho|0/13|-273.19,-2.00,0.88,0.92|0.92"}"""
+                val buttons="""{"screenW":2414,"screenH":1080,"buttons":[]}"""
+                repeat(10) {
+                    clock+=250
+                    gate.poll(ack("","hand_geometry",geometry))
+                    clock+=250
+                    gate.poll(ack("","button_coords",buttons))
+                }
+                check(records.none{it.code=="GAME_REJECTED"||it.code=="GAME_REJECTED_REPEAT"}) { records.map{it.code}.toString() }
+                check(logs.none{it.startsWith("WAITING")}) { logs.toString() }
+                check(gate.isEnabled()) { "telemetry must not disable the mode" }
+                // The pending command survives with its id, and the chain still works.
+                check(JSONObject(checkNotNull(gate.poll(null))).getString("id")==id) { "pending command changed" }
+                gate.poll(ack(id,"submitted")); gate.poll(ack(id,"accepted"))
+                val stages=records.associate{it.code to it.stage}
+                check(stages["GAME_SUBMITTED"]=="submitted" && stages["SERVER_ACCEPTED"]=="accepted") { stages.toString() }
+                // Telemetry carrying the id is telemetry too.
+                gate.poll(ack(id,"hand_geometry",geometry))
+                check(records.none{it.code=="GAME_REJECTED"}) { "an id must not turn telemetry into a verdict" }
+            }
+            test("a real rejection folds on the 2 s window and pause writes nothing more") { _, _ ->
+                val records=mutableListOf<AutoDiscardEvent>()
+                val geometry="""{"screenW":2414,"screenH":1080,"handpai":13,"concealed":0}"""
+                var clock=0L
+                val gate=AutoDiscardController({}, { clock }, { 0L }, event={records.add(it)})
+                gate.observe(live()); gate.toggle()
+                var reported=0
+                var tick=0L
+                while (tick<6_000) {
+                    tick+=250; clock=tick
+                    var command=gate.poll(null)
+                    if (command==null) { gate.observe(live((tick/250).toInt()+1)); command=gate.poll(null) }
+                    if (command!=null) { gate.poll(ack(JSONObject(command).getString("id"),"stale")); reported++ }
+                }
+                val summaries=records.filter{it.code=="GAME_REJECTED_REPEAT"}
+                check(summaries.isNotEmpty()) { "the fold window must expire without pause" }
+                gate.pause("test")
+                val after=records.size
+                repeat(4) { clock+=5_000; gate.poll(ack("","hand_geometry",geometry)) }
+                check(records.size==after) { "a paused controller wrote more records" }
+                check(records.filter{it.code=="GAME_REJECTED_REPEAT"}.sumOf{it.detail.removePrefix("repeats=").toInt()}+
+                    records.count{it.code=="GAME_REJECTED"}==reported) { "every row accounted for" }
+            }
+            test("rendered ack details keep concealed and never the raw payload") { _, _ ->
+                val records=mutableListOf<AutoDiscardEvent>()
+                val gate=AutoDiscardController({}, {0L}, {0L}, event={records.add(it)})
+                gate.observe(live()); gate.toggle(); gate.poll(null)
+                val id=records.first{it.code=="QUEUED"}.ackId
+                check(id.isNotEmpty())
+                val geometry="""{"screenW":2414,"screenH":1080,"concealed":0,"handpai":13,"cam":"camera","secret":"abc"}"""
+                val detail=AutoAckDetails.render("hand_geometry",geometry)
+                check(detail.contains("concealed=0") && detail.contains("handpai=13")) { detail }
+                check(!detail.contains("abc") && !detail.contains("{")) { detail }
+                gate.poll(ack(id,"hand_geometry",geometry))
+                check(records.none{it.code=="GAME_REJECTED"})
             }
             test("game relaunch waits ten seconds and backs off") { _, _ ->
                 val recovery=UnattendedRecovery()
@@ -1021,6 +1104,10 @@ class AutoDiscardInstrumentation : Instrumentation() {
             }
             DiagnosticsClearChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic cleanup scopes, rotations and legacy migration\n") })
+            FileProviderWiringChecks.run(targetContext)
+            sendStatus(0, Bundle().apply { putString("stream", "PASS provider wiring: distinct FileProvider components, diagnostics/update URIs readable, no shared paths or empty archives\n") })
+            DiagnosticsExportChecks.run(targetContext)
+            sendStatus(0, Bundle().apply { putString("stream", "PASS diagnostic export: zip contents, FileProvider URI, share grant and export codes\n") })
             ApkUpdateChecks.run(targetContext)
             sendStatus(0, Bundle().apply { putString("stream", "PASS APK update identity, integrity, routing and cancellation checks\n") })
             CatalogChecks.run(targetContext, context)

@@ -8,6 +8,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <queries>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="application/zip" />
+        </intent>
         <package android:name="com.soulgamechst.majsoul" />
     </queries>
     <application
@@ -45,8 +49,15 @@
             android:authorities="com.yefeng.majmax.hookprobe.ai"
             android:exported="true"
             android:grantUriPermissions="true" />
+        <!--
+            One FileProvider subclass per authority on purpose. The framework builds and
+            caches provider instances per component name, so two entries naming
+            androidx.core.content.FileProvider collapse into a single component whose
+            PathStrategy comes from whichever entry won; the other authority would then
+            resolve against the wrong paths. Distinct subclasses keep them separate.
+        -->
         <provider
-            android:name="androidx.core.content.FileProvider"
+            android:name=".manager.UpdatesFileProvider"
             android:authorities="${applicationId}.updates"
             android:exported="false"
             android:grantUriPermissions="true">
@@ -55,7 +66,7 @@
                 android:resource="@xml/update_paths" />
         </provider>
         <provider
-            android:name="androidx.core.content.FileProvider"
+            android:name=".manager.DiagnosticsFileProvider"
             android:authorities="${applicationId}.diagnostics"
             android:exported="false"
             android:grantUriPermissions="true">

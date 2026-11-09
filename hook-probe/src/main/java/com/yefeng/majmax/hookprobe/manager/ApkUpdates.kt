@@ -141,8 +141,25 @@ internal object ApkUpdates {
         }
     }
 
+    /**
+     * Installer intent for a verified package.
+     *
+     * The authority is confirmed through `PackageManager.resolveContentProvider` to be
+     * [UpdatesFileProvider] — not merely "some provider that accepts the authority" —
+     * because two manifest entries naming the same provider class share one component
+     * and the wrong entry's paths would answer here. The URI is then opened through
+     * `ContentResolver` and the ZIP header checked, so a package the installer cannot
+     * read fails before the install screen is shown instead of as "解析程序包时出现问题".
+     */
     fun installIntent(context: Context, file: File): Intent {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.updates", file)
+        val authority = "${context.packageName}.updates"
+        val provider = context.packageManager.resolveContentProvider(authority, 0)
+        check(provider != null && UpdatesFileProvider::class.java.name == provider.name) {
+            "更新组件未就绪（${provider?.name ?: "missing"}），请重装模块"
+        }
+        val uri = FileProvider.getUriForFile(context, authority, file)
+        check(uri.authority == authority) { "安装包 URI 指向了错误的组件：${uri.authority}" }
+        DiagnosticsStore.verifyReadableArchive(context, uri)
         return Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
     }

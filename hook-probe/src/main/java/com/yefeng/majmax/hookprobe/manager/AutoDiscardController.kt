@@ -12,11 +12,33 @@ object AutoDiscardState {
     val state = mutable.asStateFlow()
 }
 
-/** One pending command, one attempt per decision window; never retries an input. */
+/**
+ * A structured autoplay event: [code] is the diagnostics vocabulary, [detail] is an
+ * already-bounded rendering (never a raw adapter payload), [stage] names the ACK-chain
+ * link that produced it.
+ */
+internal data class AutoDiscardEvent(val code: String, val detail: String = "",
+    val stage: String = "", val ackId: String = "")
+
+/**
+ * One pending command, one attempt per decision window; never retries an input.
+ *
+ * Output is a single channel. [log] keeps its historical contract (`"CODE: detail"`,
+ * split by the service on the first space) and is used for every non-structured line.
+ * [event] is optional: when it is supplied it receives *structured* records only
+ * (QUEUED / GAME_SUBMITTED / SERVER_ACCEPTED / UPLINK_CONFIRMED / GAME_REJECTED and
+ * their folded summaries), and those are never passed to [log] as well. When it is
+ * absent the fallback renders them through [log], so a caller can never lose a record.
+ */
 internal class AutoDiscardController(private val log: (String) -> Unit,
     private val now: () -> Long = SystemClock::elapsedRealtime,
     private val delayMs: () -> Long = { AutoDelayRange().randomDelayMs() },
-    initialEnabled: Boolean = false, private val modeChanged: (Boolean) -> Unit = {}) {
+    initialEnabled: Boolean = false, private val modeChanged: (Boolean) -> Unit = {},
+    event: ((AutoDiscardEvent) -> Unit)? = null) {
+    /** Where a structured event goes: the injected sink, or [log] when there is none. */
+    private val emit: (AutoDiscardEvent) -> Unit = event ?: { item ->
+        log(if (item.detail.isEmpty()) item.code else "${item.code}: ${item.detail}")
+    }
     private var enabled = initialEnabled
     private var latest: JSONObject? = null
     private var pending: JSONObject? = null
@@ -30,6 +52,75 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     private var accepted = false
     /** Decision windows already claimed by the user; kept even when the window closed before arming. */
     private val manual = mutableSetOf<String>()
+    /**
+     * Command rejection rows folded per (stage, code, detail) inside the current window.
+     *
+     * The adapter re-sends the same row on every capture tick, and a stuck table
+     * alternates rows, so keyed counters fold repeated verdicts independently. Bounded to
+     * [FOLD_CAPACITY] keys; when the map is full it is flushed (one summary each) and
+     * restarted, so memory cannot grow with a pathological adapter.
+     */
+    private val folded = LinkedHashMap<List<String>, FoldedRow>()
+    /** Start of the current fold window; 0 until the first rejection. */
+    private var lastFlushAt = 0L
+    /** Per-poll ack accounting: seen / folded / written as a new record. */
+    private var ackSeen = 0
+    private var ackFolded = 0
+    private var ackWritten = 0
+
+    /** One folded signature: repeats counted since [windowStart], which a flush resets. */
+    private data class FoldedRow(val stage: String, val code: String, val detail: String,
+        val ackId: String, var repeats: Int, val windowStart: Long)
+
+    /**
+     * Counts one rejection row and writes it when it is new to the current window.
+     *
+     * The window is [REJECT_DEDUPE_MS] measured from the last [flushFolded], not from
+     * the previous sighting: a stuck frame repeats every 250 ms, so a per-row
+     * "last seen" timer would never expire and the counts would only surface on
+     * [pause]. The first row of a window is written; every later repeat of the same
+     * key is counted. Once the window ends, the next row after it starts a new window
+     * and the old counts are emitted as one `GAME_REJECTED_REPEAT` per key.
+     */
+    private fun noteRejection(stage: String, code: String, detail: String, ackId: String) {
+        val nowMs = now()
+        if (lastFlushAt == 0L) lastFlushAt = nowMs
+        if (nowMs - lastFlushAt > REJECT_DEDUPE_MS) flushFolded()
+        // The key deliberately excludes the ack id: a verdict restated for the next
+        // command carries a new id but is still the same repeating condition, and
+        // including the id made every row distinct (size grew 0,1,2,…). Stage, code
+        // and the rendered detail are compared as a list, never as a joined string,
+        // so a detail containing a separator cannot collide with a field boundary.
+        val key = listOf(stage, code, detail)
+        ackSeen++
+        val existing = folded[key]
+        if (existing != null) {
+            existing.repeats++
+            ackFolded++
+            return
+        }
+        // First sighting inside this window: one record; repeats are counted from 2.
+        folded[key] = FoldedRow(stage, code, detail, ackId, 1, lastFlushAt)
+        ackWritten++
+        emit(AutoDiscardEvent(code, detail, stage, ackId))
+        if (folded.size > FOLD_CAPACITY) flushFolded()
+    }
+
+    /**
+     * Emits one `GAME_REJECTED_REPEAT` per key that repeated inside the window, then
+     * starts a new window. The first row of a key is already written, so a count of
+     * `n` means "n repeats after it" (`repeats = sightings - 1`).
+     */
+    private fun flushFolded() {
+        lastFlushAt = now()
+        if (folded.isEmpty()) return
+        for (row in folded.values) {
+            val repeats = row.repeats - 1
+            if (repeats <= 0) continue
+            emit(AutoDiscardEvent("GAME_REJECTED_REPEAT", "repeats=$repeats", row.stage, row.ackId))
+        }
+        folded.clear()
+    }
 
     /** generation:connection:revision — the only identity a fresh decision may be matched on. */
     private fun decisionKey(source: JSONObject) =
@@ -55,6 +146,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     }
 
     @Synchronized fun pause(reason: String) {
+        flushFolded()
         if (enabled || pending != null) log("PAUSED: $reason")
         enabled = false; pending = null
         modeChanged(false)
@@ -115,7 +207,7 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                 yieldManually("检测到手动操作 · 等待新的一回合")
             } else {
                 wireConfirmed = true
-                log("UPLINK_CONFIRMED id=${command.optString("id")}")
+                emit(AutoDiscardEvent("UPLINK_CONFIRMED", "", "uplink", command.optString("id")))
                 AutoDiscardState.mutable.value = AutoDiscardStatus(true, "已确认游戏发送操作 · 等待下一回合")
             }
             return
@@ -169,17 +261,30 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
             put("delayMs", delay)
             put("gameTile", action.optString("tile")); put("tsumogiri", action.optBoolean("moqie"))
         }
-        log("QUEUED kind=${action.optString("kind")} delayMs=$delay id=${pending!!.optString("id")}")
+        emit(AutoDiscardEvent("QUEUED", "kind=${action.optString("kind")} delayMs=$delay",
+            "queued", pending!!.optString("id")))
         AutoDiscardState.mutable.value = AutoDiscardStatus(true, "随机等待 ${"%.1f".format(delay / 1000.0)} 秒 · 可随时关闭")
     }
 
+    /** Ack rows counted by the last [poll]: seen / folded into the previous record / written. */
+    internal data class AckTally(val seen: Int, val folded: Int, val written: Int)
+
+    @Synchronized fun lastAckTally() = AckTally(ackSeen, ackFolded, ackWritten)
+
     @Synchronized fun poll(acknowledgements: String?): String? {
+        ackSeen = 0; ackFolded = 0; ackWritten = 0
         if (acknowledgements != null) runCatching {
             val rows = org.json.JSONArray(acknowledgements)
             for (index in 0 until rows.length()) {
                 val ack = rows.getJSONObject(index)
                 when (ack.optString("state")) {
-                    "hand_coords" -> continue
+                    // Coordinate/geometry telemetry. The adapter emits these on every
+                    // capture tick with an empty id; AiOverlayService.pullAuto already
+                    // parses hand_coords / hand_geometry / button_coords itself. They are
+                    // never a verdict on the pending command, so they must not reach the
+                    // rejection arm (GAME_REJECTED) or suspend(); they touch no state at
+                    // all, with or without an id.
+                    "hand_coords", "hand_geometry", "button_coords" -> continue
                     "rematch_step", "rematch_again", "rematch_confirmed", "rematch_paused", "rematch_failed" -> continue
                     "ack_oversize" -> {
                         // The native bridge refuses payloads beyond its transport limit.
@@ -205,16 +310,25 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
                 // pending one; an empty id is a network-level manual signal instead.
                 val ackId = ack.optString("id")
                 if (ackId.isNotEmpty() && ackId != pending?.optString("id")) continue
-                if (ackId.isEmpty() && pending != null && ack.optString("state") != "manual") {
-                    log("ACK_UNMATCHED ${ack.optString("state")}"); continue
-                }
+                // An id-less row is never a verdict on a command. Everything that can
+                // report "unmatched" without an id is telemetry and handled above; a
+                // state that still arrives without an id here is dropped rather than
+                // being turned into a rejection of a command it does not describe.
+                if (!enabled || ackId.isEmpty()) continue
                 when (ack.optString("state")) {
                     "probe" -> { log("CLAIM_PROBE ${ack.optString("reason")}") }
                     "waiting" -> { log("GAME_WAITING ${ack.optString("reason")}") }
-                    "submitted" -> { submitted = true; log("GAME_SUBMITTED id=${ack.optString("id")}") }
-                    "accepted" -> { accepted = true; log("SERVER_ACCEPTED id=${ack.optString("id")}") }
+                    "submitted" -> {
+                        submitted = true
+                        emit(AutoDiscardEvent("GAME_SUBMITTED", "", "submitted", ackId))
+                    }
+                    "accepted" -> {
+                        accepted = true
+                        emit(AutoDiscardEvent("SERVER_ACCEPTED", "", "accepted", ackId))
+                    }
                     else -> {
-                        log("GAME_REJECTED ${ack.optString("state")} ${ack.optString("reason")}")
+                        val detail = AutoAckDetails.render(ack.optString("state"), ack.optString("reason"))
+                        noteRejection("command", "GAME_REJECTED", detail, ackId)
                         val reason = when (ack.optString("state")) {
                             "stale" -> "推荐已过期"
                             "round_mismatch" -> "回合校验未通过"
@@ -241,6 +355,11 @@ internal class AutoDiscardController(private val log: (String) -> Unit,
     }
 
     companion object {
+        /** Window in which an identical rejection is folded instead of re-written. */
+        internal const val REJECT_DEDUPE_MS = 2_000L
+        /** Distinct rejection signatures kept before the map is flushed and restarted. */
+        internal const val FOLD_CAPACITY = 64
+
         /** Select an exact server combination, including red fives; no fallback action. */
         fun prepareAction(result: JSONObject, first: JSONObject): JSONObject? {
             val kind = first.optString("kind")

@@ -47,7 +47,16 @@ class GameHintLayer {
                     main.post {
                         busy.set(false)
                         if (token != generation || host !== container) return@post
-                        if (!presentationEnabled || snapshot?.getBoolean("overlayMode", false) == true) {
+                        if (!presentationEnabled || !allowed() || snapshot?.getBoolean("overlayMode", false) == true) {
+                            clearSurfaces()
+                            return@post
+                        }
+                        // A snapshot fetched before the user switched modes carries the
+                        // previous generation. Painting it would put one frame of the old
+                        // surface on top of the new one, so it is dropped and the next
+                        // tick simply asks again.
+                        if (snapshot != null && !presentationStale(
+                                snapshot.getInt("displayGeneration", 0))) {
                             clearSurfaces()
                             return@post
                         }
@@ -130,6 +139,24 @@ class GameHintLayer {
         if (!enabled) clearSurfaces()
     }
 
+    /**
+     * Called by the control right before it acknowledges a switch: drops every surface this
+     * layer drew, so the acknowledgement cannot race a still-visible hint.
+     */
+    fun hideNow() = clearSurfaces()
+
+    /**
+     * True when the snapshot was taken for a display-mode generation that has already been
+     * superseded by the decision this layer paints under. Same rule as the manager's
+     * generation stamp: the in-game hint surface and the system overlays must never paint
+     * for two different modes. A snapshot without the field (older manager) is accepted.
+     */
+    private fun presentationStale(snapshotGeneration: Int): Boolean {
+        if (snapshotGeneration == 0) return false
+        val current = modeGeneration()
+        return current != 0 && snapshotGeneration != current
+    }
+
     private fun clearSurfaces() {
         panel?.close()
         badge?.close()
@@ -149,6 +176,19 @@ class GameHintLayer {
         panel = RecommendationPanelOverlay(activity, decor)
         main.post(tick)
     }
+
+    /** Supplies the mode generation the in-game surface currently paints under. */
+    /**
+     * False while the in-game hint surface must stay down (overlay mode, switch window).
+     * The tick consults it, so "hidden" covers the hints and not only the control bar: the
+     * acknowledgement the control sends promises exactly this.
+     */
+    @JvmField var presentationAllowed: () -> Boolean = { true }
+
+    /** Mode generation the in-game surface currently paints under. */
+    @JvmField var modeGeneration: () -> Int = { 0 }
+
+    private fun allowed(): Boolean = runCatching { presentationAllowed() }.getOrDefault(true)
 
     fun detach() {
         generation++

@@ -3,8 +3,10 @@ package com.yefeng.majmax.hookprobe;
 import android.app.Activity;
 import android.app.Application;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.ColorStateList;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -27,6 +29,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.yefeng.majmax.hookprobe.manager.AssistLaunch;
+import com.yefeng.majmax.hookprobe.manager.DisplayModeLease;
 
 import java.lang.ref.WeakReference;
 import java.util.concurrent.ExecutorService;
@@ -81,6 +84,15 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private static final String TRAMPOLINE = MANAGER + ".GameTopControl$AssistLaunchActivity";
     private static final String TOKEN_EXTRA = "majmax.assist.token";
     private static final Uri ENDPOINT = Uri.parse("content://com.yefeng.majmax.hookprobe.ai/capture");
+    /**
+     * Local broadcast the manager sends right after it persisted a new display selection.
+     * The action must stay byte-identical with
+     * {@code AssistantDisplayModeKt.DISPLAY_MODE_CHANGE_ACTION} (Kotlin top-level const, so
+     * Java sees it as a synthesized class): the manager-side constant is the source of
+     * truth and is duplicated here only because this class already runs inside the game
+     * process with its own field layout.
+     */
+    private static final String SHARED_DISPLAY_MODE_ACTION = "com.yefeng.majmax.hookprobe.DISPLAY_MODE_CHANGED";
 
     private static final int STAGE_HANDLE = 0;
     private static final int STAGE_CAPSULE = 1;
@@ -211,14 +223,35 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private boolean managerMissing;
 
     /**
-     * True while the user has selected the system-overlay surface in the manager's
-     * settings. In that mode this whole in-game control (handle, capsule, menu) is
-     * hidden so it never duplicates the overlay, but polling continues so a switch
-     * back to Hook mode is picked up immediately and the control reappears. While it is
-     * hidden the idle timer is stopped as well: a control nobody can see has nothing
-     * to collapse.
+     * The persisted display selection as the manager reported it (overlay selected). It is
+     * no longer the whole answer: [lease] combines it with the lease fields of the same
+     * reply, because the two surfaces live in two processes and only one of them may paint
+     * at any moment.
      */
     private boolean overlayMode;
+
+    /** Mirrors the manager's presentation lease; decides whether this control may paint. */
+    private final DisplayModeLease lease = new DisplayModeLease(SystemClock::elapsedRealtime);
+
+    /**
+     * Generation this control has already acknowledged to the manager, or -1. The value is
+     * sent as the {@code displayGeneration} extra of the next poll, and only after
+     * {@link #applyState()} finished hiding the surface for that generation.
+     */
+    private int acknowledgedGeneration = -1;
+
+    /** Generation whose acknowledgement is waiting for the next provider call. */
+    private int pendingAckGeneration = -1;
+
+    /**
+     * Registered while an activity is attached. The manager broadcasts right after it
+     * persisted a new selection, so the control re-reads the lease immediately instead of
+     * waiting out its 3 s idle poll; polling stays the source of truth either way.
+     */
+    private BroadcastReceiver displayModeReceiver;
+
+    /** Context the receiver was registered with; it must be the one used to unregister. */
+    private Context displayModeReceiverContext;
 
     /**
      * Auto-rematch as reported by the manager's status reply. [rematch] is the persisted
@@ -243,7 +276,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private String notice = "";
     private boolean noticeFailed;
 
+    /** Application the receiver is registered against; null while no activity is attached. */
+    private Application application;
+
     void register(Application app) {
+        application = app;
         app.registerActivityLifecycleCallbacks(this);
     }
 
@@ -276,6 +313,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         active = new WeakReference<>(activity);
         decor = decorView;
         panel = build(activity);
+        registerDisplayModeReceiver(application != null ? application : activity.getApplicationContext());
         // Wrap-content child of the decor view: it is only as large as the visible
         // stage, never a full-screen surface, so the game keeps every other touch.
         panelParams = new FrameLayout.LayoutParams(
@@ -287,9 +325,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         // The stage survives activity switches; a restored capsule / menu gets a fresh
         // idle window instead of an already-expired one.
         if (stage != STAGE_HANDLE) restartIdleTimer();
+        // The stage survived the activity switch, but not the presentation mode: a new
+        // activity must never inherit "in-game control visible" from before the user
+        // moved the surface to the overlay. The next reply re-evaluates it.
         applyState();
         hooks = new SizeWatcher(activity);
         ((ViewGroup) decorView).addOnLayoutChangeListener(hooks);
+        hints.modeGeneration = this::leaseGeneration;
+        hints.presentationAllowed = this::inGameVisible;
         hints.attach(activity);
         schedulePoll(0L);
     }
@@ -297,6 +340,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private void detach() {
         stopIdleTimer();
         touching = false;
+        // The next activity starts from an unknown acknowledgement state: it re-observes
+        // the manager and acknowledges from there.
+        pendingAckGeneration = -1;
+        unregisterDisplayModeReceiver();
         hints.detach();
         generation++;
         main.removeCallbacks(pollTick);
@@ -483,7 +530,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * back to the half-hidden handle. Nothing in polling reaches this method.
      */
     private void collapseIfIdle() {
-        if (panel == null || overlayMode || stage == STAGE_HANDLE) return;
+        if (panel == null || !inGameVisible() || stage == STAGE_HANDLE) return;
         if (touching || actionBusy.get() || starting) {
             main.postDelayed(collapseTick, ACTION_HOLD_MS);
             return;
@@ -954,13 +1001,27 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     private void applyState() {
-        hints.setPresentationEnabled(!overlayMode);
+        boolean visible = inGameVisible();
+        hints.setPresentationEnabled(visible);
+        if (!visible) {
+            // "Hidden" must cover everything this process draws, because the acknowledgement
+            // sent below promises exactly that: drop the hint surfaces now instead of on the
+            // hint layer's next 120 ms tick.
+            hints.hideNow();
+        }
         if (panel == null) return;
-        if (overlayMode) {
-            // The user switched to the system-overlay surface in the manager. Hide the
-            // entire in-game control (handle, capsule and menu) so nothing is shown
-            // twice, but keep polling so the control can reappear on switch-back. The
-            // idle timer has nothing to do while the control is invisible.
+        // The acknowledgement is what releases the manager's overlay, so it is issued only
+        // here: after this control decided what to show, and only when its own surface is
+        // actually down for the generation the manager answered with. `applyState` hides
+        // synchronously (show(..., false) / clearSurfaces()), so by the time it returns the
+        // in-game surface no longer paints for that generation.
+        noteAppliedGeneration(visible);
+        if (!visible) {
+            // The manager's system overlay owns the surface right now (or is about to,
+            // because the user just switched). Hide the entire in-game control (handle,
+            // capsule and menu) and the in-game hint layer so nothing is shown twice, but
+            // keep polling so the control reappears as soon as the manager hands the
+            // surface back. The idle timer has nothing to do while it is invisible.
             stopIdleTimer();
             show(handleTab, false);
             show(capsule, false);
@@ -1131,7 +1192,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     private String headerState() {
         if (starting) return "启动中";
-        if (overlayMode) return "悬浮窗模式";
+        if (!inGameVisible()) return "悬浮窗模式";
+        if (lease.getOverlaySelected()) return "切换中";
         if (enabled) return "无人值守开";
         if (available) return "待机";
         if (demo) return "自检中";
@@ -1415,6 +1477,41 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
+    private void registerDisplayModeReceiver(Context context) {
+        if (displayModeReceiver != null) return;
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context ignored, Intent intent) {
+                onDisplayModeBroadcast(intent);
+            }
+        };
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, new IntentFilter(SHARED_DISPLAY_MODE_ACTION),
+                    Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, new IntentFilter(SHARED_DISPLAY_MODE_ACTION));
+            }
+            displayModeReceiver = receiver;
+            displayModeReceiverContext = context;
+        } catch (RuntimeException | Error refused) {
+            // Registration is only an accelerator: the poll picks the change up anyway.
+            displayModeReceiver = null;
+        }
+    }
+
+    private void unregisterDisplayModeReceiver() {
+        BroadcastReceiver receiver = displayModeReceiver;
+        Context registeredWith = displayModeReceiverContext;
+        displayModeReceiver = null;
+        displayModeReceiverContext = null;
+        if (receiver == null || registeredWith == null) return;
+        try {
+            registeredWith.unregisterReceiver(receiver);
+        } catch (RuntimeException alreadyGone) {
+            // Not registered any more (process teardown); nothing to undo.
+        }
+    }
+
     /* ---------------------------------------------------------------- transport */
 
     private void schedulePoll(long delay) {
@@ -1422,8 +1519,27 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (panel != null) main.postDelayed(pollTick, delay);
     }
 
+    /**
+     * Re-asks the manager immediately after the display selection changed.
+     *
+     * This is only a latency optimisation: the broadcast arrives before the manager has
+     * rebuilt its own surface, so the answer it triggers is the one that carries the new
+     * generation with `displayOwner = NONE`, and this control stays down until the
+     * following reply renews the overlay for that generation. Nothing is decided here —
+     * [DisplayModeLease] already holds the previous decision, and the poll is what the
+     * manager waits for (it pauses its own overlay until this process asks).
+     */
+    private void onDisplayModeBroadcast(Intent intent) {
+        if (panel == null) return;
+        applyState();
+        schedulePoll(0L);
+    }
+
     private void poll() {
         if (panel == null || active.get() == null) return;
+        // Armed *before* any applyState below: applyState is what queues an acknowledgement,
+        // and reading the extras afterwards would drop the one queued during this tick.
+        Bundle ack = ackExtras();
         if (starting && SystemClock.elapsedRealtime() - startingAt > START_TIMEOUT_MS) {
             starting = false;
             noticeFailed = true;
@@ -1431,7 +1547,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             applyState();
         }
         if (!actionBusy.get() && pollBusy.compareAndSet(false, true)) {
-            call("autoStatus", null, REQUEST_TIMEOUT_MS, reply -> {
+            call("autoStatus", ack, REQUEST_TIMEOUT_MS, reply -> {
                 pollBusy.set(false);
                 if (reply == null || "unreachable".equals(reply.getString("state", ""))) {
                     unreachable = true;
@@ -1442,8 +1558,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
                     remoteMessage = "";
                     // Without a reply the manager's mode is unknown; show the in-game
                     // control (rather than hide it) so the user can still reach the
-                    // "open manager" action from the capsule.
-                    overlayMode = false;
+                    // "open manager" action from the capsule. The lease drops with it.
+                    lease.apply(new DisplayModeLease.Reply(false,
+                        DisplayModeLease.OWNER_NONE, lease.getGeneration(), false, true));
                 } else {
                     applyReply(reply);
                     if (starting && available && enabled) {
@@ -1464,6 +1581,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
+    /**
+     * Applies one status reply and re-evaluates the presentation lease.
+     *
+     * The persisted mode ({@code overlayMode}) is only half of the answer: the manager
+     * also reports which surface it granted the lease to and for which mode generation
+     * ({@code displayOwner} / {@code displayGeneration}), plus whether its overlay window
+     * is really on screen ({@code displayOverlayFailed}). {@link #lease} combines them so
+     * this control stays hidden while the manager's overlay paints, comes back the moment
+     * the manager hands the surface over, and never stays hidden behind an overlay that
+     * failed to appear. A manager older than this field set simply sends nothing, and the
+     * control falls back to the persisted mode exactly as before.
+     */
     private void applyReply(Bundle reply) {
         available = reply.getBoolean("available");
         enabled = reply.getBoolean("enabled");
@@ -1477,6 +1606,56 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         recommendationPanel = reply.getBoolean("recommendationPanel", recommendationPanel);
         unreachable = false;
         managerMissing = false;
+        // The reply's own `overlayMode` belongs to the same generation as the lease fields;
+        // the field is kept for the rest of the control (the capsule's own label) and is
+        // used again only by a manager old enough not to send the lease at all.
+        lease.apply(new DisplayModeLease.Reply(
+            reply.getBoolean("overlaySelected", overlayMode),
+            reply.getInt("displayOwner", DisplayModeLease.OWNER_NONE),
+            reply.containsKey("displayGeneration")
+                ? reply.getInt("displayGeneration") : lease.getGeneration(),
+            reply.getBoolean("displayOverlayFailed", false),
+            false));
+    }
+
+    /**
+     * Whether this control may show itself at all. Re-evaluated on every poll and on
+     * every re-attach, never cached across a mode change.
+     */
+    private boolean inGameVisible() {
+        return !lease.mustHide();
+    }
+
+    /** Mode generation the in-game surface currently paints under. */
+    private int leaseGeneration() {
+        return lease.getGeneration();
+    }
+
+    /**
+     * Queues the acknowledgement of the generation this control has just hidden for.
+     *
+     * The acknowledgement is sent whether or not the overlay already owns the surface: it is
+     * how the manager learns that an in-game control exists, and it is what lets the first
+     * switch to overlay wait for a real "hidden" instead of painting both surfaces. It is
+     * only ever queued from {@link #applyState()} *after* the views were hidden, so the
+     * manager cannot show its window while this control still paints.
+     */
+    private void noteAppliedGeneration(boolean visible) {
+        int generation = lease.generationToAcknowledge();
+        if (generation <= 0) return;
+        if (!visible && acknowledgedGeneration != generation) pendingAckGeneration = generation;
+    }
+
+    /** Extra carrying the acknowledgement; empty while none is pending. */
+    private Bundle ackExtras() {
+        Bundle extras = new Bundle();
+        int generation = pendingAckGeneration;
+        if (generation > 0) {
+            extras.putInt("displayGeneration", generation);
+            acknowledgedGeneration = generation;
+            pendingAckGeneration = -1;
+        }
+        return extras;
     }
 
     /**

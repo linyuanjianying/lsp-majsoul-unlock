@@ -75,22 +75,37 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yefeng.majmax.hookprobe.BuildConfig
 import com.yefeng.majmax.hookprobe.R
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 
 private val Green = Color(0xFF007A46)
 private val Cream = Color(0xFFF7F7EF)
 
 class MainActivity : ComponentActivity() {
+    /** Export work for this activity instance; cancelled in [onDestroy]. */
+    internal val exportScope: CoroutineScope = newExportScope()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DiagnosticsAccess.grantToGame(this)
         DiagnosticsStore.cleanExpiredExports(this)
         CatalogUpdates.check(applicationContext)
-        setContent { HookManagerApp() }
+        setContent { HookManagerApp(exportScope) }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // This scope captures UI state belonging to this activity instance.
+        // Cancel on rotation too, so a destroyed activity cannot launch a late chooser.
+        exportScope.cancel()
     }
 }
 
@@ -114,24 +129,42 @@ private sealed interface UpdateState {
 }
 
 private object ManagerDiagnostics {
-    fun append(context: Context, level: String, source: String, message: String) {
-        val code = when {
+    fun append(context: Context, level: String, source: String, message: String, code: String? = null) {
+        val resolved = code ?: when {
             source == "diagnostics" -> "EXPORT_FAILED"
             message.contains("启动目标游戏") -> "GAME_LAUNCH_REQUESTED"
             message.contains("刷新诊断状态") -> "DIAGNOSTICS_REFRESH"
             message.contains("设置仍由游戏内页面管理") -> "GAME_SETTINGS_OPENED"
             else -> "MANAGER_ACTION"
         }
-        DiagnosticsStore.appendAssistant(context, level, "manager", code,
+        DiagnosticsStore.appendAssistant(context, level, "manager", resolved,
             JSONObject().put("reason", source.take(24)))
     }
 
     fun read(context: Context): List<DiagnosticRecord> = DiagnosticsStore.read(context, DiagnosticKind.Assistant)
 }
 
+/**
+ * Export work deliberately does not live in `rememberCoroutineScope()`.
+ *
+ * In Compose 1.7.x the remembered scope's job is cancelled as soon as its
+ * composition leaves the tree, for example when the user switches tabs.
+ * Keep packaging alive across tab/dialog disposal, but cancel when the activity
+ * is destroyed. Opening a chooser alone does not dispose the composition.
+ */
+private fun newExportScope(): CoroutineScope =
+    CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+/** What the export dialog should tell the user after a delivery attempt. */
+private sealed interface ExportOutcome {
+    data object Shared : ExportOutcome
+    data class Saved(val name: String) : ExportOutcome
+    data class Failed(val reason: String) : ExportOutcome
+}
+
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-private fun HookManagerApp() {
+private fun HookManagerApp(exportScope: CoroutineScope) {
     val context = LocalContext.current
     var selectedIndex by rememberSaveable { mutableIntStateOf(0) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
@@ -200,7 +233,7 @@ private fun HookManagerApp() {
             when (destination) {
                 Destination.Overview -> OverviewScreen(padding)
                 Destination.Assistant -> AiScreen(padding)
-                Destination.Logs -> LogsScreen(padding)
+                Destination.Logs -> LogsScreen(padding, exportScope)
                 Destination.Updates -> UpdatesScreen(
                     padding = padding,
                     updateState = updateState,
@@ -338,7 +371,7 @@ private fun StatusCard(status: ModuleStatus, onRefresh: () -> Unit) {
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
-private fun LogsScreen(padding: PaddingValues) {
+private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
     val context = LocalContext.current
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var hookLines by remember { mutableStateOf(DiagnosticsStore.read(context, DiagnosticKind.Hook)) }
@@ -493,6 +526,10 @@ private fun LogsScreen(padding: PaddingValues) {
             },
         )
     }
+    // Export state lives outside the dialog's composition: see the note on exportBusy.
+    var exportBusy by remember { mutableStateOf(false) }
+    var exportError by remember { mutableStateOf<String?>(null) }
+    var exportOutcome by remember { mutableStateOf<ExportOutcome?>(null) }
     if (showExport) {
         var range by remember { mutableIntStateOf(0) }
         val options = listOf("最近 1 小时", "最近 24 小时", "全部保留日志")
@@ -504,37 +541,126 @@ private fun LogsScreen(padding: PaddingValues) {
         val estimateBytes = DiagnosticsStore.estimateBytes(hookExport, assistantExport)
         val estimateLabel = if (estimateBytes < 1024 * 1024) "${estimateBytes / 1024} KiB"
             else "${"%.1f".format(estimateBytes / (1024f * 1024f))} MiB"
-        var exportBusy by remember { mutableStateOf(false) }
-        val scope = rememberCoroutineScope()
+        // Never package an archive that has no destination: on a device with no
+        // application/zip handler the old flow silently produced a file and then
+        // failed at startActivity, which the user only saw as "分享没反应".
+        val shareAvailable = remember { DiagnosticsStore.canShare(context) }
+        val appContext = context.applicationContext
         AlertDialog(
-            onDismissRequest = { showExport = false },
+            onDismissRequest = { if (!exportBusy) { showExport = false; exportOutcome = null } },
             title = { Text("打包发送") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     options.forEachIndexed { index, label ->
-                        FilterChip(selected = range == index, onClick = { range = index }, label = { Text(label) })
+                        FilterChip(selected = range == index, onClick = { range = index },
+                            enabled = !exportBusy, label = { Text(label) })
                     }
                     Text("故障包包含 Hook 日志 ${hookExport.size} 条、助手日志 ${assistantExport.size} 条，与当前搜索筛选无关。")
                     Text("预计未压缩约 $estimateLabel；分享前会再次执行字段白名单检查，文件上限 8 MiB。",
                         style = MaterialTheme.typography.bodySmall)
+                    if (!shareAvailable) {
+                        Text("当前系统没有可接收 ZIP 的分享目标，将改为保存到系统“下载”目录。",
+                            color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
+                    exportError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    exportOutcome?.let { outcome ->
+                        Text(
+                            when (outcome) {
+                                ExportOutcome.Shared -> "已打开分享面板，请选择要发送的应用。"
+                                is ExportOutcome.Saved ->
+                                    "已保存到“下载”：${outcome.name}。可自行转发给开发者。"
+                                is ExportOutcome.Failed -> "打包或发送失败：${outcome.reason}"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    if (!exportBusy) scope.launch {
-                        exportBusy = true
-                        runCatching { withContext(Dispatchers.IO) { DiagnosticsStore.packageZip(context, durations[range]) } }
-                            .onSuccess { file ->
-                                context.startActivity(Intent.createChooser(DiagnosticsStore.shareIntent(context, file), "发送故障排查包"))
-                                showExport = false
+                TextButton(enabled = !exportBusy, onClick = {
+                    exportBusy = true
+                    exportError = null
+                    exportOutcome = null
+                    ManagerDiagnostics.append(context, "INFO", "diagnostics", "创建故障包", "EXPORT_STARTED")
+                    // exportScope, not rememberCoroutineScope: see the note above the
+                    // scope. The lambda captures only stable values / appContext.
+                    exportScope.launch {
+                        // The busy flag must be cleared on every exit path, including
+                        // cancellation by onDestroy; otherwise the button stays disabled
+                        // for the rest of the activity's life.
+                        try {
+                            val file = withContext(Dispatchers.IO) {
+                                DiagnosticsStore.packageZip(appContext, durations[range])
                             }
-                            .onFailure { ManagerDiagnostics.append(context, "ERROR", "diagnostics", "故障包生成失败") }
-                        exportBusy = false
+                            deliverExport(appContext, file) { outcome -> exportOutcome = outcome }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Throwable) {
+                            val reason = error.message?.take(120) ?: error.javaClass.simpleName
+                            exportError = "打包失败：$reason"
+                            ManagerDiagnostics.append(appContext, "ERROR", "diagnostics",
+                                "故障包生成失败", "EXPORT_FAILED")
+                        } finally {
+                            exportBusy = false
+                        }
                     }
-                }, enabled = !exportBusy) { Text(if (exportBusy) "正在打包…" else "创建并分享") }
+                }) { Text(if (exportBusy) "正在打包…" else if (shareAvailable) "创建并分享" else "创建并保存") }
             },
-            dismissButton = { TextButton(onClick = { showExport = false }) { Text("取消") } },
+            dismissButton = {
+                TextButton(enabled = !exportBusy, onClick = { showExport = false; exportOutcome = null }) {
+                    Text(if (exportOutcome == null) "取消" else "关闭")
+                }
+            },
         )
+    }
+}
+
+/**
+ * Hands [file] to the share sheet, falling back to a public Downloads copy when no
+ * chooser can be started (no ZIP handler, share restricted by policy, or the
+ * platform refuses the activity). Every branch appends an EXPORT_* event so the
+ * next package explains itself, and the callback is invoked on the main thread.
+ */
+private suspend fun deliverExport(
+    appContext: Context,
+    file: File,
+    report: (ExportOutcome) -> Unit,
+) {
+    val name = file.name
+    // Build and *verify* the share intent off the main thread: diagnostics/ and
+    // chooser-adjacent work here is I/O plus a ContentResolver round trip, and the
+    // check is what decides between sharing and the Downloads fallback. Opening the
+    // chooser is deliberately not treated as proof that the file can be read — the
+    // receiving app is the one that would fail, which is the reported symptom.
+    val prepared = if (!DiagnosticsStore.canShare(appContext)) {
+        null to "no share target"
+    } else {
+        withContext(Dispatchers.IO) {
+            runCatching { DiagnosticsStore.shareIntent(appContext, file) }
+        }.fold({ it to null }, { null to (it.message ?: it.javaClass.simpleName) })
+    }
+    val chooser = prepared.first?.let { intent ->
+        runCatching {
+            appContext.startActivity(
+                Intent.createChooser(intent, "发送故障排查包")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.isSuccess
+    } ?: false
+    if (chooser) {
+        ManagerDiagnostics.append(appContext, "INFO", "diagnostics", "打开分享面板", "EXPORT_SHARED")
+        report(ExportOutcome.Shared)
+        return
+    }
+    ManagerDiagnostics.append(appContext, "ERROR", "diagnostics", "分享组件无法提供故障包",
+        "EXPORT_URI_UNREADABLE")
+    val saved = withContext(Dispatchers.IO) { DiagnosticsStore.saveToDownloads(appContext, file, name) }
+    if (saved != null) {
+        ManagerDiagnostics.append(appContext, "INFO", "diagnostics", "保存到下载目录", "EXPORT_SAVED")
+        report(ExportOutcome.Saved(name))
+    } else {
+        ManagerDiagnostics.append(appContext, "ERROR", "diagnostics", "无法交付故障包", "EXPORT_INTENT_UNAVAILABLE")
+        report(ExportOutcome.Failed(prepared.second ?: "系统无法打开分享面板，也没能写入下载目录"))
     }
 }
 

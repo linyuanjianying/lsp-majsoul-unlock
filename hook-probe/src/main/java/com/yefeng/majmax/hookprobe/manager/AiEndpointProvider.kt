@@ -50,10 +50,20 @@ class AiEndpointProvider : ContentProvider() {
             val ack = DiagnosticsStore.acceptHookBatch(app, payload)
             return Bundle().apply { putLong("ackSeq", ack) }
         }
-        if (method == "autoPoll") return Bundle().apply {
-            putString("command", AiOverlayService.autoPoll(extras?.getString("acks")))
+        if (method == "autoPoll") {
+            // No lease bookkeeping here on purpose. A heartbeat only proves the process
+            // runs; it says nothing about whether the in-game surface has already hidden
+            // for the current selection. The acknowledgement is the explicit
+            // `displayGeneration` extra of `autoStatus` below.
+            return Bundle().apply {
+                putString("command", AiOverlayService.autoPoll(extras?.getString("acks")))
+            }
         }
         if (method == "autoStatus" || method == "autoSet") {
+            // Explicit acknowledgement: the in-game control sends, in `displayGeneration`,
+            // the generation it has applied and finished hiding its surface for. Anything
+            // else (a missing extra, a poll in flight) leaves the manager's overlay paused.
+            ackDisplayGeneration(extras)
             if (method == "autoSet") {
                 // Mode only: the service keeps running, so a later enable is instant and
                 // the foreground notification still explains what is running.
@@ -92,6 +102,10 @@ class AiEndpointProvider : ContentProvider() {
             return Bundle().apply {
                 putString("mode", mode.wire)
                 putBoolean("overlay", AssistantDisplayModeSettings.overlayActive(app))
+                // The lease fields are the ones a status reply carries; this method exists
+                // for callers that only want the mode and must not disagree with it.
+                AssistLaunch.putLease(app, this)
+                putString("displayEffective", AssistantDisplayModeSettings.effective(app).wire)
             }
         }
         if (method == "hintSnapshot") return AiOverlayService.hintSnapshot()
@@ -138,6 +152,20 @@ class AiEndpointProvider : ContentProvider() {
     override fun update(uri: Uri, values: ContentValues?, selection: String?,
         selectionArgs: Array<out String>?): Int = 0
 }
+
+    /**
+     * Records the generation the in-game control says it has applied.
+     *
+     * Only the caller's own extra is trusted: the provider is exported, so a value it
+     * invents or infers would let any caller lift the manager's pause. A missing or
+     * non-positive value is "not acknowledged" and changes nothing.
+     */
+    private fun ackDisplayGeneration(extras: Bundle?) {
+        val acked = extras?.takeIf { it.containsKey("displayGeneration") }
+            ?.getInt("displayGeneration", 0) ?: return
+        if (acked <= 0) return
+        DisplayModeLeaseLocal.acknowledge(acked)
+    }
 
 /**
  * Starts, observes and switches the manager's foreground analysis service for the
@@ -386,6 +414,50 @@ object AssistLaunch {
     }
 
     /**
+     * Writes the presentation lease the in-game control mirrors ([DisplayModeLease]).
+     *
+     * `displayOwner` says which surface may paint, `displayGeneration` says for which
+     * selection, `displayOverlayFailed` says overlay mode is selected but its window is not
+     * on screen (so the in-game control has to stand in, never "neither surface").
+     *
+     * The generation is captured **before** the values are read, and the lease is only
+     * reported once the publisher has caught up with it. A reply assembled across a switch
+     * therefore carries the new generation with `displayOwner = NONE` — the lease of the
+     * previous selection is never re-stamped as if it belonged to the new one, which is
+     * what used to let the overlay be treated as "already showing" for a selection it had
+     * never painted.
+     *
+     * With the service down nothing owns the surface: the overlay windows went away with
+     * it, so `displayOwner` is NONE regardless of what the last publisher left behind.
+     */
+    @JvmStatic
+    fun putLease(context: Context, bundle: Bundle) {
+        // A restarted manager continues the persisted generation instead of restarting the
+        // counter at 0, which the game would drop as stale forever (see
+        // AssistantDisplayModeSettings.ensureLoaded).
+        AssistantDisplayModeSettings.ensureLoaded(context)
+        val generation = AssistantDisplayModeSettings.generation()
+        bundle.putInt("displayGeneration", generation)
+        // `overlaySelected` is the instruction the game acts on: while it is true the game
+        // hides everything it draws and acknowledges; while it is false the game paints.
+        // It is published by the service and is true on the way back to hook mode until the
+        // windows are actually removed, so the game never paints next to a live window.
+        val lease = DisplayModeBroadcastState.current()
+        val alive = AiOverlayService.isAlive()
+        val current = alive && lease.generation == generation
+        bundle.putBoolean("overlaySelected", current && lease.overlaySelected)
+        bundle.putBoolean("displayOverlayFailed", current && lease.overlayFailed)
+        // Ownership is only ever claimed by the service after the game's acknowledgement.
+        bundle.putInt("displayOwner",
+            if (current && !lease.overlayFailed) lease.owner else DisplayModeOwner.NONE)
+        // Backwards-compatible field for an in-game control that predates this protocol: it
+        // keys off `overlayMode` alone, so it must keep reading "hide" for as long as this
+        // side intends to show the system surface.
+        bundle.putBoolean("overlayMode", current && lease.overlaySelected)
+    }
+
+
+    /**
      * Appends the persisted presentation mode to a status bundle for the game process.
      * Kept separate from [status] because the mode read needs an app [Context], which
      * the provider always has but [status] itself does not hold a stable reference to.
@@ -394,7 +466,7 @@ object AssistLaunch {
     fun withDisplayMode(context: Context, bundle: Bundle): Bundle {
         val mode = AssistantDisplayModeSettings.read(context)
         bundle.putString("displayMode", mode.wire)
-        bundle.putBoolean("overlayMode", AssistantDisplayModeSettings.overlayActive(context))
+        putLease(context, bundle)
         // Auto-rematch opt-in, read-only projection. `rematch` is the stored setting,
         // `rematchActive` is the effective gate (stored AND not demo) and
         // matches the `autoRematch` field of the next autoPoll heartbeat exactly, so the
