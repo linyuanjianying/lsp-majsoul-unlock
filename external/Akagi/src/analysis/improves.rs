@@ -261,7 +261,7 @@ pub fn analyze_13(info: &PlayerInfo34) -> Hand13Result {
         // the weighted expectation used by the attack ranking.
         win_scores = score::wait_scores(info, &current_waits, !is_open);
 
-        let est = score::expectation(info, &current_waits, !is_open);
+        let est = score::expectation_from_wait_scores(&win_scores);
         dama_point = est.dama_point;
         riichi_point = est.riichi_point;
         yaku_ids = est.yaku_ids;

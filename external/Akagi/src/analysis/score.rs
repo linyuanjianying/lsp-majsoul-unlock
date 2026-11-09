@@ -360,24 +360,23 @@ pub fn wait_scores(info: &PlayerInfo34, waits: &Waits, allow_riichi: bool) -> Ve
 
 /// Compute the point expectation across the wait set.
 pub fn expectation(info: &PlayerInfo34, waits: &Waits, allow_riichi: bool) -> ScoreEstimate {
-    if waits.is_empty() {
-        return ScoreEstimate::default();
-    }
-    let closed = is_closed(info);
-    let evaluator = Evaluator::build(info);
+    expectation_from_wait_scores(&wait_scores(info, waits, allow_riichi))
+}
 
+/// Reuse the exact ron slots already evaluated for the UI; do not evaluate the
+/// same hand a second time for the attack-ranking expectation.
+pub fn expectation_from_wait_scores(scores: &[WaitScore]) -> ScoreEstimate {
     let mut sum_dama = 0.0f64;
     let mut sum_riichi = 0.0f64;
     let mut total_w = 0u32;
     let mut yaku_set: std::collections::BTreeSet<u32> = Default::default();
     let mut has_yaku = false;
 
-    for (tile, left) in waits.iter() {
+    for e in scores {
+        let left = e.left;
         if left == 0 {
             continue;
         }
-        let e = eval_tile(&evaluator, info, tile, closed, allow_riichi);
-
         let dama_pt = e.ron.as_ref().map(|s| s.points as f64).unwrap_or(0.0);
         let riichi_pt = e.riichi_ron.as_ref().map(|s| s.points as f64).unwrap_or(0.0);
 
@@ -438,6 +437,27 @@ mod tests {
             from_who: Some(1),
             aka_count: 0,
         }
+    }
+
+    #[test]
+    fn expectation_reuses_weighted_ron_slots_only() {
+        let value = |points, yaku_ids| WaitScoreValue {
+            han: 1, fu: 30, points, yakuman: false, yaku_ids,
+        };
+        let scores = vec![
+            WaitScore { tile: "1m".into(), left: 1, han: None, fu: None, points: None,
+                ron: Some(value(1000, vec![2])), riichi_ron: Some(value(2000, vec![1, 2])),
+                tsumo: Some(value(99999, vec![99])), riichi_tsumo: None },
+            WaitScore { tile: "4m".into(), left: 3, han: None, fu: None, points: None,
+                ron: None, riichi_ron: Some(value(4000, vec![1])),
+                tsumo: None, riichi_tsumo: None },
+        ];
+        let estimate = expectation_from_wait_scores(&scores);
+        assert_eq!(estimate.dama_point, 250.0);
+        assert_eq!(estimate.riichi_point, 3500.0);
+        assert_eq!(estimate.yaku_ids, vec![1, 2]);
+        assert!(estimate.has_yaku);
+        assert_eq!(expectation_from_wait_scores(&[]).dama_point, 0.0);
     }
 
     #[test]

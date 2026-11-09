@@ -85,6 +85,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private var rematchName: TextView? = null
     private var rematchStateLabel: TextView? = null
     private var rematchDetail: TextView? = null
+    private var appliedPanelEnabled: Boolean? = null
     private var panelSwitch: Switch? = null
     private var panelName: TextView? = null
     private var panelStateLabel: TextView? = null
@@ -136,6 +137,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         rematchStateLabel = null
         rematchDetail = null
         panelSwitch = null
+        appliedPanelEnabled = null
         panelName = null
         panelStateLabel = null
         panelDetail = null
@@ -610,6 +612,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
         val toggle = switchOn(stored, "推荐与番点面板开关")
         panelSwitch = toggle
+        appliedPanelEnabled = null
         toggle.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
             onPanelTap(checked)
         }
@@ -634,11 +637,15 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private fun onPanelTap(checked: Boolean) {
         val saved = runCatching { RecommendationPanelSettings.save(context, checked) }
             .getOrDefault(checked)
+        // A user tap already moved the thumb, even if persistence returned the old value.
+        appliedPanelEnabled = null
         applyPanel(saved)
     }
 
     /** Keeps switch, caption and explanation in one place so they can never disagree. */
     private fun applyPanel(enabled: Boolean) {
+        if (panelSwitch == null || appliedPanelEnabled == enabled) return
+        appliedPanelEnabled = enabled
         panelSwitch?.let { applyChecked(it, enabled) }
         switchColors(panelSwitch, enabled, enabled)
         panelSwitch?.refreshDrawableState()

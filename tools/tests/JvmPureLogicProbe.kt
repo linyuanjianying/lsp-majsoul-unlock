@@ -177,6 +177,13 @@ fun main() {
         check("absent analysis preserves recommendations", unknown.getInt("shanten") == -99 && unknown.getJSONArray("rows").length() == 1)
     }
 
+    run {
+        fun lines(prob: Double, extra: Int = 0) = com.yefeng.majmax.hookprobe.manager.RecommendationPanelOverlay.displayLines(
+            JSONObject().put("rows", JSONArray().put(JSONObject().put("tile", "E").put("probabilityPercent", prob).put("revision", extra))))
+        check("invisible probability precision does not redraw panel", lines(83.0001) == lines(83.0002, 99))
+        check("visible probability change updates panel", lines(83.0) != lines(83.2))
+    }
+
     println("\n=== ${passed} passed, ${failed} failed ===")
     if (failed != 0) kotlin.system.exitProcess(1)
 }

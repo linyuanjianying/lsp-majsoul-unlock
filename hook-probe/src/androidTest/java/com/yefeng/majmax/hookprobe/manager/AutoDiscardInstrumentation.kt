@@ -915,6 +915,45 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     "badge hint must not carry floating-window chrome"
                 }
             }
+            test("panel reuses its window and text views across updates and waiting") { _, _ ->
+                runOnMainSync {
+                    val host = android.widget.FrameLayout(targetContext)
+                    val panel = RecommendationPanelOverlay(targetContext, host)
+                    fun state(prob: Double) = JSONObject("""{"status":"live","recommendations":[{"kind":"discard","tile":"E","policyProbability":$prob}]}""")
+                    panel.update(state(.83), true)
+                    val frame = host.getChildAt(0) as android.widget.FrameLayout
+                    val pane = frame.getChildAt(0) as android.widget.LinearLayout
+                    val row = pane.getChildAt(1)
+                    repeat(30) { panel.update(state(.830001), true) }
+                    check(host.childCount == 1 && host.getChildAt(0) === frame)
+                    check(frame.getChildAt(0) === pane && pane.getChildAt(1) === row)
+                    panel.update(state(.84), true)
+                    check(pane.getChildAt(1) === row)
+                    check((row as android.widget.TextView).text.contains("84.0%"))
+                    panel.update(JSONObject().put("status", "waiting"), true)
+                    check(frame.visibility == android.view.View.INVISIBLE && host.childCount == 1)
+                    panel.update(state(.84), true)
+                    check(frame.visibility == android.view.View.VISIBLE && host.getChildAt(0) === frame)
+                    panel.update(state(.84), false)
+                    check(frame.visibility == android.view.View.INVISIBLE)
+                    panel.update(state(.84), true)
+                    check(frame.visibility == android.view.View.VISIBLE && pane.getChildAt(1) === row)
+                    fun resize(width: Int, height: Int) {
+                        frame.measure(android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY),
+                            android.view.View.MeasureSpec.makeMeasureSpec(height, android.view.View.MeasureSpec.EXACTLY))
+                        frame.layout(0, 0, width, height)
+                    }
+                    resize(2376, 1080)
+                    check(host.getChildAt(0) === frame && pane.getChildAt(1) === row)
+                    panel.update(state(.84), false)
+                    resize(1600, 720)
+                    panel.update(state(.84), true)
+                    check(frame.visibility == android.view.View.VISIBLE && pane.getChildAt(1) === row)
+                    check((pane.layoutParams as android.widget.FrameLayout.LayoutParams).leftMargin == (1600 * (.287f - .22f / 2f)).toInt())
+                    panel.close()
+                    check(host.childCount == 0)
+                }
+            }
             test("panel probability uses native policy fraction and legacy percentage") { _, _ ->
                 check(RecommendationPanelOverlay.probabilityPercent(JSONObject("""{"policyProbability":0.83}""")) == 83.0)
                 check(RecommendationPanelOverlay.probabilityPercent(JSONObject("""{"weight":83}""")) == 83.0)

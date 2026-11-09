@@ -25,6 +25,8 @@ class GameHintLayer {
     private var badge: TileBadgeOverlay? = null
     private var panel: RecommendationPanelOverlay? = null
     private var generation = 0
+    private var previousPanelResult: String? = null
+    private var previousPanelEnabled = true
     private var previousResult = ""
     private var previousCoords = ""
     private var previousButtons = ""
@@ -45,7 +47,8 @@ class GameHintLayer {
                         busy.set(false)
                         if (token != generation || host !== container) return@post
                         if (snapshot == null) {
-                            panel?.close()
+                            panel?.update(null, false)
+                            previousPanelResult = null
                             // The provider call itself failed (e.g. SecurityException).
                             // A null snapshot is otherwise indistinguishable from
                             // "not running" downstream, so surface it explicitly.
@@ -56,14 +59,21 @@ class GameHintLayer {
                             return@post
                         }
                         if (snapshot.getBoolean("running") != true) {
-                            panel?.close()
+                            panel?.update(null, false)
+                            previousPanelResult = null
                             badge?.update(JSONObject().put("status", "waiting"))
                             previousResult = ""
                             previousCoords = ""
                             previousButtons = ""
                         } else {
                             val result = snapshot.getString("result").orEmpty()
-                            panel?.update(runCatching { JSONObject(result) }.getOrNull(), snapshot.getBoolean("recommendationPanel", true))
+                            val panelEnabled = snapshot.getBoolean("recommendationPanel", true)
+                            val parsedResult by lazy { runCatching { JSONObject(result) }.getOrNull() }
+                            if (result != previousPanelResult || panelEnabled != previousPanelEnabled) {
+                                panel?.update(parsedResult, panelEnabled)
+                                previousPanelResult = result
+                                previousPanelEnabled = panelEnabled
+                            }
                             val coords = snapshot.getString("coords").orEmpty()
                             val buttons = snapshot.getString("buttons").orEmpty()
                             val sourceW = snapshot.getInt("sourceW")
@@ -73,7 +83,7 @@ class GameHintLayer {
                             val source = "${sourceW}x${sourceH}"
                             val buttonSource = "${buttonSourceW}x${buttonSourceH}"
                             if (result.isNotEmpty() && result != previousResult) {
-                                val parsed = runCatching { JSONObject(result) }.getOrNull()
+                                val parsed = parsedResult
                                 if (parsed != null) {
                                     runCatching { badge?.update(parsed) }.onSuccess {
                                         previousResult = result
@@ -121,6 +131,7 @@ class GameHintLayer {
         generation++
         main.removeCallbacks(tick)
         panel?.close(); panel = null
+        previousPanelResult = null
         badge?.close()
         badge = null
         host = null
