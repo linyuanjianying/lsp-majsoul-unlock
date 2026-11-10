@@ -485,6 +485,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         menuParams.topMargin = dp(activity, TOP_GAP_DP);
+        menu.setPivotY(0f);
+        menu.setScaleX(.5f);
+        menu.setScaleY(.5f);
         root.addView(menu, menuParams);
 
         // Outer touch watcher. It only observes: every event is handed straight back to
