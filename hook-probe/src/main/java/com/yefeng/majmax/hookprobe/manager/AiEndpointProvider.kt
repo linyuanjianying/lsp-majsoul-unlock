@@ -15,8 +15,52 @@ import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
 
-/** `overlayError` value meaning "this process could not read its display state". */
+/**
+ * Reply field carrying the manager's UI language ("zh-Hans" / "en" / "ja").
+ *
+ * Every reply the in-game surfaces read is stamped with it through [putUiLanguage], so
+ * the menu, the recommendation window and the hint snapshot all follow the same value
+ * the manager page shows. It is a read-only projection of the preference: it is never
+ * written back, it never touches the service, the mode or the model, and it carries no
+ * behaviour the game could act on beyond choosing which copy to draw.
+ */
+internal const val KEY_UI_LANGUAGE = "uiLanguage"
+
+/**
+ * `overlayError` value meaning "this process could not read its display state".
+ */
 internal const val DISPLAY_MODE_UNAVAILABLE = "display_mode_unavailable"
+
+/**
+ * Stamps the language tag on this bundle, so the call site keeps reading
+ * `return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)`.
+ *
+ * The tag is re-derived from storage on **every** reply instead of trusting the value the
+ * process happens to hold. That matters for the two cases where the process is stale:
+ *
+ *  - a cold start of the manager process, where nothing has loaded the preference yet and
+ *    the in-memory language is still the initial Chinese;
+ *  - a device-language change while "follow system" is selected and the manager page has
+ *    not been opened since (only `MainActivity.onCreate` refreshes otherwise).
+ *
+ * `UiLanguage.refresh` reads the preference file and `Resources.getSystem()` and republishes
+ * the effective language. This runs on the provider's binder thread, never on the Compose
+ * main thread, and it only writes `MutableState` — the observable writes Compose already
+ * relies on from `MainActivity`. Compose coalesces them into the next snapshot, and the
+ * manager page re-reads `UiLanguage.text(...)` on recomposition, so a value refreshed here
+ * is exactly what the page would have produced itself.
+ *
+ * Best effort: an unreadable preference leaves the key off rather than inventing a
+ * language, and both surfaces treat a missing key as "no news".
+ */
+internal fun Bundle.putUiLanguage(context: Context): Bundle {
+    val tag = runCatching {
+        UiLanguage.refresh(context)
+        UiLanguage.currentTag()
+    }.getOrNull()
+    if (!tag.isNullOrBlank()) putString(KEY_UI_LANGUAGE, tag)
+    return this
+}
 
 /** Delivers a temporary loopback capability only to the game UID. */
 class AiEndpointProvider : ContentProvider() {
@@ -66,7 +110,7 @@ class AiEndpointProvider : ContentProvider() {
                     ?: throw IllegalArgumentException("Missing enabled")
                 AiOverlayService.setAutoEnabled(requested)
             }
-            return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
+            return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)
         }
         if (method == "rematchSet") {
             // Single boolean preference. It never starts/stops the service, never flips
@@ -75,7 +119,7 @@ class AiEndpointProvider : ContentProvider() {
             val requested = extras?.takeIf { it.containsKey("enabled") }?.getBoolean("enabled")
                 ?: throw IllegalArgumentException("Missing enabled")
             AiOverlayService.publishRematch(app, requested)
-            return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
+            return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)
         }
         if (method == "panelSet") {
             // Single boolean preference for the click-through fixed panel's
@@ -87,7 +131,7 @@ class AiEndpointProvider : ContentProvider() {
             val requested = extras?.takeIf { it.containsKey("enabled") }?.getBoolean("enabled")
                 ?: throw IllegalArgumentException("Missing enabled")
             RecommendationPanelSettings.save(app, requested)
-            return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
+            return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)
         }
         if (method == "displayMode" || method == "runMode") {
             // Read-only projection of the mode that is actually in effect: the running
@@ -115,7 +159,7 @@ class AiEndpointProvider : ContentProvider() {
                         .getOrDefault(AssistantDisplayMode.HOOK.wire))
             }
         }
-        if (method == "hintSnapshot") return AiOverlayService.hintSnapshot()
+        if (method == "hintSnapshot") return AiOverlayService.hintSnapshot().putUiLanguage(app)
         if (method == "assistFollowHost") {
             // Host-process lifecycle hand-off. The game process reports "I am starting"
             // right after its MainActivity is created; the manager answers whether it
@@ -123,11 +167,12 @@ class AiEndpointProvider : ContentProvider() {
             // trampoline activity and never flips the unattended opt-in on its own.
             val state = AssistLaunch.followHost(app)
             return AssistLaunch.withDisplayMode(app, AssistLaunch.status().apply { putString("state", state) })
+                .putUiLanguage(app)
         }
         if (method == "assistLaunch") return AssistLaunch.withDisplayMode(app, AssistLaunch.status().apply {
             putString("state", AssistLaunch.RESTRICTED)
             putString("token", AssistLaunch.issueToken())
-        })
+        }).putUiLanguage(app)
         if (method == "assistStart") {
             // Runs in the manager process with the manager's identity, so this is the
             // only legal place to touch the manager's foreground service.
@@ -140,7 +185,7 @@ class AiEndpointProvider : ContentProvider() {
                     // trampoline activity, where a visible activity makes the start legal.
                     putString("token", AssistLaunch.issueToken())
                 }
-            })
+            }).putUiLanguage(app)
         }
         if (method != "endpoint") return null
         val endpoint = AiOverlayService.currentEndpoint()

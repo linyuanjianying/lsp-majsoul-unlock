@@ -6,8 +6,12 @@ import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import com.yefeng.majmax.hookprobe.manager.TileBadgeOverlay
+import com.yefeng.majmax.hookprobe.helper.GameMenuText
+import com.yefeng.majmax.hookprobe.manager.ManagerLanguage
+import com.yefeng.majmax.hookprobe.manager.ManagerLanguageSettings
+import com.yefeng.majmax.hookprobe.manager.ManagerSystemLanguage
 import com.yefeng.majmax.hookprobe.manager.RecommendationPanelOverlay
+import com.yefeng.majmax.hookprobe.manager.TileBadgeOverlay
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -24,6 +28,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * known; it is not a lease and it never switches modes. The provider already reports
  * `overlayMode` / `runMode` for the authoritative answer, so the layer clears itself when it
  * sees overlay mode instead of re-deriving the decision locally.
+ *
+ * Language: the recommendation window follows the manager's UI language, carried by the
+ * `uiLanguage` field of the same `hintSnapshot` this tick already reads — no extra provider
+ * call and no extra timer. The tile badges are intentionally left alone: their content is
+ * drawn on the tiles and must read exactly like the game's own tiles.
  */
 class GameHintLayer {
     private val main = Handler(Looper.getMainLooper())
@@ -44,6 +53,18 @@ class GameHintLayer {
     private var previousButtons = ""
     private var previousSource = ""
     private var previousButtonSource = ""
+
+    /**
+     * Language the recommendation window is rendered in.
+     *
+     * Seeded from the manager's own preference when this layer is created (the panel is
+     * created in the game process, so this is only a first guess), then corrected by the
+     * `uiLanguage` field of every snapshot. A snapshot without the field — an older
+     * manager, or a reply that failed — leaves it alone instead of resetting it.
+     */
+    private var language: ManagerLanguage = ManagerLanguage.SIMPLIFIED
+    private var languageKnown = false
+    private var previousLanguageTag = ""
 
     private val tick = object : Runnable {
         override fun run() {
@@ -80,6 +101,10 @@ class GameHintLayer {
                             previousButtons = ""
                             return@post
                         }
+                        // Language first: a change must repaint the panel even when the
+                        // recommendation below is byte-identical to the last one.
+                        val tag = snapshot.getString("uiLanguage").orEmpty()
+                        val languageChanged = syncLanguage(tag)
                         if (snapshot.getBoolean("running") != true) {
                             panel?.update(null, false)
                             previousPanelResult = null
@@ -91,7 +116,7 @@ class GameHintLayer {
                             val result = snapshot.getString("result").orEmpty()
                             val panelEnabled = snapshot.getBoolean("recommendationPanel", true)
                             val parsedResult by lazy { runCatching { JSONObject(result) }.getOrNull() }
-                            if (result != previousPanelResult || panelEnabled != previousPanelEnabled) {
+                            if (result != previousPanelResult || panelEnabled != previousPanelEnabled || languageChanged) {
                                 panel?.update(parsedResult, panelEnabled)
                                 previousPanelResult = result
                                 previousPanelEnabled = panelEnabled
@@ -104,6 +129,7 @@ class GameHintLayer {
                             val buttonSourceH = snapshot.getInt("buttonSourceH")
                             val source = "${sourceW}x${sourceH}"
                             val buttonSource = "${buttonSourceW}x${buttonSourceH}"
+                            // Tile badges: unchanged behaviour, same inputs, no language.
                             if (result.isNotEmpty() && result != previousResult) {
                                 val parsed = parsedResult
                                 if (parsed != null) {
@@ -140,6 +166,40 @@ class GameHintLayer {
         }
     }
 
+    /**
+     * Adopts the snapshot's language tag. Returns true when it differs from the one that
+     * produced what is on screen, which is the signal to repaint the recommendation
+     * window even if nothing else changed. The tile badge never sees this value.
+     */
+    private fun syncLanguage(tag: String): Boolean {
+        if (tag == previousLanguageTag && languageKnown) return false
+        val next = GameMenuText.languageOf(tag, ensureLanguage())
+        previousLanguageTag = tag
+        languageKnown = true
+        language = next
+        // host = true: from now on the game's tag owns the copy of this panel.
+        panel?.setLanguageTag(tag, true)
+        return true
+    }
+
+    /**
+     * First guess only: the manager's stored preference. The player's choice lives in the
+     * manager process; this read is just so the very first frame is already right, and a
+     * failed read simply keeps Chinese until the first snapshot arrives.
+     */
+    private fun ensureLanguage(): ManagerLanguage {
+        if (languageKnown) return language
+        val app = host?.context?.applicationContext
+        if (app != null) {
+            // The stored *choice*, with "follow the system" resolved here, matches what
+            // the manager page shows before the first reply corrects it.
+            language = runCatching {
+                ManagerLanguageSettings.readChoice(app).effective(ManagerSystemLanguage.current())
+            }.getOrDefault(language)
+        }
+        return language
+    }
+
     /** Called by the control's mode projection, independently of hint delivery. */
     fun setPresentationEnabled(enabled: Boolean) {
         if (presentationEnabled == enabled) return
@@ -169,9 +229,20 @@ class GameHintLayer {
         detach()
         val decor = activity.window?.decorView as? FrameLayout ?: return
         host = decor
+        ensureLanguage()
         badge = TileBadgeOverlay(activity, decor)
         panel = RecommendationPanelOverlay(activity, decor)
+        // Queued behind the snapshot call the tick issues right below, so the panel is
+        // painted with the same tag everything else uses; this only avoids a Chinese
+        // flash for a player who already chose another language.
+        panel?.setLanguageTag(previousLanguageTag.ifEmpty { languageTagOf(language) })
         main.post(tick)
+    }
+
+    private fun languageTagOf(language: ManagerLanguage): String = when (language) {
+        ManagerLanguage.SIMPLIFIED -> "zh-Hans"
+        ManagerLanguage.ENGLISH -> "en"
+        ManagerLanguage.JAPANESE -> "ja"
     }
 
     /**

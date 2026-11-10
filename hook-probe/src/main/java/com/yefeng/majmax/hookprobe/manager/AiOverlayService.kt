@@ -16,6 +16,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import com.yefeng.majmax.hookprobe.helper.InGameLocalizer
 import org.json.JSONObject
 import java.io.DataInputStream
 import java.net.InetAddress
@@ -262,11 +263,33 @@ class AiOverlayService : Service() {
         val panel = recommendationPanel ?: return
         val value = hintResult
         val enabled = RecommendationPanelSettings.read(this)
+        // The system overlay never receives a `uiLanguage` tag, so it is told the manager's
+        // current language here on every render: a switch on the manager page then reaches
+        // an already-open panel (its own repaint is skipped below when the result is
+        // unchanged, so telling it *before* the early return is what makes the switch
+        // visible). Untagged — the in-game panel takes its language from the hint snapshot
+        // and ignores this source.
+        InGameLocalizer.currentTag(this)?.let { panel.setLanguageTag(it) }
         if (value == previousPanelResult && enabled == previousPanelEnabled) return
         panel.update(value.takeIf { it.isNotBlank() }?.let { JSONObject(it) }, enabled)
         previousPanelResult = value
         previousPanelEnabled = enabled
     }
+    /**
+     * Re-derives the manager's effective language from the stored choice and the device.
+     *
+     * The service is the only component that is running when no manager page is open, so it
+     * is what keeps "follow system" honest after a device-language change. It only reloads
+     * the shared selection (`UiLanguage.refresh` never writes preferences); every surface
+     * here decides what to redraw on its own, and the Compose page recomposes from the same
+     * state if it happens to be visible.
+     */
+    private fun refreshLanguage() {
+        runCatching { UiLanguage.refresh(this) }
+            .onFailure { DiagnosticsStore.appendAssistant(this, "WARN", "assistant.service",
+                "UI_LANGUAGE_REFRESH_FAILED", JSONObject().put("error", it.javaClass.simpleName)) }
+    }
+
     @Volatile private var fallbackLogged = false
     /** One diagnostics record per rematch ack state, for the lifetime of the service. */
     private val autoUiTick = object : Runnable {
@@ -846,6 +869,10 @@ class AiOverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        // A new device language (or a restored explicit choice) must be re-derived here:
+        // this runs only while no manager page is open, so nothing else would notice, and
+        // the overlay windows re-read the language when they are rebuilt just below.
+        refreshLanguage()
         overlay?.configurationChanged()
         badges?.configurationChanged()
         recommendationPanel?.close()

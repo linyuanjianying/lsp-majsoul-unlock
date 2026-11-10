@@ -40,6 +40,9 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -71,6 +74,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yefeng.majmax.hookprobe.BuildConfig
@@ -96,9 +100,39 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DiagnosticsAccess.grantToGame(this)
+        // Before setContent, so the first frame is already in the stored language: the stored
+        // option first, then the device locale behind it (only when the option is "follow system").
+        ManagerLanguageState.load(this)
+        ManagerLanguageState.syncSystemLanguage()
         DiagnosticsStore.cleanExpiredExports(this)
         CatalogUpdates.check(applicationContext)
         setContent { HookManagerApp(exportScope) }
+    }
+
+    /**
+     * Coming back from the language settings is a system language change in practice; a
+     * recreate also re-reads the stored option, in case it changed while the UI was away.
+     */
+    override fun onResume() {
+        super.onResume()
+        ManagerLanguageState.syncSystemLanguage()
+    }
+
+    /**
+     * Reports device locale changes to the composition.
+     *
+     * The manager reads `Resources.getSystem()` rather than its own configuration (see
+     * [ManagerSystemLanguage]), so a locale change does not otherwise invalidate anything and
+     * a "follow system" choice would go unnoticed until the next start. Republishing the
+     * effective language in [ManagerLanguageState] is what makes the open screens recompose.
+     * The change is passed in directly instead of re-reading the system resources, which may
+     * not have settled yet at this point.
+     */
+    @Suppress("DEPRECATION")
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val locale = if (newConfig.locales.size() > 0) newConfig.locales.get(0) else null
+        ManagerLanguageState.syncSystemLanguage(ManagerSystemLanguage.resolve(locale))
     }
 
     override fun onDestroy() {
@@ -109,8 +143,19 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Destination(val title: String) {
-    Overview("概览"), Assistant("助手"), Logs("日志"), Updates("更新")
+/**
+ * Bottom-bar destinations. The Chinese title is first by contract: it is what the manager
+ * showed before the language switch existed, and [title] falls back to it for any language
+ * that has no entry.
+ */
+private enum class Destination(val zh: String, val en: String, val ja: String) {
+    Overview("概览", "Overview", "概要"),
+    Assistant("助手", "Assistant", "アシスト"),
+    Logs("日志", "Logs", "ログ"),
+    Updates("更新", "Updates", "更新"),
+    ;
+
+    fun title(language: ManagerLanguage): String = language.tr(zh, en, ja)
 }
 
 private data class ModuleStatus(
@@ -168,6 +213,9 @@ private fun HookManagerApp(exportScope: CoroutineScope) {
     val context = LocalContext.current
     var selectedIndex by rememberSaveable { mutableIntStateOf(0) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
+    var languageMenu by remember { mutableStateOf(false) }
+    val language = managerLanguage()
+    val languageChoice = managerLanguageChoice()
     val destination = Destination.entries[selectedIndex]
     val configured = BuildConfig.UPDATE_OWNER.isNotBlank() && BuildConfig.UPDATE_REPO.isNotBlank()
     var updateState by remember(configured) {
@@ -195,14 +243,40 @@ private fun HookManagerApp(exportScope: CoroutineScope) {
                             )
                             Spacer(Modifier.width(10.dp))
                             Column {
+                                // The product name stays as-is in every language.
                                 Text("雀魂 Max Hook", fontWeight = FontWeight.SemiBold)
-                                Text("独立模块管理", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(language.tr("独立模块管理", "Module manager", "モジュール管理"),
+                                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
                     },
                     actions = {
+                        Box {
+                            // Short tag: the top bar is narrow on small screens, and the full
+                            // names (including "follow system") are in the dropdown this opens.
+                            TextButton(onClick = { languageMenu = true }) {
+                                Text(topBarLanguageTag(languageChoice, language))
+                            }
+                            DropdownMenu(expanded = languageMenu, onDismissRequest = { languageMenu = false }) {
+                                ManagerLanguageChoice.entries.forEach { option ->
+                                    DropdownMenuItem(
+                                        text = { Text(option.describe(language)) },
+                                        leadingIcon = {
+                                            RadioButton(selected = option == languageChoice, onClick = null)
+                                        },
+                                        onClick = {
+                                            languageMenu = false
+                                            // Stores the *choice*; the effective language is
+                                            // re-derived (device locale or explicit) right here.
+                                            ManagerLanguageState.select(context, option)
+                                        },
+                                    )
+                                }
+                            }
+                        }
                         IconButton(onClick = { showAbout = true }) {
-                            Icon(Icons.Default.Info, contentDescription = "关于")
+                            Icon(Icons.Default.Info,
+                                contentDescription = language.tr("关于", "About", "このアプリについて"))
                         }
                     },
                 )
@@ -221,10 +295,13 @@ private fun HookManagerApp(exportScope: CoroutineScope) {
                                         Destination.Logs -> Icons.AutoMirrored.Filled.Article
                                         Destination.Updates -> Icons.Default.SystemUpdate
                                     },
-                                    contentDescription = item.title,
+                                    contentDescription = item.title(language),
                                 )
                             },
-                            label = { Text(item.title) },
+                            label = {
+                                Text(item.title(language), maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis)
+                            },
                         )
                     }
                 }
@@ -253,31 +330,38 @@ private fun HookManagerApp(exportScope: CoroutineScope) {
 @Composable
 private fun AboutDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val language = managerLanguage()
     var showLicense by remember { mutableStateOf(false) }
     val versionText = "雀魂 Max Hook ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · " +
         "${BuildConfig.UPDATE_CHANNEL} · ${BuildConfig.BUILD_SHA} · ${BuildConfig.APPLICATION_ID}"
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("关于雀魂 Max Hook") },
+        title = { Text(language.tr("关于雀魂 Max Hook", "About Majsoul Max Hook", "雀魂 Max Hook について")) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                InfoRow("应用", "雀魂 Max Hook")
-                InfoRow("版本", "${BuildConfig.VERSION_NAME} · ${BuildConfig.VERSION_CODE}")
-                InfoRow("发布通道", BuildConfig.UPDATE_CHANNEL)
-                InfoRow("构建提交", BuildConfig.BUILD_SHA)
-                InfoRow("包名", BuildConfig.APPLICATION_ID)
-                InfoRow("开发者", "YeFeng233")
+                InfoRow(language.tr("应用", "App", "アプリ"), "雀魂 Max Hook")
+                InfoRow(language.tr("版本", "Version", "バージョン"),
+                    "${BuildConfig.VERSION_NAME} · ${BuildConfig.VERSION_CODE}")
+                InfoRow(language.tr("发布通道", "Channel", "リリースチャンネル"), BuildConfig.UPDATE_CHANNEL)
+                InfoRow(language.tr("构建提交", "Build commit", "ビルドコミット"), BuildConfig.BUILD_SHA)
+                InfoRow(language.tr("包名", "Package", "パッケージ名"), BuildConfig.APPLICATION_ID)
+                InfoRow(language.tr("开发者", "Developer", "開発者"), "YeFeng233")
                 ManagerOutlinedButton(onClick = { openUrl(context, "https://github.com/YeFeng233/lsp-majsoul-unlock") }) {
-                    Text("项目地址 · GitHub")
+                    Text(language.tr("项目地址 · GitHub", "Project on GitHub", "プロジェクト · GitHub"))
                 }
                 ManagerOutlinedButton(onClick = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("版本信息", versionText))
-                }) { Text("复制版本信息") }
-                ManagerOutlinedButton(onClick = { showLicense = true }) { Text("开源许可") }
+                    clipboard.setPrimaryClip(ClipData.newPlainText(
+                        language.tr("版本信息", "Version info", "バージョン情報"), versionText))
+                }) { Text(language.tr("复制版本信息", "Copy version info", "バージョン情報をコピー")) }
+                ManagerOutlinedButton(onClick = { showLicense = true }) {
+                    Text(language.tr("开源许可", "Open-source licenses", "オープンソースライセンス"))
+                }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(language.tr("关闭", "Close", "閉じる")) }
+        },
     )
     if (showLicense) {
         val license = remember {
@@ -287,9 +371,11 @@ private fun AboutDialog(onDismiss: () -> Unit) {
         }
         AlertDialog(
             onDismissRequest = { showLicense = false },
-            title = { Text("Akagi 开源许可") },
+            title = { Text(language.tr("Akagi 开源许可", "Akagi licenses", "Akagi ライセンス")) },
             text = { Text(license, Modifier.verticalScroll(rememberScrollState()), style = MaterialTheme.typography.bodySmall) },
-            confirmButton = { TextButton(onClick = { showLicense = false }) { Text("关闭") } },
+            confirmButton = {
+                TextButton(onClick = { showLicense = false }) { Text(language.tr("关闭", "Close", "閉じる")) }
+            },
         )
     }
 }
@@ -297,15 +383,26 @@ private fun AboutDialog(onDismiss: () -> Unit) {
 @Composable
 private fun OverviewScreen(padding: PaddingValues) {
     val context = LocalContext.current
+    val language = managerLanguage()
     var status by remember { mutableStateOf(readStatus(context)) }
     ManagerPage(padding) {
-        Text("概览", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Text(language.tr("概览", "Overview", "概要"),
+            style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         StatusCard(status) { status = readStatus(context) }
         ManagerCard {
-            Text("当前安装", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            InfoRow("模块版本", "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
-            InfoRow("目标游戏", "com.soulgamechst.majsoul")
-            InfoRow("更新通道", if (BuildConfig.UPDATE_OWNER.isBlank()) "尚未配置新仓库" else BuildConfig.UPDATE_CHANNEL)
+            Text(language.tr("当前安装", "Installed now", "現在のインストール"),
+                style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            InfoRow(language.tr("模块版本", "Module version", "モジュールのバージョン"),
+                "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+            // Package name: a machine identifier, never translated.
+            InfoRow(language.tr("目标游戏", "Target game", "対象ゲーム"), "com.soulgamechst.majsoul")
+            InfoRow(
+                language.tr("更新通道", "Update channel", "更新チャンネル"),
+                if (BuildConfig.UPDATE_OWNER.isBlank()) {
+                    language.tr("尚未配置更新仓库", "No update repository configured",
+                        "更新リポジトリは未設定です")
+                } else BuildConfig.UPDATE_CHANNEL,
+            )
         }
         ManagerCard(
             onClick = { ManagerDiagnostics.append(context, "INFO", "ui", "MOD 设置仍由游戏内页面管理") },
@@ -315,8 +412,13 @@ private fun OverviewScreen(padding: PaddingValues) {
                 Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("MOD 选项请在游戏内设置中调整", fontWeight = FontWeight.Medium)
-                    Text("打开雀魂后进入 设置 → MOD设置", style = MaterialTheme.typography.bodySmall)
+                    Text(language.tr("MOD 选项在游戏内设置中调整",
+                        "MOD options live in the in-game settings",
+                        "MOD の設定はゲーム内で行います"), fontWeight = FontWeight.Medium)
+                    Text(language.tr("打开雀魂后进入 设置 → MOD设置",
+                            "Open Majsoul, then Settings → MOD settings",
+                            "雀魂を開き、設定 → MOD 設定 の順に進みます"),
+                        style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
@@ -326,6 +428,8 @@ private fun OverviewScreen(padding: PaddingValues) {
 @Composable
 private fun StatusCard(status: ModuleStatus, onRefresh: () -> Unit) {
     val context = LocalContext.current
+    // Subscribes this card so an open screen re-translates on a language change.
+    val language = managerLanguage()
     val installed = runCatching {
         context.packageManager.getLaunchIntentForPackage("com.soulgamechst.majsoul") != null
     }.getOrDefault(false)
@@ -340,30 +444,47 @@ private fun StatusCard(status: ModuleStatus, onRefresh: () -> Unit) {
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    if (status.diagnosticAvailable) "已有最近诊断记录" else "尚未读取游戏运行记录",
+                    if (status.diagnosticAvailable) language.tr("已有最近诊断记录",
+                        "Recent diagnostic records found", "最近の診断記録があります")
+                    else language.tr("尚未读取游戏运行记录", "No game run records yet",
+                        "ゲーム実行の記録はまだありません"),
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    status.lastEvent ?: "启动游戏并在 LSPosed 中启用模块后可产生记录",
+                    // A stored diagnostic line: translated only when its shape is known,
+                    // otherwise shown as produced.
+                    status.lastEvent?.let { localizedKnown(it) }
+                        ?: language.tr("启动游戏并在 LSPosed 中启用模块后可产生记录",
+                            "Start the game with the module enabled in LSPosed to produce records",
+                            "LSPosed でモジュールを有効にしてゲームを起動すると記録が残ります"),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
         HorizontalDivider()
-        InfoRow("目标游戏", if (installed) "已安装" else "未检测到")
-        InfoRow("日志来源", "Hook 事件通过游戏 UID 校验通道提交；不读取全局 logcat")
+        InfoRow(language.tr("目标游戏", "Target game", "対象ゲーム"),
+            if (installed) language.tr("已安装", "Installed", "インストール済み")
+            else language.tr("未检测到", "Not found", "見つかりません"))
+        InfoRow(language.tr("日志来源", "Log source", "ログの取得元"),
+            language.tr("Hook 事件通过游戏 UID 校验通道提交；不读取全局 logcat",
+                "Hook events arrive over a UID-checked channel; global logcat is never read",
+                "Hook イベントはゲーム UID を検証した経路で届きます。全体の logcat は読みません"))
         ManagerActions(first = { modifier ->
             ManagerButton(modifier = modifier, onClick = {
                 ManagerDiagnostics.append(context, "INFO", "ui", "启动目标游戏")
                 context.packageManager.getLaunchIntentForPackage("com.soulgamechst.majsoul")?.let { context.startActivity(it) }
-            }, enabled = installed) { Text("打开雀魂") }
+            }, enabled = installed) { Text(language.tr("打开雀魂", "Open Majsoul", "雀魂を開く")) }
         }, second = { modifier ->
             ManagerOutlinedButton(modifier = modifier, onClick = {
                 ManagerDiagnostics.append(context, "INFO", "ui", "刷新诊断状态")
                 onRefresh()
-            }) { Icon(Icons.Default.Refresh, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("刷新诊断") }
+            }) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(Modifier.width(4.dp))
+                Text(language.tr("刷新诊断", "Refresh", "診断を更新"))
+            }
         })
 
     }
@@ -373,13 +494,17 @@ private fun StatusCard(status: ModuleStatus, onRefresh: () -> Unit) {
 @OptIn(ExperimentalLayoutApi::class)
 private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
     val context = LocalContext.current
+    // Subscribes this screen (and its dialogs) to the language.
+    val language = managerLanguage()
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var hookLines by remember { mutableStateOf(DiagnosticsStore.read(context, DiagnosticKind.Hook)) }
     var assistantLines by remember { mutableStateOf(ManagerDiagnostics.read(context)) }
     var hookQuery by rememberSaveable { mutableStateOf("") }
     var assistantQuery by rememberSaveable { mutableStateOf("") }
-    var hookLevel by rememberSaveable { mutableStateOf("全部") }
-    var assistantLevel by rememberSaveable { mutableStateOf("全部") }
+    // Level filters store a stable key ("ALL"/"DEBUG"/…), never the label: the label is
+    // translated, and rememberSaveable keeps this value across a language switch.
+    var hookLevel by rememberSaveable { mutableStateOf(LOG_LEVEL_ALL) }
+    var assistantLevel by rememberSaveable { mutableStateOf(LOG_LEVEL_ALL) }
     var followLatest by rememberSaveable { mutableStateOf(true) }
     val hookScroll = rememberLazyListState()
     val assistantScroll = rememberLazyListState()
@@ -393,7 +518,7 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
     val query = if (selectedTab == 0) hookQuery else assistantQuery
     val level = if (selectedTab == 0) hookLevel else assistantLevel
     val visible = lines.filter { log ->
-        (level == "全部" || log.level == level) &&
+        (level == LOG_LEVEL_ALL || log.level == level) &&
             (query.isBlank() || "${log.component} ${log.code} ${log.fields}".contains(query, ignoreCase = true))
     }
     val activeScroll = if (selectedTab == 0) hookScroll else assistantScroll
@@ -408,46 +533,78 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
         Column(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxWidth().padding(horizontal = ManagerLayout.pagePadding, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("日志", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    Text(language.tr("日志", "Logs", "ログ"), style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     TextButton(onClick = {
                         clearAll = false
                         clearError = null
                         showClear = true
-                    }, enabled = hookLines.isNotEmpty() || assistantLines.isNotEmpty()) { Text("清理日志") }
-                    IconButton(onClick = ::refresh) { Icon(Icons.Default.Refresh, "刷新") }
-                    IconButton(onClick = { showExport = true }) { Icon(Icons.Default.Share, "打包发送") }
+                    }, enabled = hookLines.isNotEmpty() || assistantLines.isNotEmpty()) {
+                        Text(language.tr("清理日志", "Clear", "ログを消去"))
+                    }
+                    IconButton(onClick = ::refresh) {
+                        Icon(Icons.Default.Refresh, language.tr("刷新", "Refresh", "更新"))
+                    }
+                    IconButton(onClick = { showExport = true }) {
+                        Icon(Icons.Default.Share, language.tr("打包发送", "Package and send", "まとめて送信"))
+                    }
                 }
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Hook 日志", "助手日志").forEachIndexed { index, label ->
+                    logTabs(language).forEachIndexed { index, label ->
                         FilterChip(selected = selectedTab == index, onClick = { selectedTab = index }, label = { Text(label) })
                     }
-                    FilterChip(selected = followLatest, onClick = { followLatest = !followLatest }, label = { Text("跟随最新") })
+                    FilterChip(selected = followLatest, onClick = { followLatest = !followLatest },
+                        label = { Text(language.tr("跟随最新", "Follow latest", "最新に追従")) })
                 }
                 OutlinedTextField(
                     value = query,
                     onValueChange = { if (selectedTab == 0) hookQuery = it else assistantQuery = it },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
-                    label = { Text("搜索消息或事件") },
+                    // Filters the manager's own records; the record text itself is untouched.
+                    label = { Text(language.tr("搜索消息或事件", "Search messages or events",
+                        "メッセージやイベントを検索")) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
                 )
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("全部", "INFO", "WARN", "ERROR").forEach { level ->
-                        FilterChip(selected = level == (if (selectedTab == 0) hookLevel else assistantLevel),
-                            onClick = { if (selectedTab == 0) hookLevel = level else assistantLevel = level },
-                            label = { Text(level) })
+                    // Level names are machine fields written by the service; only "all" translates.
+                    logLevelFilters(language).forEach { (key, label) ->
+                        FilterChip(selected = key == (if (selectedTab == 0) hookLevel else assistantLevel),
+                            onClick = { if (selectedTab == 0) hookLevel = key else assistantLevel = key },
+                            label = { Text(label) })
                     }
                 }
                 Text(
                     if (lines.isEmpty()) {
-                        if (selectedTab == 0) "尚未收到游戏 Hook 事件；请确认 LSPosed 已启用模块并重启游戏" else "助手尚未运行，或还没有产生诊断事件"
-                    } else "已载入 ${visible.size} / ${lines.size} 条",
+                        if (selectedTab == 0) language.tr(
+                            "尚未收到游戏 Hook 事件；请确认 LSPosed 已启用模块并重启游戏",
+                            "No hook events received yet. Check that the module is enabled in LSPosed, then restart the game.",
+                            "ゲームの Hook イベントはまだ届いていません。LSPosed でモジュールを有効にしてゲームを再起動してください。")
+                        else language.tr(
+                            "助手尚未运行，或还没有产生诊断事件",
+                            "The assistant has not run yet, or has produced no diagnostic events.",
+                            "アシストはまだ実行されていないか、診断イベントがありません。")
+                    } else language.tr(
+                        "已载入 ${visible.size} / ${lines.size} 条",
+                        "Showing ${visible.size} of ${lines.size}",
+                        "${lines.size} 件中 ${visible.size} 件を表示")
+                    ,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             if (visible.isEmpty()) {
-                EmptyState("暂无匹配日志", if (lines.isEmpty()) "可刷新页面，或在游戏/助手运行后再次查看。" else "调整搜索内容或级别筛选。")
+                EmptyState(
+                    language.tr("暂无匹配日志", "No matching entries", "一致するログはありません"),
+                    if (lines.isEmpty()) language.tr(
+                        "可刷新页面，或在游戏/助手运行后再次查看。",
+                        "Refresh the page, or look again once the game or the assistant has run.",
+                        "ページを更新するか、ゲームやアシストの実行後に再度ご確認ください。")
+                    else language.tr(
+                        "调整搜索内容或级别筛选。",
+                        "Adjust the search text or the level filter.",
+                        "検索語やレベル絞り込みを変更してください。"),
+                )
             } else {
                 LazyColumn(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -464,16 +621,32 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
                                 Text(log.level, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                                 Text(log.component, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                             }
+                            // The record itself (summary, code, session, fields) is service or
+                            // game data and stays in the language it was written in. Only the
+                            // labels around it are translated.
                             Text(log.summary)
                             if (expanded) {
-                                Text("事件：${log.code} · 会话：${log.session} · 序号：${log.seq}",
-                                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    language.tr(
+                                        "事件：${log.code} · 会话：${log.session} · 序号：${log.seq}",
+                                        "Event: ${log.code} · Session: ${log.session} · Seq: ${log.seq}",
+                                        "イベント: ${log.code} · セッション: ${log.session} · 連番: ${log.seq}",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                                 if (log.fields.length() > 0) {
-                                    Text("诊断字段：${log.fields}", style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(
+                                        language.tr("诊断字段：${log.fields}", "Fields: ${log.fields}",
+                                            "診断フィールド: ${log.fields}"),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
                                 }
                             } else {
-                                Text("点按查看诊断详情", style = MaterialTheme.typography.labelSmall,
+                                Text(language.tr("点按查看诊断详情", "Tap to see details",
+                                        "タップで診断の詳細を表示"),
+                                    style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
@@ -484,17 +657,30 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
     }
     if (showClear) {
         val currentKind = if (selectedTab == 0) DiagnosticKind.Hook else DiagnosticKind.Assistant
-        val currentLabel = if (selectedTab == 0) "Hook 日志" else "助手日志"
+        val currentLabel = logTabs(language)[selectedTab]
         AlertDialog(
             onDismissRequest = { if (!clearBusy) showClear = false },
-            title = { Text("清理日志") },
+            title = { Text(language.tr("清理日志", "Clear logs", "ログを消去")) },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     FilterChip(selected = !clearAll, onClick = { clearAll = false }, enabled = !clearBusy,
-                        modifier = Modifier.fillMaxWidth(), label = { Text("当前分类：$currentLabel（${lines.size} 条）") })
+                        modifier = Modifier.fillMaxWidth(), label = {
+                            Text(language.tr("当前分类：$currentLabel（${lines.size} 条）",
+                                "This category: $currentLabel (${lines.size})",
+                                "この分類: $currentLabel（${lines.size} 件）"))
+                        })
                     FilterChip(selected = clearAll, onClick = { clearAll = true }, enabled = !clearBusy,
-                        modifier = Modifier.fillMaxWidth(), label = { Text("全部日志（${hookLines.size + assistantLines.size} 条）") })
-                    Text("将删除所选范围的全部历史日志，包括被搜索或级别筛选隐藏的记录。清理后无法恢复，新日志仍会正常记录。")
+                        modifier = Modifier.fillMaxWidth(), label = {
+                            Text(language.tr("全部日志（${hookLines.size + assistantLines.size} 条）",
+                                "All logs (${hookLines.size + assistantLines.size})",
+                                "すべてのログ（${hookLines.size + assistantLines.size} 件）"))
+                        })
+                    Text(
+                        language.tr(
+                            "将删除所选范围的全部历史日志，包括被搜索或级别筛选隐藏的记录。清理后无法恢复，新日志仍会正常记录。",
+                            "Every historical entry in the selected scope is deleted, including those hidden by the search or the level filter. This cannot be undone; new entries are still recorded normally.",
+                            "選択した範囲の過去ログをすべて削除します。検索やレベル絞り込みで非表示の記録も対象です。消去は元に戻せませんが、新しいログはこれまでどおり記録されます。",
+                        ))
                     clearError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 }
             },
@@ -515,14 +701,23 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
                             assistantLines = assistant
                             showClear = false
                         }.onFailure {
-                            clearError = "清理失败，请重试。"
+                            clearError = language.tr("清理失败，请重试。", "Clearing failed. Try again.",
+                                "消去に失敗しました。もう一度お試しください。")
                         }
                         clearBusy = false
                     }
-                }) { Text(if (clearBusy) "正在清理…" else "确认清理", color = MaterialTheme.colorScheme.error) }
+                }) {
+                    Text(
+                        if (clearBusy) language.tr("正在清理…", "Clearing…", "消去中…")
+                        else language.tr("确认清理", "Clear", "消去する"),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             },
             dismissButton = {
-                TextButton(enabled = !clearBusy, onClick = { showClear = false }) { Text("取消") }
+                TextButton(enabled = !clearBusy, onClick = { showClear = false }) {
+                    Text(language.tr("取消", "Cancel", "キャンセル"))
+                }
             },
         )
     }
@@ -532,7 +727,11 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
     var exportOutcome by remember { mutableStateOf<ExportOutcome?>(null) }
     if (showExport) {
         var range by remember { mutableIntStateOf(0) }
-        val options = listOf("最近 1 小时", "最近 24 小时", "全部保留日志")
+        val options = listOf(
+            language.tr("最近 1 小时", "Last hour", "直近 1 時間"),
+            language.tr("最近 24 小时", "Last 24 hours", "直近 24 時間"),
+            language.tr("全部保留日志", "All retained logs", "保存されているすべてのログ"),
+        )
         val durations = listOf(60 * 60 * 1000L, 24 * 60 * 60 * 1000L, null)
         val previewRange = durations[range]
         val now = System.currentTimeMillis()
@@ -548,28 +747,51 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
         val appContext = context.applicationContext
         AlertDialog(
             onDismissRequest = { if (!exportBusy) { showExport = false; exportOutcome = null } },
-            title = { Text("打包发送") },
+            title = { Text(language.tr("打包发送", "Package and send", "まとめて送信")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     options.forEachIndexed { index, label ->
                         FilterChip(selected = range == index, onClick = { range = index },
                             enabled = !exportBusy, label = { Text(label) })
                     }
-                    Text("故障包包含 Hook 日志 ${hookExport.size} 条、助手日志 ${assistantExport.size} 条，与当前搜索筛选无关。")
-                    Text("预计未压缩约 $estimateLabel；分享前会再次执行字段白名单检查，文件上限 8 MiB。",
+                    Text(
+                        language.tr(
+                            "故障包包含 Hook 日志 ${hookExport.size} 条、助手日志 ${assistantExport.size} 条，与当前搜索筛选无关。",
+                            "The package contains ${hookExport.size} hook entries and ${assistantExport.size} assistant entries; the current search filter does not apply.",
+                            "パッケージには Hook ログ ${hookExport.size} 件、アシストログ ${assistantExport.size} 件が含まれます（現在の検索条件は適用されません）。",
+                        ))
+                    Text(
+                        language.tr(
+                            "预计未压缩约 $estimateLabel；分享前会再次执行字段白名单检查，文件上限 8 MiB。",
+                            "About $estimateLabel before compression; the field allowlist is checked again before sharing, and the file is capped at 8 MiB.",
+                            "非圧縮で約 $estimateLabel。共有前にフィールドの許可リストを再確認し、ファイルは 8 MiB までです。",
+                        ),
                         style = MaterialTheme.typography.bodySmall)
                     if (!shareAvailable) {
-                        Text("当前系统没有可接收 ZIP 的分享目标，将改为保存到系统“下载”目录。",
+                        Text(
+                            language.tr(
+                                "当前系统没有可接收 ZIP 的分享目标，将改为保存到系统“下载”目录。",
+                                "This system has no share target for ZIP files, so the package will be saved to the system Downloads folder instead.",
+                                "ZIP を受け取れる共有先がないため、システムの「ダウンロード」フォルダに保存します。",
+                            ),
                             color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                     }
                     exportError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     exportOutcome?.let { outcome ->
                         Text(
                             when (outcome) {
-                                ExportOutcome.Shared -> "已打开分享面板，请选择要发送的应用。"
-                                is ExportOutcome.Saved ->
-                                    "已保存到“下载”：${outcome.name}。可自行转发给开发者。"
-                                is ExportOutcome.Failed -> "打包或发送失败：${outcome.reason}"
+                                ExportOutcome.Shared -> language.tr(
+                                    "已打开分享面板，请选择要发送的应用。",
+                                    "The share sheet is open; choose the app to send it with.",
+                                    "共有画面を開きました。送信先のアプリを選んでください。")
+                                is ExportOutcome.Saved -> language.tr(
+                                    "已保存到“下载”：${outcome.name}。可自行转发给开发者。",
+                                    "Saved to Downloads: ${outcome.name}. You can forward it to the developer yourself.",
+                                    "「ダウンロード」に保存しました: ${outcome.name}。開発者へご自身で転送できます。")
+                                is ExportOutcome.Failed -> language.tr(
+                                    "打包或发送失败：${localizedKnown(outcome.reason, language)}",
+                                    "Packaging or sending failed: ${localizedKnown(outcome.reason, language)}",
+                                    "パッケージ作成または送信に失敗しました: ${localizedKnown(outcome.reason, language)}")
                             },
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -597,18 +819,31 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
                             throw cancelled
                         } catch (error: Throwable) {
                             val reason = error.message?.take(120) ?: error.javaClass.simpleName
-                            exportError = "打包失败：$reason"
+                            exportError = language.tr(
+                                "打包失败：${localizedKnown(reason, language)}",
+                                "Packaging failed: ${localizedKnown(reason, language)}",
+                                "パッケージ作成に失敗しました: ${localizedKnown(reason, language)}",
+                            )
                             ManagerDiagnostics.append(appContext, "ERROR", "diagnostics",
                                 "故障包生成失败", "EXPORT_FAILED")
                         } finally {
                             exportBusy = false
                         }
                     }
-                }) { Text(if (exportBusy) "正在打包…" else if (shareAvailable) "创建并分享" else "创建并保存") }
+                }) {
+                    Text(
+                        if (exportBusy) language.tr("正在打包…", "Packaging…", "パッケージ作成中…")
+                        else if (shareAvailable) language.tr("创建并分享", "Create and share", "作成して共有")
+                        else language.tr("创建并保存", "Create and save", "作成して保存"),
+                    )
+                }
             },
             dismissButton = {
                 TextButton(enabled = !exportBusy, onClick = { showExport = false; exportOutcome = null }) {
-                    Text(if (exportOutcome == null) "取消" else "关闭")
+                    Text(
+                        if (exportOutcome == null) language.tr("取消", "Cancel", "キャンセル")
+                        else language.tr("关闭", "Close", "閉じる"),
+                    )
                 }
             },
         )
@@ -641,8 +876,11 @@ private suspend fun deliverExport(
     }
     val chooser = prepared.first?.let { intent ->
         runCatching {
+            // The label the share sheet shows; read non-composably, which is why it goes
+            // through the language state directly rather than through managerLanguage().
             appContext.startActivity(
-                Intent.createChooser(intent, "发送故障排查包")
+                Intent.createChooser(intent, ManagerLanguageState.current.tr(
+                    "发送故障排查包", "Send diagnostic package", "診断パッケージを送信"))
                     .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }.isSuccess
@@ -660,7 +898,10 @@ private suspend fun deliverExport(
         report(ExportOutcome.Saved(name))
     } else {
         ManagerDiagnostics.append(appContext, "ERROR", "diagnostics", "无法交付故障包", "EXPORT_INTENT_UNAVAILABLE")
-        report(ExportOutcome.Failed(prepared.second ?: "系统无法打开分享面板，也没能写入下载目录"))
+        report(ExportOutcome.Failed(prepared.second ?: ManagerLanguageState.current.tr(
+            "系统无法打开分享面板，也没能写入下载目录",
+            "The system could not open the share sheet, and the Downloads copy failed too.",
+            "共有画面を開けず、「ダウンロード」への書き込みにも失敗しました。")))
     }
 }
 
@@ -671,9 +912,12 @@ private fun UpdatesScreen(
     onCheck: () -> Unit,
 ) {
     val context = LocalContext.current
+    val language = managerLanguage()
     val configured = BuildConfig.UPDATE_OWNER.isNotBlank() && BuildConfig.UPDATE_REPO.isNotBlank()
     ManagerPage(padding) {
-        Text("更新", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Text(language.tr("更新", "Updates", "更新"),
+            style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        // Shared cards: their own text stays as it is for now (owned by another component).
         GitHubConnectionCard()
         UnlockCatalogCard()
         ManagerCard {
@@ -687,42 +931,75 @@ private fun UpdatesScreen(
             }
             HorizontalDivider()
             if (configured) {
-                Text(updateState.label(), color = MaterialTheme.colorScheme.primary)
+                Text(updateState.label(language), color = MaterialTheme.colorScheme.primary)
                 ManagerButton(
                     enabled = updateState !is UpdateState.Checking,
                     onClick = onCheck,
                 ) {
                     Icon(Icons.Default.SystemUpdate, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text(if (updateState is UpdateState.Checking) "检查中…" else "检查更新")
+                    Text(
+                        if (updateState is UpdateState.Checking) language.tr("检查中…", "Checking…", "確認中…")
+                        else language.tr("检查更新", "Check for updates", "更新を確認"),
+                    )
                 }
                 when (val state = updateState) {
                     is UpdateState.Available -> {
-                        Text("发现新版本 ${state.versionName}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            language.tr("发现新版本 ${state.versionName}",
+                                "New version ${state.versionName} is available",
+                                "新しいバージョン ${state.versionName} があります"),
+                            style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                        )
+                        // Release notes are written on GitHub, in whatever language the author
+                        // used: only the label around them is translated.
                         if (state.notes.isNotBlank()) Text(state.notes.take(500), maxLines = 6)
                         if (state.downloadUrl.isNotBlank()) ApkUpdateActions(
                             ApkRelease(state.versionCode, state.downloadUrl, state.bytes, state.sha256))
-                        ManagerOutlinedButton(onClick = { openUrl(context, state.pageUrl) }) { Text("打开发布页面") }
+                        ManagerOutlinedButton(onClick = { openUrl(context, state.pageUrl) }) {
+                            Text(language.tr("打开发布页面", "Open the release page", "リリースページを開く"))
+                        }
                     }
-                    is UpdateState.Error -> Text(state.message, color = MaterialTheme.colorScheme.error)
+                    // The message explains a check that failed; translated only when the
+                    // manager wrote it itself, otherwise (network errors, HTTP status) verbatim.
+                    is UpdateState.Error -> Text(localizedUpdateFailure(state.message, language),
+                        color = MaterialTheme.colorScheme.error)
                     else -> Unit
                 }
             } else {
-                Text("尚未配置新仓库", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("当前构建没有配置 GitHub Releases 更新源。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(language.tr("尚未配置更新仓库", "No update repository configured",
+                        "更新リポジトリは未設定です"),
+                    style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(language.tr("当前构建没有配置 GitHub Releases 更新源。",
+                        "This build has no GitHub Releases update source configured.",
+                        "このビルドには GitHub Releases の更新元が設定されていません。"),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Text("安装新模块后需重启游戏，才能载入新的 Hook 版本。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(language.tr("安装新模块后需重启游戏，才能载入新的 Hook 版本。",
+                "After installing the new module, restart the game to load the new hook version.",
+                "新しいモジュールをインストールした後、ゲームを再起動すると新しい Hook が読み込まれます。"),
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
-private fun UpdateState.label(): String = when (this) {
-    UpdateState.NotConfigured -> "尚未配置新仓库"
-    UpdateState.Idle -> "更新源已配置，可以检查新版本。"
-    UpdateState.Checking -> "正在检查新仓库…"
-    UpdateState.UpToDate -> "当前已是最新稳定版。"
-    is UpdateState.Available -> "发现可用更新。"
-    is UpdateState.Error -> "检查失败。"
+/**
+ * The one-line summary above the update button. Only the manager's own wording is translated;
+ * [UpdateState.Error.message] is shown elsewhere and is left to [localizedKnown].
+ */
+private fun UpdateState.label(language: ManagerLanguage): String = when (this) {
+    UpdateState.NotConfigured -> language.tr("尚未配置更新仓库", "No update repository configured",
+        "更新リポジトリは未設定です")
+    UpdateState.Idle -> language.tr("更新源已配置，可以检查新版本。",
+        "The update source is configured; you can check for a new version.",
+        "更新元は設定済みです。新しいバージョンを確認できます。")
+    UpdateState.Checking -> language.tr("正在检查新仓库…", "Checking the repository…",
+        "リポジトリを確認中…")
+    UpdateState.UpToDate -> language.tr("当前已是最新稳定版。", "You are on the latest stable version.",
+        "最新の安定版を使用中です。")
+    is UpdateState.Available -> language.tr("发现可用更新。", "An update is available.",
+        "利用可能な更新があります。")
+    is UpdateState.Error -> language.tr("检查失败。", "The check failed.", "確認に失敗しました。")
 }
 
 private fun checkForUpdate(context: Context): UpdateState {
@@ -730,6 +1007,7 @@ private fun checkForUpdate(context: Context): UpdateState {
     val repo = BuildConfig.UPDATE_REPO.trim()
     if (owner.isBlank() || repo.isBlank()) return UpdateState.NotConfigured
     val validPart = Regex("[A-Za-z0-9_.-]+")
+    // Manager-owned Chinese source text; translated at render time by localizedKnown().
     if (!validPart.matches(owner) || !validPart.matches(repo)) return UpdateState.Error("更新源配置无效。")
     val endpoint = "https://api.github.com/repos/$owner/$repo/releases?per_page=100"
     return runCatching {

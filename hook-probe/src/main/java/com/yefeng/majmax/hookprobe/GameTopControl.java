@@ -26,7 +26,9 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import com.yefeng.majmax.hookprobe.helper.InGameLocalizer;
 import com.yefeng.majmax.hookprobe.manager.AssistLaunch;
+import com.yefeng.majmax.hookprobe.manager.ManagerLanguage;
 
 import java.lang.ref.WeakReference;
 import java.util.concurrent.ExecutorService;
@@ -246,6 +248,25 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      */
     private boolean recommendationPanel = true;
 
+    /**
+     * UI language of every label on this surface. Seeded from the manager's own
+     * preference (the first reply corrects it), then moved only by the `uiLanguage`
+     * tag the provider stamps on each status reply.
+     *
+     * A change repaints *all* static copy — tab names, card titles, the header, the
+     * capsule and the status page — not just the values that were already dynamic;
+     * that is what [paintStatic] exists for. Nothing else is rebuilt: no listener is
+     * added here and no view is created, so repeated replies cannot stack anything.
+     */
+    private final InGameLocalizer.State uiLanguage = new InGameLocalizer.State();
+
+    /**
+     * The copy behind the current notice, kept in Chinese. `notice` is what a card
+     * shows (already translated and possibly clipped); the key is never rewritten, so
+     * the failure tests below keep reading the source phrase whatever the language.
+     */
+    private String noticeKey = "";
+
     /* Local, transient start sequence. */
     private boolean starting;
     private long startingAt;
@@ -329,6 +350,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (!(decorView instanceof ViewGroup)) return;
         active = new WeakReference<>(activity);
         decor = decorView;
+        seedLanguage(activity);
         panel = build(activity);
         // Wrap-content child of the decor view: it is only as large as the visible
         // stage, never a full-screen surface, so the game keeps every other touch.
@@ -452,7 +474,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         // The capsule body is drawn above the viewport; only its curved bottom remains.
         handleTab = new TabView(activity,
             GameTopUi.round(activity, 26, 0xDD141E25, 0x553F505C, 1));
-        handleTab.setContentDescription("展开雀魂助手");
+        handleTab.setContentDescription(t("展开雀魂助手"));
         handleTab.setOnClickListener(view -> {
             stage = STAGE_CAPSULE;
             restartIdleTimer();
@@ -469,7 +491,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         capsule.setGravity(Gravity.CENTER);
         capsule.setPadding(dp(activity, 16), 0, dp(activity, 16), 0);
         capsule.setMinHeight(dp(activity, 44));
-        capsule.setContentDescription("打开雀魂助手菜单");
+        capsule.setContentDescription(t("打开雀魂助手菜单"));
+        // One-line pill: translated copy trims inside the same measured box.
+        InGameLocalizer.layout(capsule, 1);
         ripple(capsule, GameTopUi.round(activity, 22, 0xEE1C2732, 0x66536373, 1));
         capsule.setElevation(dp(activity, 4));
         // openMenu() arms the idle window, so the capsule needs no touch listener of its
@@ -485,10 +509,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         menuParams.topMargin = dp(activity, TOP_GAP_DP);
-        menu.setPivotY(0f);
-        menu.setScaleX(.5f);
-        menu.setScaleY(.5f);
-        root.addView(menu, menuParams);
+        // The host occupies the visible scaled size, not the original large rectangle.
+        ScaledMenuHost menuHost = new ScaledMenuHost(activity);
+        menuHost.addView(menu, new FrameLayout.LayoutParams(dp(activity, 500),
+            ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(menuHost, menuParams);
 
         // Outer touch watcher. It only observes: every event is handed straight back to
         // the normal child/click path (return false), so switches, rows and the scroll
@@ -681,6 +706,38 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
+    /** A compact menu with matching visual, layout and touch bounds. */
+    private static final class ScaledMenuHost extends FrameLayout {
+        private static final float SCALE = .75f;
+        ScaledMenuHost(Context context) { super(context); }
+
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            View child = getChildAt(0);
+            int availableWidth = MeasureSpec.getSize(widthSpec);
+            int screenWidth = getResources().getDisplayMetrics().widthPixels;
+            int screenHeight = getResources().getDisplayMetrics().heightPixels;
+            int visualWidth = Math.round(screenWidth * .42f);
+            if (availableWidth > 0) visualWidth = Math.min(visualWidth, availableWidth);
+            int width = Math.round(visualWidth / SCALE);
+            int availableHeight = MeasureSpec.getSize(heightSpec);
+            int visualHeight = Math.round(screenHeight * .60f);
+            if (availableHeight > 0) visualHeight = Math.min(visualHeight, availableHeight);
+            child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(Math.round(visualHeight / SCALE), MeasureSpec.EXACTLY));
+            setMeasuredDimension(Math.round(child.getMeasuredWidth() * SCALE),
+                Math.round(child.getMeasuredHeight() * SCALE));
+        }
+
+        @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+            View child = getChildAt(0);
+            child.setPivotX(0f);
+            child.setPivotY(0f);
+            child.setScaleX(SCALE);
+            child.setScaleY(SCALE);
+            child.layout(0, 0, child.getMeasuredWidth(), child.getMeasuredHeight());
+        }
+    }
+
     /** Top-clipped capsule: visible and touchable bounds use the reference proportions. */
     private static final class TabView extends View {
         private final Drawable background;
@@ -752,7 +809,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         void refreshCap() {
             int available = marginReserve;
             View parent = (View) getParent();
-            if (parent != null && parent.getHeight() > 0) {
+            if (parent != null && parent.getHeight() > 0 && !(parent instanceof ScaledMenuHost)) {
                 available = Math.min(available, parent.getHeight());
             }
             maxHeight = Math.max(0, available);
@@ -765,7 +822,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
                 ? Math.min(MeasureSpec.getSize(heightSpec), maxHeight)
                 : maxHeight;
             if (maxHeight > 0) {
-                heightSpec = MeasureSpec.makeMeasureSpec(limit, MeasureSpec.AT_MOST);
+                heightSpec = MeasureSpec.makeMeasureSpec(limit,
+                    MeasureSpec.getMode(heightSpec) == MeasureSpec.EXACTLY
+                        ? MeasureSpec.EXACTLY : MeasureSpec.AT_MOST);
             }
             super.onMeasure(widthSpec, heightSpec);
             int measured = getMeasuredHeight();
@@ -780,7 +839,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             - GameTopUi.density(activity) * (TOP_GAP_DP + 8));
         LinearLayout panelView = new CappedColumn(activity, maxHeight);
         panelView.setBackground(GameTopUi.panel(activity));
-        panelView.setPadding(dp(activity, 12), dp(activity, 10), dp(activity, 12), dp(activity, 10));
+        panelView.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 18));
         panelView.setElevation(dp(activity, 12));
         // Width is capped so a narrow portrait screen never pushes the panel off-screen;
         // the status page scrolls instead of growing past the window height.
@@ -796,7 +855,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         body.setOrientation(LinearLayout.HORIZONTAL);
         body.setGravity(Gravity.TOP);
         LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         panelView.addView(body, bodyParams);
 
         LinearLayout sidebar = new LinearLayout(activity);
@@ -806,17 +865,21 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         sidebarParams.rightMargin = dp(activity, 10);
         body.addView(sidebar, sidebarParams);
 
-        tabControl = sidebarTab(activity, "控制", () -> selectTab(TAB_CONTROL));
+        tabControl = sidebarTab(activity, t("控制"), () -> selectTab(TAB_CONTROL));
         tabControlLabel = (TextView) tabControl.getChildAt(0);
         sidebar.addView(tabControl);
         sidebar.addView(spacer(activity, 6));
-        tabStatus = sidebarTab(activity, "状态", () -> selectTab(TAB_STATUS));
+        tabStatus = sidebarTab(activity, t("状态"), () -> selectTab(TAB_STATUS));
         tabStatusLabel = (TextView) tabStatus.getChildAt(0);
         sidebar.addView(tabStatus);
 
+        android.widget.ScrollView pageScroll = new android.widget.ScrollView(activity);
+        pageScroll.setFillViewport(true);
+        body.addView(pageScroll, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
         FrameLayout pages = new FrameLayout(activity);
-        body.addView(pages, new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        pageScroll.addView(pages, new android.widget.ScrollView.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         pageControl = buildControlPage(activity);
         pages.addView(pageControl, new FrameLayout.LayoutParams(
@@ -827,7 +890,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         panelView.addView(GameTopUi.divider(activity));
-        collapseRow = actionRow(activity, "收起面板", GameTopUi.INK_MUTED, null);
+        collapseRow = actionRow(activity, t("收起面板"), GameTopUi.INK_MUTED, null);
         collapseRow.setOnClickListener(view -> {
             // A tap on the collapse row is an explicit user request: no idle wait.
             collapse();
@@ -845,8 +908,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         titleDot = GameTopUi.dot(activity, GameTopUi.INK_FAINT);
         header.addView(titleDot);
 
-        title = GameTopUi.text(activity, 13, GameTopUi.INK, true);
-        title.setText("雀魂助手");
+        title = GameTopUi.text(activity, 16, GameTopUi.INK, true);
+        title.setText(t("雀魂助手"));
         header.addView(title, new LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         return header;
@@ -858,8 +921,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         tabView.setGravity(Gravity.CENTER);
         tabView.setPadding(dp(activity, 6), dp(activity, 8), dp(activity, 6), dp(activity, 8));
         tabView.setMinimumHeight(dp(activity, 52));
-        tabView.setContentDescription(label);
-        TextView text = GameTopUi.text(activity, 12, GameTopUi.INK_MUTED, true);
+        TextView text = GameTopUi.text(activity, 15, GameTopUi.INK_MUTED, true);
         text.setText(label);
         text.setGravity(Gravity.CENTER);
         tabView.addView(text);
@@ -885,8 +947,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private LinearLayout buildControlPage(Activity activity) {
         LinearLayout page = vertical(activity);
 
-        unattendedCard = switchCard(activity, page, "无人值守",
-            "助手服务自动分析并出牌",
+        unattendedCard = switchCard(activity, page, t("无人值守"),
+            t("助手服务自动分析并出牌"),
             () -> onToggle());
         unattendedTitle = (TextView) unattendedCard.getTag(TAG_TITLE);
         unattendedState = (TextView) unattendedCard.getTag(TAG_STATE);
@@ -895,8 +957,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
         page.addView(spacer(activity, 6));
 
-        rematchCard = switchCard(activity, page, "自动下一局",
-            "整场牌局结束后自动继续",
+        rematchCard = switchCard(activity, page, t("自动下一局"),
+            t("整场牌局结束后自动继续"),
             () -> onRematchToggle());
         rematchTitle = (TextView) rematchCard.getTag(TAG_TITLE);
         rematchState = (TextView) rematchCard.getTag(TAG_STATE);
@@ -907,8 +969,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
         // Click-through fixed panel content: recommendation / honour points. Its own
         // switch, live via `panelSet`; it never closes any other feature.
-        panelCard = switchCard(activity, page, "推荐与番点",
-            "点击穿透固定面板上的推荐与番点",
+        panelCard = switchCard(activity, page, t("推荐与番点"),
+            t("点击穿透固定面板上的推荐与番点"),
             () -> onPanelToggle());
         panelTitle = (TextView) panelCard.getTag(TAG_TITLE);
         panelState = (TextView) panelCard.getTag(TAG_STATE);
@@ -937,10 +999,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         top.setGravity(Gravity.CENTER_VERTICAL);
 
         LinearLayout labels = vertical(activity);
-        TextView titleView = GameTopUi.text(activity, 13, GameTopUi.INK, true);
+        TextView titleView = GameTopUi.text(activity, 16, GameTopUi.INK, true);
         titleView.setText(titleText);
         labels.addView(titleView);
-        TextView stateView = GameTopUi.text(activity, 11, GameTopUi.INK_FAINT, false);
+        TextView stateView = GameTopUi.text(activity, 14, GameTopUi.INK_FAINT, false);
         stateView.setText(subtitle);
         stateView.setPadding(0, dp(activity, 2), 0, 0);
         labels.addView(stateView);
@@ -955,8 +1017,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         top.addView(toggle, switchParams);
         card.addView(top);
 
-        TextView note = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        TextView note = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
         note.setPadding(0, dp(activity, 6), 0, 0);
+        // Translated copy may be longer than the Chinese source; it wraps inside the
+        // card's existing width instead of widening it (no size or padding is touched).
+        InGameLocalizer.layout(titleView, 2);
+        InGameLocalizer.layout(stateView, 2);
+        InGameLocalizer.layout(note, 3);
         card.addView(note);
 
         // Filled by buildControlPage right after this call; no resource ids involved.
@@ -976,17 +1043,21 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         card.setPadding(dp(activity, 10), dp(activity, 8), dp(activity, 10), dp(activity, 8));
         card.setBackground(GameTopUi.card(activity));
 
-        statusMode = GameTopUi.text(activity, 12, GameTopUi.INK, true);
+        statusMode = GameTopUi.text(activity, 15, GameTopUi.INK, true);
         card.addView(statusMode);
-        statusDetail = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        statusDetail = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
         statusDetail.setPadding(0, dp(activity, 4), 0, 0);
         card.addView(statusDetail);
-        statusService = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        statusService = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
         statusService.setPadding(0, dp(activity, 4), 0, 0);
         card.addView(statusService);
-        statusRematch = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        statusRematch = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
         statusRematch.setPadding(0, dp(activity, 4), 0, 0);
         card.addView(statusRematch);
+        InGameLocalizer.layout(statusMode, 3);
+        InGameLocalizer.layout(statusDetail, 3);
+        InGameLocalizer.layout(statusService, 2);
+        InGameLocalizer.layout(statusRematch, 2);
         page.addView(card);
 
         page.addView(spacer(activity, 8));
@@ -995,10 +1066,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         startStop.setMinHeight(dp(activity, 40));
         ripple(startStop, GameTopUi.round(activity, 12, GameTopUi.ACCENT, 0, 0));
         startStop.setOnClickListener(view -> onToggle());
+        InGameLocalizer.layout(startStop, 2);
         page.addView(startStop, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        manualRow = actionRow(activity, "打开管理应用", GameTopUi.ACCENT, null);
+        manualRow = actionRow(activity, t("打开管理应用"), GameTopUi.ACCENT, null);
         manualRow.setOnClickListener(view -> openManager());
         page.addView(manualRow);
         return page;
@@ -1010,7 +1082,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         row.setGravity(Gravity.CENTER);
         row.setMinimumHeight(dp(activity, 36));
         row.setPadding(dp(activity, 8), dp(activity, 6), dp(activity, 8), dp(activity, 6));
-        TextView text = GameTopUi.text(activity, 12, color, true);
+        TextView text = GameTopUi.text(activity, 15, color, true);
         text.setText(label);
         row.addView(text);
         if (description != null) row.setContentDescription(description);
@@ -1029,6 +1101,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     private void applyState() {
         if (panel == null) return;
+        if (languageStale) {
+            // A switched (or freshly seeded) language: rebuild the views of the current
+            // stage so every label — including the ones only written at build time — is
+            // painted from scratch in the new language. The stage root is reused, so
+            // this neither stacks views nor adds listeners; the geometry is identical.
+            languageStale = false;
+            rebuildStage();
+        }
+        // Repaint every static label first (a language switch has to reach them too);
+        // the dynamic painters below then overwrite the values they own, so one pass is
+        // always consistent. Nothing is added here, so repeated replies cannot stack.
+        paintStatic();
         // The surface only exists in hook mode with a decided gate, so `visible` is false
         // only for the short window before the first answer in this activity.
         boolean visible = inGameVisible();
@@ -1050,7 +1134,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         show(menu, menuShown);
         show(capsule, stage == STAGE_CAPSULE);
         show(handleTab, stage == STAGE_HANDLE);
-        if (stage == STAGE_CAPSULE) setText(capsule, "雀魂助手 · " + shortState() + "  ▸");
+        if (stage == STAGE_CAPSULE) setText(capsule, t("雀魂助手") + " · " + shortState() + "  ▸");
         if (menuShown) {
             paintTab();
             paintSwitches();
@@ -1065,6 +1149,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private static void show(View view, boolean visible) {
         if (view == null) return;
         int wanted = visible ? View.VISIBLE : View.GONE;
+        if (view.getParent() instanceof ScaledMenuHost) {
+            View host = (View) view.getParent();
+            if (host.getVisibility() != wanted) host.setVisibility(wanted);
+        }
         if (view.getVisibility() != wanted) view.setVisibility(wanted);
     }
 
@@ -1101,7 +1189,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     /** Live header: a coloured dot plus the current mode in one short phrase. */
     private void paintSwitches() {
         if (title == null) return;
-        setText(title, "雀魂助手 · " + headerState());
+        setText(title, t("雀魂助手") + " · " + headerState());
         int dotColor = starting ? GameTopUi.INK_FAINT
             : enabled ? GameTopUi.ACCENT
             : available ? 0xFF43B581
@@ -1138,7 +1226,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             rematchSwitch.setOn(rematch, true);
             rematchSwitch.setBusy(actionBusy.get() && !starting);
         }
-        setCardText(rematchCard, TAG_STATE, rematchState, rematch ? "已开启" : "已关闭");
+        setCardText(rematchCard, TAG_STATE, rematchState, rematch ? t("已开启") : t("已关闭"));
         if (rematchState != null) {
             rematchState.setTextColor(rematchActive ? GameTopUi.ACCENT
                 : rematch ? 0xFFC08A1E : GameTopUi.INK_FAINT);
@@ -1157,7 +1245,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             panelSwitch.setBusy(actionBusy.get() && !starting);
         }
         setCardText(panelCard, TAG_STATE, panelState,
-            recommendationPanel ? "已开启" : "已关闭");
+            recommendationPanel ? t("已开启") : t("已关闭"));
         if (panelState != null) {
             panelState.setTextColor(recommendationPanel ? GameTopUi.ACCENT : GameTopUi.INK_FAINT);
         }
@@ -1169,12 +1257,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /** True when the last failed notice came from the unattended path. */
     private boolean noticeRefersToUnattended() {
-        return notice.contains("无人值守") || notice.contains("启动") || notice.contains("管理应用");
+        return noticeKey.contains("无人值守") || noticeKey.contains("启动") || noticeKey.contains("管理应用");
     }
 
     /** True when the last failed notice came from the panel (recommendation) path. */
     private boolean panelNoticeFailed() {
-        return noticeFailed && notice.contains("面板");
+        return noticeFailed && noticeKey.contains("面板");
     }
 
     private void paintStatusPage() {
@@ -1199,99 +1287,103 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         String manualText = manualText();
         if (manualRow != null) {
             show(manualRow, manualText != null);
-            manualRow.setContentDescription(manualText == null ? "打开管理应用" : manualText);
+            manualRow.setContentDescription(manualText == null ? t("打开管理应用") : manualText);
             if (manualRow.getChildCount() > 0 && manualRow.getChildAt(0) instanceof TextView) {
                 TextView label = (TextView) manualRow.getChildAt(0);
-                setText(label, manualText == null ? "打开管理应用" : manualText);
+                setText(label, manualText == null ? t("打开管理应用") : manualText);
                 label.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.ACCENT);
             }
         }
     }
 
     private String headerState() {
-        if (!display.isDecided()) return "读取显示模式";
-        if (starting) return "启动中";
-        if (enabled) return "无人值守开";
-        if (available) return "待机";
-        if (demo) return "自检中";
-        if (unreachable) return "未连接";
-        return "未启动";
+        if (!display.isDecided()) return t("读取显示模式");
+        if (starting) return t("启动中");
+        if (enabled) return t("无人值守开");
+        if (available) return t("待机");
+        if (demo) return t("自检中");
+        if (unreachable) return t("未连接");
+        return t("未启动");
     }
 
     private String unattendedStateText() {
-        if (starting) return "启动中…";
-        if (enabled) return "运行中";
-        if (demo) return "自检中 · 暂不可开";
-        if (!available) return "未启动";
-        return "已关闭";
+        if (starting) return t("启动中…");
+        if (enabled) return t("运行中");
+        if (demo) return t("自检中 · 暂不可开");
+        if (!available) return t("未启动");
+        return t("已关闭");
     }
 
     /**
      * Why an "on" switch is not acting yet, or what a tap will do. Kept short: the
-     * card is narrow and the line must never wrap into the collapse row.
+     * card is narrow, so the line may wrap to a second line inside it but never grows
+     * the card's width.
      */
     private String unattendedNoteText() {
         if (!notice.isEmpty() && noticeRefersToUnattended()) return notice;
-        if (starting) return "正在启动分析与无人值守…";
-        if (enabled) return "点按关闭 · 助手服务继续运行";
-        if (demo) return "模型自检中，结束后可开启";
-        if (!available) return "点按开启，自动拉起管理应用服务";
-        return "点按开启 AI 自动出牌";
+        if (starting) return t("正在启动分析与无人值守…");
+        if (enabled) return t("点按关闭 · 助手服务继续运行");
+        if (demo) return t("模型自检中，结束后可开启");
+        if (!available) return t("点按开启，自动拉起管理应用服务");
+        return t("点按开启 AI 自动出牌");
     }
 
     private String rematchNoteText() {
-        if (demo && rematch) return "自检中不生效";
-        if (rematch && !rematchActive) return "待条件满足";
-        if (rematch) return "仅按下一局原按钮";
-        return "牌局结束后自动继续，与上项独立";
+        if (demo && rematch) return t("自检中不生效");
+        if (rematch && !rematchActive) return t("待条件满足");
+        if (rematch) return t("仅按下一局原按钮");
+        return t("牌局结束后自动继续，与上项独立");
     }
 
     /** Note line of card 3: why it does or does not draw, in one short phrase. */
     private String panelNoteText() {
         if (panelNoticeFailed()) return notice;
-        if (recommendationPanel) return "固定面板显示建议牌与番点 · 不影响其他功能";
-        return "已隐藏建议牌与番点 · 其他功能不受影响";
+        if (recommendationPanel) return t("固定面板显示建议牌与番点 · 不影响其他功能");
+        return t("已隐藏建议牌与番点 · 其他功能不受影响");
     }
 
     private String serviceText() {
-        if (unreachable) return managerMissing ? "管理应用 · 未安装" : "管理应用 · 无响应";
-        if (!available && demo) return "前台服务 · 自检中";
-        if (!available) return "前台服务 · 未运行";
-        return "前台服务 · 运行中" + (remoteMessage.isEmpty() ? "" : " · " + clip(remoteMessage, 14));
+        if (unreachable) return managerMissing ? t("管理应用 · 未安装") : t("管理应用 · 无响应");
+        if (!available && demo) return t("前台服务 · 自检中");
+        if (!available) return t("前台服务 · 未运行");
+        return t("前台服务 · 运行中") + (remoteMessage.isEmpty() ? "" : " · " + clip(remoteMessageText(), 14));
     }
 
     /** One-phrase state for the collapsed capsule. */
     private String shortState() {
-        if (starting) return "启动中";
-        if (enabled) return "无人值守 开";
-        if (available) return "已就绪";
-        if (demo) return "自检中";
-        return "未启动";
+        if (starting) return t("启动中");
+        if (enabled) return t("无人值守 开");
+        if (available) return t("已就绪");
+        if (demo) return t("自检中");
+        return t("未启动");
     }
 
     private String modeText() {
-        if (starting && !available) return "正在启动助手服务…";
-        if (!available && demo) return "模型自检中 · 暂不可开启";
-        if (!available) return "助手未启动";
-        String suffix = remoteMessage.isEmpty() ? "" : " · " + clip(remoteMessage, 16);
-        return enabled ? "无人值守已开启" + suffix : "助手已就绪 · 无人值守关闭" + suffix;
+        if (starting && !available) return t("正在启动助手服务…");
+        if (!available && demo) return t("模型自检中 · 暂不可开启");
+        if (!available) return t("助手未启动");
+        String suffix = remoteMessage.isEmpty() ? "" : " · " + clip(remoteMessageText(), 16);
+        return (enabled ? t("无人值守已开启") : t("助手已就绪 · 无人值守关闭")) + suffix;
     }
 
     /**
      * The overlay error the manager reported, or null. In-game surfaces only exist in hook
      * mode, so this is normally empty here; it is shown when a *different* running assistant
      * instance reported a broken overlay, which is what the user needs to see in that case.
+     *
+     * The reason token itself (`overlayError`) is a diagnostic identifier, not copy, and is
+     * kept verbatim.
      */
     private String overlayErrorText() {
         if (display.getMode() == GameDisplayGate.Mode.OVERLAY) {
-            return displayError.isEmpty() ? "系统悬浮窗模式" : "系统悬浮窗不可用 · " + displayError;
+            return displayError.isEmpty() ? t("系统悬浮窗模式") : t("系统悬浮窗不可用 · ") + displayError;
         }
         return null;
     }
 
     private String toggleText() {
-        if (starting) return "启动中…";
-        return enabled ? "关闭无人值守" : "开启无人值守";
+        if (starting) return t("启动中…");
+        return enabled ? t("关闭无人值守") : t("开启无人值守");
     }
 
     /**
@@ -1299,28 +1391,230 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * facts split over its state and note lines.
      */
     private String rematchText() {
-        String state = rematch ? "开" : "关";
+        String state = rematch ? t("开") : t("关");
         String note;
-        if (demo && rematch) note = "自检中不生效";
-        else if (rematch && !rematchActive) note = "待条件满足";
-        else if (rematch) note = "仅按下一局原按钮";
-        else note = "点按开启";
-        return "自动下一局 · " + state + "（" + note + "）";
+        if (demo && rematch) note = t("自检中不生效");
+        else if (rematch && !rematchActive) note = t("待条件满足");
+        else if (rematch) note = t("仅按下一局原按钮");
+        else note = t("点按开启");
+        return t("自动下一局 · ") + state + "（" + note + "）";
     }
 
     private String detailText() {
         if (!notice.isEmpty()) return notice;
         if (!displayError.isEmpty() && overlayErrorText() != null) return overlayErrorText();
-        if (!available) return "点击开启即自动启动管理应用的前台分析服务";
-        return enabled ? "点击关闭只关闭无人值守，助手服务继续运行" : "开启后按 AI 首选操作，可随时在此关闭";
+        if (!available) return t("点击开启即自动启动管理应用的前台分析服务");
+        return enabled ? t("点击关闭只关闭无人值守，助手服务继续运行") : t("开启后按 AI 首选操作，可随时在此关闭");
     }
 
     /** Label of the hand-off action; null hides the row. */
     private String manualText() {
         if (starting) return null;
-        if (unreachable) return managerMissing ? "未安装管理应用 · 点击打开" : "管理应用无响应 · 点击打开";
-        if (noticeFailed) return "点击打开管理应用";
+        if (unreachable) return managerMissing ? t("未安装管理应用 · 点击打开") : t("管理应用无响应 · 点击打开");
+        if (noticeFailed) return t("点击打开管理应用");
         return null;
+    }
+
+    /**
+     * Replaces the stage root with a freshly built one for the same stage.
+     *
+     * Only the view tree is rebuilt: the stage, tab, language, mode and every value
+     * polled from the manager are carried over, and the new tree is inserted with the
+     * same layout params the old one had. Used when the copy language changes, so no
+     * label can keep a string from the previous language.
+     */
+    private void rebuildStage() {
+        Activity activity = active.get();
+        View decorView = decor;
+        if (panel == null || activity == null || !(decorView instanceof ViewGroup) || panelParams == null) return;
+        ViewGroup parent = (ViewGroup) decorView;
+        if (parent.indexOfChild(panel) < 0) return;
+        int stage = this.stage;
+        int tab = this.tab;
+        // Detach only the old tree; the hint layer is owned by this control and keeps
+        // running against the same decor view.
+        parent.removeView(panel);
+        panel = null;
+        handleTab = null;
+        capsule = null;
+        menu = null;
+        title = null;
+        titleDot = null;
+        tabControl = tabStatus = null;
+        tabControlLabel = tabStatusLabel = null;
+        pageControl = pageStatus = null;
+        unattendedCard = null;
+        unattendedTitle = unattendedState = unattendedNote = null;
+        unattendedSwitch = null;
+        rematchCard = null;
+        rematchTitle = rematchState = rematchNote = null;
+        rematchSwitch = null;
+        panelCard = null;
+        panelTitle = panelState = panelNote = null;
+        panelSwitch = null;
+        statusMode = statusDetail = statusService = statusRematch = null;
+        startStop = null;
+        manualRow = collapseRow = null;
+
+        panel = build(activity);
+        parent.addView(panel, panelParams);
+        this.stage = stage;
+        this.tab = tab;
+        if (hooks == null) {
+            hooks = new SizeWatcher(activity);
+            parent.addOnLayoutChangeListener(hooks);
+        }
+    }
+
+    /* ------------------------------------------------------------------- copy */
+
+    /**
+     * The language was just re-seeded or switched. The next [applyState] rebuilds the
+     * views of the current stage (same stage, same geometry) so every label is painted
+     * from scratch in the new language — including the ones that are only written at
+     * build time. Nothing accumulates: the stage root is reused, not added to.
+     */
+    private boolean languageStale;
+
+    /** The language the surface draws in; never null. */
+    private ManagerLanguage lang() {
+        return uiLanguage.language;
+    }
+
+    /** Translation of a Chinese source string for the current language. */
+    private String t(String zh) {
+        return InGameLocalizer.t(lang(), zh);
+    }
+
+    /**
+     * Seeds the language before the first reply can arrive.
+     *
+     * The menu lives in the game process, so the manager's stored preference is the only
+     * local source; it is a read-only projection used for the very first frame and is
+     * replaced by whatever tag the first status reply carries. A failed read keeps the
+     * current value (Chinese), so a broken preference never shows a half-translated menu.
+     */
+    private void seedLanguage(Context context) {
+        if (!uiLanguage.tag.isEmpty()) return;
+        // The stored *choice*, with "follow the system" resolved against this device, so
+        // the very first frame already matches what the manager page will show.
+        ManagerLanguage stored =
+            InGameLocalizer.currentLanguage(context);
+        // Tag stays empty on purpose: the first reply is authoritative and must be able
+        // to move the copy even if the stored value was stale.
+        uiLanguage.force(stored);
+        notice = InGameLocalizer.t(lang(), noticeKey);
+        languageStale = true;
+    }
+
+    /**
+     * Records a notice in Chinese and paints it in the current language.
+     *
+     * [noticeKey] keeps the untouched source phrase: the failure predicates below and the
+     * card checks read it, so they keep working in every language.
+     */
+    private void setNotice(String zh) {
+        noticeKey = zh == null ? "" : zh;
+        notice = InGameLocalizer.t(lang(), noticeKey);
+    }
+
+    /**
+     * A manager status line: translated only when it is one of the known phrases; an
+     * unknown diagnostic is returned exactly as the manager sent it.
+     */
+    private String remoteMessageText() {
+        return InGameLocalizer.t(lang(), remoteMessage);
+    }
+
+    /**
+     * Repaints every label that is not part of the polled value set: tab names, the
+     * three card titles, the collapse row and the hand-off row.
+     *
+     * Called from [applyState] on every pass, so a language switch reaches the *static*
+     * labels too and not only the values that were already dynamic. Nothing here adds a
+     * listener or a view, which is what keeps repeated replies from stacking anything.
+     */
+    private void paintStatic() {
+        if (tabControlLabel != null && !TextUtils.equals(tabControlLabel.getText(), t("控制"))) {
+            setText(tabControlLabel, t("控制"));
+        }
+        if (tabStatusLabel != null && !TextUtils.equals(tabStatusLabel.getText(), t("状态"))) {
+            setText(tabStatusLabel, t("状态"));
+        }
+        if (tabControl != null) setDescription(tabControl, t("控制"));
+        if (tabStatus != null) setDescription(tabStatus, t("状态"));
+        InGameLocalizer.layout(tabControlLabel, 1);
+        InGameLocalizer.layout(tabStatusLabel, 1);
+
+        setStaticCard(unattendedCard, "无人值守", "助手服务自动分析并出牌", true);
+        setStaticCard(rematchCard, "自动下一局", "整场牌局结束后自动继续", false);
+        setStaticCard(panelCard, "推荐与番点", "点击穿透固定面板上的推荐与番点", false);
+
+        paintActionRow(collapseRow, "收起面板");
+        // The hand-off row only names its static label while it has no live label of its
+        // own; [paintActions] owns it otherwise.
+        if (manualRow == null || manualText() == null) paintActionRow(manualRow, "打开管理应用");
+
+        InGameLocalizer.layout(title, 1);
+        InGameLocalizer.layout(capsule, 1);
+        InGameLocalizer.layout(unattendedNote, 3);
+        InGameLocalizer.layout(rematchNote, 3);
+        InGameLocalizer.layout(panelNote, 3);
+        InGameLocalizer.layout(statusMode, 3);
+        InGameLocalizer.layout(statusDetail, 3);
+        InGameLocalizer.layout(statusService, 2);
+        InGameLocalizer.layout(statusRematch, 2);
+        InGameLocalizer.layout(startStop, 2);
+    }
+
+    /**
+     * Card title (plus its accessibility label) and, while the card still shows its
+     * static subtitle, that subtitle.
+     *
+     * [unattended] is the only card that painted a static subtitle at build time; the
+     * other two were built with their state line already live, so repainting it here
+     * would race their painters.
+     */
+    private void setStaticCard(View card, String titleZh, String subtitleZh, boolean staticSubtitle) {
+        if (card == null) return;
+        TextView titleView = card.getTag(TAG_TITLE) instanceof TextView
+            ? (TextView) card.getTag(TAG_TITLE) : null;
+        TextView stateView = card.getTag(TAG_STATE) instanceof TextView
+            ? (TextView) card.getTag(TAG_STATE) : null;
+        TextView noteView = card.getTag(TAG_NOTE) instanceof TextView
+            ? (TextView) card.getTag(TAG_NOTE) : null;
+        setText(titleView, t(titleZh));
+        if (staticSubtitle && stateView != null && isStaticSubtitle(stateView, subtitleZh)) {
+            setText(stateView, t(subtitleZh));
+        }
+        setDescription(card, t(titleZh));
+        View toggle = card.getTag(TAG_SWITCH) instanceof View ? (View) card.getTag(TAG_SWITCH) : null;
+        if (toggle != null) setDescription(toggle, t(titleZh) + t("开关"));
+        InGameLocalizer.layout(titleView, 2);
+        InGameLocalizer.layout(stateView, 2);
+        InGameLocalizer.layout(noteView, 3);
+    }
+
+    /** True while the state line still shows its card's static subtitle. */
+    private boolean isStaticSubtitle(TextView stateView, String subtitleZh) {
+        CharSequence current = stateView.getText();
+        return TextUtils.equals(current, subtitleZh) || TextUtils.equals(current, t(subtitleZh));
+    }
+
+    private void paintActionRow(LinearLayout row, String labelZh) {
+        if (row == null) return;
+        String label = t(labelZh);
+        setDescription(row, label);
+        if (row.getChildCount() > 0 && row.getChildAt(0) instanceof TextView) {
+            TextView text = (TextView) row.getChildAt(0);
+            setText(text, label);
+            InGameLocalizer.layout(text, 2);
+        }
+    }
+
+    private static void setDescription(View view, String text) {
+        if (view == null) return;
+        if (!TextUtils.equals(view.getContentDescription(), text)) view.setContentDescription(text);
     }
 
     private static String clip(String text, int limit) {
@@ -1340,7 +1634,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (!actionBusy.compareAndSet(false, true)) return;
         starting = true;
         startingAt = SystemClock.elapsedRealtime();
-        notice = "正在启动分析与无人值守…";
+        setNotice("正在启动分析与无人值守…");
         noticeFailed = false;
         applyState();
         call("assistLaunch", null, REQUEST_TIMEOUT_MS, reply -> {
@@ -1353,25 +1647,25 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
                 noticeFailed = true;
                 unreachable = true;
                 managerMissing = reply != null && !reply.getBoolean("installed", true);
-                notice = managerMissing ? "未找到管理应用 · 请先安装" : "管理应用无响应 · 点击重试";
+                setNotice(managerMissing ? "未找到管理应用 · 请先安装" : "管理应用无响应 · 点击重试");
             } else {
                 applyReply(reply);
                 if (AssistLaunch.RUNNING.equals(state) || AssistLaunch.STARTED.equals(state)) {
-                    notice = "已请求启动 · 等待服务就绪";
+                    setNotice("已请求启动 · 等待服务就绪");
                 } else if (AssistLaunch.RESTRICTED.equals(state) || AssistLaunch.FORBIDDEN.equals(state)) {
                     String token = reply.getString("token");
                     if (launchTrampoline(token)) {
-                        notice = "正在通过管理应用完成启动…";
+                        setNotice("正在通过管理应用完成启动…");
                     } else {
                         starting = false;
                         noticeFailed = true;
-                        notice = "无法打开管理应用 · 请手动开启助手";
+                        setNotice("无法打开管理应用 · 请手动开启助手");
                     }
                 } else {
                     starting = false;
                     noticeFailed = true;
-                    notice = AssistLaunch.UNAVAILABLE.equals(state)
-                        ? "无法启动前台服务 · 点击重试" : "启动中断 · 点击重试";
+                    setNotice(AssistLaunch.UNAVAILABLE.equals(state)
+                        ? "无法启动前台服务 · 点击重试" : "启动中断 · 点击重试");
                 }
             }
             applyState();
@@ -1389,7 +1683,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private void onRematchToggle() {
         if (!actionBusy.compareAndSet(false, true)) return;
         boolean wanted = !rematch;
-        notice = wanted ? "正在开启整场后续局…" : "正在关闭整场后续局…";
+        setNotice(wanted ? "正在开启整场后续局…" : "正在关闭整场后续局…");
         noticeFailed = false;
         applyState();
         Bundle args = new Bundle();
@@ -1398,14 +1692,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             actionBusy.set(false);
             if (reply == null) {
                 noticeFailed = true;
-                notice = "管理应用无响应 · 设置可能未保存";
+                setNotice("管理应用无响应 · 设置可能未保存");
             } else {
                 applyReply(reply);
                 // The reply carries the stored value, so a write that did not stick is
                 // reported instead of leaving the row claiming the new state.
                 noticeFailed = rematch != wanted;
-                notice = rematch != wanted ? "设置未保存 · 当前" + (rematch ? "开" : "关")
-                    : wanted ? "整场后续局已开启" : "整场后续局已关闭 · 无人值守未变";
+                setNotice(rematch != wanted ? "设置未保存 · 当前" + (rematch ? "开" : "关")
+                    : wanted ? "整场后续局已开启" : "整场后续局已关闭 · 无人值守未变");
             }
             applyState();
             schedulePoll(POLL_MENU_MS);
@@ -1421,7 +1715,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private void onPanelToggle() {
         if (!actionBusy.compareAndSet(false, true)) return;
         boolean wanted = !recommendationPanel;
-        notice = wanted ? "正在显示推荐与番点面板…" : "正在隐藏推荐与番点面板…";
+        setNotice(wanted ? "正在显示推荐与番点面板…" : "正在隐藏推荐与番点面板…");
         noticeFailed = false;
         applyState();
         Bundle args = new Bundle();
@@ -1430,13 +1724,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             actionBusy.set(false);
             if (reply == null) {
                 noticeFailed = true;
-                notice = "管理应用无响应 · 面板设置可能未保存";
+                setNotice("管理应用无响应 · 面板设置可能未保存");
             } else {
                 applyReply(reply);
                 noticeFailed = recommendationPanel != wanted;
-                notice = recommendationPanel != wanted
+                setNotice(recommendationPanel != wanted
                     ? "面板设置未保存 · 当前" + (recommendationPanel ? "开" : "关")
-                    : wanted ? "推荐与番点面板已开启" : "推荐与番点面板已关闭 · 其他功能未变";
+                    : wanted ? "推荐与番点面板已开启" : "推荐与番点面板已关闭 · 其他功能未变");
             }
             applyState();
             schedulePoll(POLL_MENU_MS);
@@ -1445,7 +1739,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     private void disable() {
         if (!actionBusy.compareAndSet(false, true)) return;
-        notice = "正在关闭无人值守…";
+        setNotice("正在关闭无人值守…");
         noticeFailed = false;
         starting = false;
         applyState();
@@ -1455,11 +1749,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             actionBusy.set(false);
             if (reply == null) {
                 noticeFailed = true;
-                notice = "管理应用无响应 · 模式可能仍在开启";
+                setNotice("管理应用无响应 · 模式可能仍在开启");
             } else {
                 applyReply(reply);
                 noticeFailed = enabled;
-                notice = enabled ? "未能关闭无人值守 · 点击重试" : "已关闭无人值守 · 助手服务保持运行";
+                setNotice(enabled ? "未能关闭无人值守 · 点击重试" : "已关闭无人值守 · 助手服务保持运行");
             }
             applyState();
             schedulePoll(POLL_MENU_MS);
@@ -1493,7 +1787,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (activity == null) return;
         Intent intent = activity.getPackageManager().getLaunchIntentForPackage(MANAGER);
         if (intent == null) {
-            notice = "未安装管理应用";
+            setNotice("未安装管理应用");
             noticeFailed = true;
             managerMissing = true;
             applyState();
@@ -1519,7 +1813,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (starting && SystemClock.elapsedRealtime() - startingAt > START_TIMEOUT_MS) {
             starting = false;
             noticeFailed = true;
-            notice = "启动超时 · 点击重试";
+            setNotice("启动超时 · 点击重试");
             applyState();
         }
         if (!actionBusy.get() && pollBusy.compareAndSet(false, true)) {
@@ -1540,7 +1834,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
                     applyReply(reply);
                     if (starting && available && enabled) {
                         starting = false;
-                        notice = "";
+                        setNotice("");
                         noticeFailed = false;
                     }
                 }
@@ -1565,6 +1859,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * still recognised, and `overlayError` is kept for the status page.
      */
     private void applyReply(Bundle reply) {
+        // The language travels with the reply. Adopt it before the values are painted,
+        // so this same reply is already drawn in the new language; a reply without the
+        // key (older manager, partial reply) leaves the current one untouched.
+        boolean languageChanged = uiLanguage.apply(reply.getString("uiLanguage"));
+        if (languageChanged) {
+            notice = t(noticeKey);
+            languageStale = true;
+        }
         available = reply.getBoolean("available");
         enabled = reply.getBoolean("enabled");
         demo = reply.getBoolean("demo");

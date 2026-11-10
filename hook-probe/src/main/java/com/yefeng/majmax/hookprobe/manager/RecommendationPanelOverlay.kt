@@ -1,6 +1,7 @@
 package com.yefeng.majmax.hookprobe.manager
 
 import android.content.Context
+import android.text.TextUtils
 import android.view.View
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -11,11 +12,30 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.yefeng.majmax.hookprobe.helper.GameMenuText
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 
-/** Fixed read-only HUD. The game host and system window both pass every touch through. */
+/**
+ * Fixed read-only HUD. The game host and system window both pass every touch through.
+ *
+ * Text follows the manager's UI language and only the *rendered* strings are translated.
+ * Where that language comes from depends on which of the two surfaces this is:
+ *
+ *  - **In the game** ([host] != null) the host stamps a tag from the hint snapshot
+ *    ([setLanguageTag]). That tag is authoritative for this run: the process is the game
+ *    process, whose stored preference is not the manager's live one, so it is never
+ *    overridden by a local preference read.
+ *  - **As a system overlay** ([host] == null) this lives in the manager process, which the
+ *    service never feeds a tag to. The stored choice *is* the authority there, so
+ *    [update] re-reads it on every repaint and a switch made on the manager page reaches an
+ *    already-open window without a rebuild or a second timer.
+ *
+ * The machine values the panel is built from ([dataFor], [displayLines]) are unchanged, and
+ * so are the position, width and font sizes; a longer translation wraps inside the same box
+ * instead of resizing it.
+ */
 internal class RecommendationPanelOverlay(private val context: Context, private val host: ViewGroup? = null) {
     private val windows = context.getSystemService(WindowManager::class.java)
     private var root: FrameLayout? = null
@@ -24,16 +44,93 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
     private var renderedWidth = 0
     private var renderedHeight = 0
 
+    /**
+     * Language the text is currently drawn in. Seeded once from the manager preference, then
+     * moved by an arriving tag (game) or by the re-read preference (overlay). An empty tag is
+     * "no news", not "back to Chinese".
+     */
+    private var language: ManagerLanguage = ManagerLanguage.SIMPLIFIED
+    private var languageSeeded = false
+
+    /**
+     * True once a tag arrived from the host. From then on this panel is fed by the game and
+     * must not re-derive the language locally: the game process' preferences are not the
+     * manager's live selection, so a local read could silently undo the received tag.
+     */
+    private var hostTagSeen = false
+
+    /**
+     * Called with the `uiLanguage` tag of the latest reply / hint snapshot.
+     *
+     * `host = true` marks the tag as coming from the game process (the hint snapshot),
+     * which then owns the copy for the rest of the run. The default is the service telling
+     * this panel about the manager's language, which must never lock out the host.
+     */
+    @JvmOverloads
+    fun setLanguageTag(tag: String?, host: Boolean = false) {
+        val current = if (languageSeeded) language else seedLanguage()
+        val next = GameMenuText.languageOf(tag, current)
+        if (host && !tag.isNullOrBlank()) hostTagSeen = true
+        if (next == language && languageSeeded) return
+        language = next
+        languageSeeded = true
+        val shown = lastResult ?: return
+        // Only redraw an already visible panel; a hidden one is redrawn by its next update.
+        if (root?.visibility == View.VISIBLE) update(shown, true)
+    }
+
+    /**
+     * Re-reads the manager's stored language for the *system overlay* case.
+     *
+     * Does nothing for the in-game panel (a host exists, or a host tag already arrived):
+     * there the tag from the game owns the copy. A changed language repaints the panel that
+     * is already on screen through the normal [update] path, so the repaint also happens
+     * when the recommendation itself is unchanged.
+     */
+    private fun refreshOverlayLanguage() {
+        if (host != null || hostTagSeen) return
+        val next = runCatching {
+            val choice: ManagerLanguageChoice = ManagerLanguageSettings.readChoice(context)
+            choice.effective(ManagerSystemLanguage.current())
+        }.getOrNull() ?: return
+        if (next == language && languageSeeded) return
+        language = next
+        languageSeeded = true
+        val shown = lastResult ?: return
+        // A window removed by a rotation/resize has no parent: the next activity update
+        // repaints it anyway, so there is nothing to redraw here.
+        if (root?.visibility == View.VISIBLE && root?.parent != null) update(shown, true)
+    }
+
+    private fun seedLanguage(): ManagerLanguage = runCatching {
+        // The stored choice, with "follow the system" resolved here: this overlay is
+        // created in the manager process but the hint snapshot corrects it on the very
+        // first tick, so the seed only prevents a Chinese flash.
+        val choice: ManagerLanguageChoice = ManagerLanguageSettings.readChoice(context)
+        choice.effective(ManagerSystemLanguage.current())
+    }.getOrDefault(ManagerLanguage.SIMPLIFIED)
+        .also { language = it; languageSeeded = true }
+
+    private fun ensureLanguage() {
+        if (!languageSeeded) seedLanguage()
+    }
+
     fun update(result: JSONObject?, enabled: Boolean) {
+        // The system overlay is never handed a tag, so it follows the stored preference
+        // here; the in-game panel keeps whatever the host told it.
+        refreshOverlayLanguage()
+        ensureLanguage()
         val active = result?.optString("status") in listOf("live", "demo")
         if (!enabled || !active) { root?.visibility = View.INVISIBLE; return }
         val value = result ?: return
         lastResult = value
         val data = value.optJSONObject("recommendationPanel") ?: dataFor(value)
-        val lines = displayLines(data)
+        val lines = displayLines(data, language)
         val targetWidth = root?.width?.takeIf { it > 0 } ?: host?.width?.takeIf { it > 0 } ?: context.resources.displayMetrics.widthPixels
         val targetHeight = root?.height?.takeIf { it > 0 } ?: host?.height?.takeIf { it > 0 } ?: context.resources.displayMetrics.heightPixels
-        val next = "${targetWidth}x${targetHeight}:$lines"
+        // The language is part of the signature: a switch re-renders even when the
+        // recommendation itself is byte-identical.
+        val next = "${targetWidth}x${targetHeight}:${language.name}:$lines"
         root?.visibility = View.VISIBLE
         if (next == signature && root != null) return
         signature = next
@@ -75,6 +172,10 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
             if (view.text.toString() != line.text) view.text = line.text
             val size = if (line.small) font * .77f else font
             if (view.textSize != size * context.resources.displayMetrics.scaledDensity) view.textSize = size
+            // A translated line is longer than its Chinese source; it wraps inside the
+            // same measured box instead of widening the panel or shrinking the font.
+            if (view.maxLines != WRAP_LINES) view.maxLines = WRAP_LINES
+            if (view.ellipsize != null) view.ellipsize = null
             view.setTextColor(if (line.gold) 0xFFFFC14D.toInt() else 0xFF78C8FF.toInt())
             view.typeface = Typeface.create(Typeface.DEFAULT, if (line.gold) Typeface.BOLD else Typeface.NORMAL)
             view.setPadding(0, (3 * scale).toInt(), 0, (3 * scale).toInt())
@@ -146,32 +247,96 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
 
     companion object {
         internal data class DisplayLine(val text: String, val gold: Boolean, val small: Boolean)
-        internal fun displayLines(data: JSONObject): List<DisplayLine> {
+
+        /** Lines wrap rather than clip once a translation is longer than the source. */
+        private const val WRAP_LINES = 2
+
+        /**
+         * Lines for the panel in the manager's current UI language (default Chinese).
+         *
+         * Kept as the single entry point for callers that do not track a language; the
+         * overload below is the one the live panel uses.
+         */
+        internal fun displayLines(data: JSONObject): List<DisplayLine> = displayLines(data, null)
+
+        /**
+         * Same rows, same order, same flags; only the rendered strings change. The
+         * numbers, tile codes and the decision itself are never translated — a tile
+         * score fragment is re-rendered by [GameMenuText] from the very same values.
+         *
+         * `null` or Chinese returns the original copy byte for byte.
+         */
+        internal fun displayLines(data: JSONObject, language: ManagerLanguage?): List<DisplayLine> {
+            val lang = language ?: ManagerLanguage.SIMPLIFIED
+            val zh = lang == ManagerLanguage.SIMPLIFIED
+            fun t(text: String): String = if (zh) text else GameMenuText.text(text, lang)
+            fun face(tile: String): String = if (zh) tileName(tile) else GameMenuText.tileName(tile, lang)
             val lines = mutableListOf<DisplayLine>()
             fun line(text: String, gold: Boolean = false, small: Boolean = false) {
-                lines.add(DisplayLine(text, gold, small))
+                lines.add(DisplayLine(t(text), gold, small))
             }
             line("推荐切牌 · 决策概率", true)
             val rows = data.optJSONArray("rows") ?: JSONArray()
             for (i in 0 until rows.length()) {
                 val row = rows.getJSONObject(i)
                 val probability = row.optDouble("probabilityPercent", Double.NaN)
-                line("切${tileName(row.optString("tile"))}    ${if (probability.isFinite()) String.format(Locale.ROOT, "%.1f%%", probability) else "—"}", i == 0)
+                val percent = if (probability.isFinite()) String.format(Locale.ROOT, "%.1f%%", probability) else "—"
+                val cut = if (zh) "切" else when (lang) {
+                    ManagerLanguage.ENGLISH -> "Discard "
+                    ManagerLanguage.JAPANESE -> "打 "
+                    ManagerLanguage.SIMPLIFIED -> "切"
+                }
+                line("$cut${face(row.optString("tile"))}    $percent", i == 0)
             }
             val scores = data.optJSONArray("scores") ?: JSONArray()
             if (rows.length() == 0 && scores.length() == 0) line("等待出牌机会", small = true)
             if (scores.length() > 0) {
-                line(data.optString("scoreLabel", "和牌番点"), true, true)
+                val label = data.optString("scoreLabel", "和牌番点")
+                line(if (zh) label else scoreLabel(label, lang), true, true)
                 for (i in 0 until scores.length()) {
                     val score = scores.getJSONObject(i)
-                    line("和${tileName(score.optString("tile"))}", true, true)
-                    fun scoreText(key: String): String {
-                        val v = score.optJSONObject(key) ?: return "无役"
-                        return "${if (v.optBoolean("yakuman")) "役满" else "${v.optInt("han")}番${v.optInt("fu")}符"} ${v.optInt("points")}点"
+                    val win = face(score.optString("tile"))
+                    val won = if (zh) "和$win" else when (lang) {
+                        ManagerLanguage.ENGLISH -> "Win $win"
+                        ManagerLanguage.JAPANESE -> "和了 $win"
+                        ManagerLanguage.SIMPLIFIED -> "和$win"
                     }
-                    line("荣和 ${scoreText("ron")} / 自摸 ${scoreText("tsumo")}", small = true)
+                    line(won, true, true)
+                    fun scoreText(key: String): String {
+                        val v = score.optJSONObject(key)
+                        if (v == null) return if (zh) "无役" else t("无役")
+                        return if (zh) {
+                            "${if (v.optBoolean("yakuman")) "役满" else "${v.optInt("han")}番${v.optInt("fu")}符"} ${v.optInt("points")}点"
+                        } else {
+                            scoreValue(v, lang)
+                        }
+                    }
+                    // The separator differs per language ("/" is a fraction bar in
+                    // English), so translated lines are composed per language; the
+                    // Chinese line keeps its exact original shape.
+                    val ron = scoreText("ron")
+                    val tsumo = scoreText("tsumo")
+                    if (zh) {
+                        line("荣和 $ron / 自摸 $tsumo", small = true)
+                    } else {
+                        when (lang) {
+                            ManagerLanguage.ENGLISH -> line("Ron $ron · Tsumo $tsumo", small = true)
+                            ManagerLanguage.JAPANESE -> line("ロン $ron · ツモ $tsumo", small = true)
+                            ManagerLanguage.SIMPLIFIED -> {}
+                        }
+                    }
                     if (score.optJSONObject("riichi_ron") != null || score.optJSONObject("riichi_tsumo") != null) {
-                        line("立直 荣${scoreText("riichi_ron")} / 摸${scoreText("riichi_tsumo")}", small = true)
+                        val ronR = scoreText("riichi_ron")
+                        val tsumoR = scoreText("riichi_tsumo")
+                        if (zh) {
+                            line("立直 荣$ronR / 摸$tsumoR", small = true)
+                        } else {
+                            when (lang) {
+                                ManagerLanguage.ENGLISH -> line("Riichi · ron $ronR · tsumo $tsumoR", small = true)
+                                ManagerLanguage.JAPANESE -> line("リーチ ロン$ronR · ツモ$tsumoR", small = true)
+                                ManagerLanguage.SIMPLIFIED -> {}
+                            }
+                        }
                     }
                 }
                 line("基础估算；不含里宝/一发/本场/供托/和牌赤5", small = true)
@@ -181,6 +346,41 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                 line(if (shanten > 0) "${shanten}向听 · 听牌后显示番点" else if (shanten == 0) "已听牌 · 暂无可用番点" else "等待手牌分析", small = true)
             }
             return lines
+        }
+
+        /** One score object as a phrase ("2番30符 2000点" / "2 han 30 fu, 2000 pts"). */
+        private fun scoreValue(v: JSONObject, language: ManagerLanguage): String {
+            val points = v.optInt("points")
+            return if (v.optBoolean("yakuman")) {
+                when (language) {
+                    ManagerLanguage.ENGLISH -> "yakuman $points pts"
+                    ManagerLanguage.JAPANESE -> "役満 ${points}点"
+                    ManagerLanguage.SIMPLIFIED -> "役满 ${points}点"
+                }
+            } else {
+                val han = v.optInt("han")
+                val fu = v.optInt("fu")
+                when (language) {
+                    ManagerLanguage.ENGLISH -> "$han han $fu fu, $points pts"
+                    ManagerLanguage.JAPANESE -> "${han}翻 ${fu}符 ${points}点"
+                    ManagerLanguage.SIMPLIFIED -> "${han}番${fu}符 ${points}点"
+                }
+            }
+        }
+
+        /**
+         * The stored `scoreLabel` ("当前听牌番点" plus a furiten suffix) re-rendered in
+         * [language]. Only the two shapes [dataFor] can produce are translated; anything
+         * else is returned as stored.
+         */
+        private fun scoreLabel(label: String, language: ManagerLanguage): String {
+            if (label == "和牌番点" || label == "当前听牌番点") return GameMenuText.text(label, language)
+            val furitenSuffix = "（振听不可荣和）"
+            if (label.endsWith(furitenSuffix)) {
+                val base = label.removeSuffix(furitenSuffix)
+                return GameMenuText.text(base, language) + GameMenuText.text(furitenSuffix, language)
+            }
+            return label
         }
 
         fun dataFor(result: JSONObject): JSONObject {

@@ -19,6 +19,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import com.yefeng.majmax.hookprobe.helper.GameMenuText
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -93,6 +94,27 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     /** Title-bar drag bookkeeping, shared by the grab handle and the capsule tabs. */
     private var dragging = false
 
+    /**
+     * UI language every label of this window is drawn in.
+     *
+     * Seeded from the manager preference (this window lives in the manager process, so the
+     * stored choice is authoritative) and refreshed by [refreshLanguage], which the service
+     * calls from the tick it already runs. No timer, listener or extra view is created: a
+     * change re-applies the copy to the views that already exist, through the same
+     * render/apply paths every other repaint uses.
+     */
+    private var language: ManagerLanguage = runCatching {
+        // Seeded from the stored choice (this window lives in the manager process, so the
+        // preference is authoritative); the service tick re-checks it in [refreshLanguage].
+        ManagerLanguageSettings.readChoice(context).effective(ManagerSystemLanguage.current())
+    }.getOrDefault(ManagerLanguage.SIMPLIFIED)
+
+    /** Name under which each slider caption was created, so a switch can re-label it. */
+    private var opacitySliderName = "背景不透明度"
+    private var widthSliderName = "窗口宽度"
+    private var opacityCaptionText: String? = null
+    private var widthCaptionText: String? = null
+
     private val layout = WindowManager.LayoutParams(
         dp(width), WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -128,6 +150,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         settingsPane = null
         opacityCaption = null
         widthCaption = null
+        opacityCaptionText = null
+        widthCaptionText = null
         autoSwitch = null
         autoName = null
         autoState = null
@@ -146,9 +170,17 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     fun configurationChanged() { rebuild() }
 
     fun updateAuto(value: AutoDiscardStatus) {
-        if (auto == value) return
+        if (auto == value) {
+            // The tick also carries the language check: an unchanged status still has to
+            // follow a switch made on the manager page. One repaint, no extra timer.
+            refreshLanguage()
+            return
+        }
         auto = value
-        renderState()
+        // Language first: a switch made on the manager page has to reach the copy of
+        // this very repaint, not the next one.
+        val switched = refreshLanguage()
+        if (!switched) renderState()
     }
 
     /**
@@ -159,10 +191,69 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * directly, which does not notify the listener.
      */
     fun updateRematch(value: RematchState) {
+        refreshLanguage()
+        // The panel card is read back from the single preference; this also re-labels
+        // it in the current language. `applyPanel` skips an unchanged value, so the
+        // caption is refreshed explicitly for a language switch.
         applyPanel(RecommendationPanelSettings.read(context))
         if (rematchState == value) return
         rematchState = value
         applyRematch()
+    }
+
+    // ---- language ------------------------------------------------------------
+
+    /** The language the manager page currently shows, resolved from the stored choice. */
+    private fun currentLanguage(): ManagerLanguage = runCatching {
+        ManagerLanguageSettings.readChoice(context).effective(ManagerSystemLanguage.current())
+    }.getOrDefault(ManagerLanguage.SIMPLIFIED)
+
+    private fun t(zh: String): String = GameMenuText.text(zh, language)
+
+    /**
+     * Adopts the manager's language and repaints the views that already exist.
+     *
+     * Driven by the service tick so the open window follows a switch without a restart,
+     * and without a second timer. A collapsed window only has the bubble and the header
+     * captions, which [renderHeader] already refreshes; an open one is re-rendered
+     * through [renderHeader] + the active pane, both of which are idempotent and never
+     * fire a callback, so the 200 ms tick cannot toggle anything.
+     *
+     * Returns true when the language actually changed.
+     */
+    fun refreshLanguage(): Boolean {
+        val next = currentLanguage()
+        if (next == language) return false
+        language = next
+        // Make the value-gated appliers write again: their text is copy too.
+        appliedPanelEnabled = null
+        renderHeader()
+        if (root != null && !collapsed) showTab()
+        // The auto-rematch detail is written by its own applier; force one pass.
+        if (rematchDetail != null || rematchStateLabel != null) applyRematch()
+        if (root == null) return true
+        // The settings captions carry a value ("窗口宽度 · 300 dp"), so they are redrawn
+        // from the stored number rather than merely re-labelled.
+        paintSliderCaptions()
+        return true
+    }
+
+    /**
+     * Redraws the slider captions in the current language. The value comes from the same
+     * source the slider was created with, so nothing is recomputed or re-saved here.
+     */
+    private fun paintSliderCaptions() {
+        opacityCaption?.let { caption -> caption.text = sliderLabel(opacitySliderName, opacityCaptionText) }
+        widthCaption?.let { caption -> caption.text = sliderLabel(widthSliderName, widthCaptionText) }
+    }
+
+    /** "<name> · <suffix>", where the suffix is whatever the slider last rendered. */
+    private fun sliderLabel(nameZh: String, suffix: String?): String {
+        val raw = suffix ?: return t(nameZh)
+        // The suffix is "78%" or "300 dp": the numeric part is language neutral.
+        val cut = raw.lastIndexOf(" · ")
+        val value = if (cut >= 0) raw.substring(cut) else ""
+        return t(nameZh) + value
     }
 
     // ---- shared helpers ------------------------------------------------------
@@ -172,22 +263,22 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private fun isDemo() = result.optString("status") == "demo"
     private fun statusIsGame() = result.optString("status") == "live" || isDemo()
 
-    private fun caption() = when {
+    private fun caption() = t(when {
         statusIsGame() && isDemo() -> "本地自检 · 样例"
         statusIsGame() -> "雀魂 · 本地 AI"
         else -> "雀魂 · 本地助手"
-    }
+    })
 
-    private fun subCaption() = when {
+    private fun subCaption() = t(when {
         auto.enabled && isDemo() -> "自检中，不会操作游戏"
         auto.enabled -> "无人值守运行中"
         statusIsGame() && isDemo() -> "样例数据，仅供自检"
         statusIsGame() -> "对局已同步，等待操作"
         else -> "等待牌局连接"
-    }
+    })
 
-    private fun autoSummary() = if (auto.enabled) "开" else "关"
-    private fun rematchSummary() = if (!rematchState.enabled) "关" else if (rematchState.active) "开" else "待开启"
+    private fun autoSummary() = t(if (auto.enabled) "开" else "关")
+    private fun rematchSummary() = t(if (!rematchState.enabled) "关" else if (rematchState.active) "开" else "待开启")
 
     private fun switchOn(checked: Boolean, description: String) = Switch(context).apply {
         this.isChecked = checked
@@ -256,7 +347,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             isClickable = true
             isFocusable = true
         }
-        val caption = style.text("雀", 15f,
+        val caption = style.text(t("雀"), 15f,
             if (auto.enabled) 0xFFE6B783.toInt() else 0xFFD6E1ED.toInt(), true).apply {
             gravity = Gravity.CENTER
             maxLines = 1
@@ -277,7 +368,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         makeDraggable(circle, bubbleClick())
     }
 
-    private fun bubbleDescription(): String = "点击展开助手面板，选择无人值守和自动下一局开关，可拖动"
+    private fun bubbleDescription(): String = t("点击展开助手面板，选择无人值守和自动下一局开关，可拖动")
 
     /** Opening the bubble never changes either persisted control. */
     private fun bubbleClick(): () -> Unit = {
@@ -349,7 +440,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         // Dashed grab handle: the whole title group drags the window.
         val grip = style.text("⋮⋮", 12f, style.muted, true).apply {
             gravity = Gravity.CENTER
-            contentDescription = "拖动悬浮窗"
+            contentDescription = t("拖动悬浮窗")
             layoutParams = LinearLayout.LayoutParams(dp(28), dp(40))
         }
         heading.addView(grip)
@@ -361,8 +452,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 0, 0, 0)
         }
-        val assistant = tabChip("助手") { tab = 0; dragging = false; showTab() }
-        val settings = tabChip("设置") { tab = 1; dragging = false; showTab() }
+        val assistant = tabChip(t("助手")) { tab = 0; dragging = false; showTab() }
+        val settings = tabChip(t("设置")) { tab = 1; dragging = false; showTab() }
         tabButton = assistant
         settingsButton = settings
         tabs.addView(assistant, LinearLayout.LayoutParams(0, dp(30), 1f))
@@ -372,9 +463,9 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             gravity = Gravity.CENTER_VERTICAL
         })
 
-        val close = style.text("收起", 11f, style.muted, true).apply {
+        val close = style.text(t("收起"), 11f, style.muted, true).apply {
             gravity = Gravity.CENTER
-            contentDescription = "收起成浮标"
+            contentDescription = t("收起成浮标")
             setPadding(dp(6), dp(6), dp(6), dp(6))
             isClickable = true
             background = style.pill(Color.TRANSPARENT, dp(12).toFloat())
@@ -390,7 +481,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private fun tabChip(value: String, select: () -> Unit) = style.text(value, 11.5f, style.tabText, true)
         .apply {
             gravity = Gravity.CENTER
-            contentDescription = if (value == "助手") "助手分区" else "设置分区"
+            contentDescription = if (value == t("助手")) t("助手分区") else t("设置分区")
             isClickable = true
             setPadding(dp(4), 0, dp(4), 0)
             layoutParams = LinearLayout.LayoutParams(0, dp(30), 1f)
@@ -405,20 +496,20 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             val selected = tab == 0
             button.background = if (selected) on else off
             button.setTextColor(if (selected) style.onAccent else style.tabText)
-            button.contentDescription = if (selected) "助手分区，已选中" else "助手分区" +
-                "，切换后查看推荐与对局状态"
+            button.contentDescription = if (selected) t("助手分区，已选中") else t("助手分区") +
+                t("，切换后查看推荐与对局状态")
         }
         settingsButton?.let { button ->
             val selected = tab == 1
             button.background = if (selected) on else off
             button.setTextColor(if (selected) style.onAccent else style.tabText)
-            button.contentDescription = if (selected) "设置分区，已选中" else
-                "设置分区，切换后调整宽度、透明度和开关"
+            button.contentDescription = if (selected) t("设置分区，已选中") else
+                t("设置分区") + t("，切换后调整宽度、透明度和开关")
         }
     }
 
     private fun renderHeader() {
-        bubbleCaption?.text = "雀"
+        bubbleCaption?.text = t("雀")
         bubbleCaption?.setTextColor(if (auto.enabled) 0xFFE6B783.toInt() else 0xFFD6E1ED.toInt())
         bubbleBadge?.text = autoSummary()
         bubbleBadge?.setTextColor(0xFFA8B6C7.toInt())
@@ -476,8 +567,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             background = style.card(opacity)
             setPadding(dp(12), dp(8), dp(10), dp(10))
         }
-        card.addView(style.text("自动控制", 10f, style.muted, true))
-        val name = style.text("无人值守", 14f, style.ink, true).apply { maxLines = 1 }
+        card.addView(style.text(t("自动控制"), 10f, style.muted, true))
+        val name = style.text(t("无人值守"), 14f, style.ink, true).apply { maxLines = 1 }
         autoName = name
         val row = style.row(44)
         row.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -488,7 +579,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         autoState = stateLabel
         row.addView(stateLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
-        val toggle = switchOn(auto.enabled, "无人值守模式开关")
+        val toggle = switchOn(auto.enabled, t("无人值守模式开关"))
         autoSwitch = toggle
         toggle.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
             // Only a user-driven change reaches here (restores write isChecked), and the
@@ -504,8 +595,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val detail = style.text("", 11f, style.muted).apply { maxLines = 3 }
         autoDetail = detail
         card.addView(detail)
-        val hint = style.text(if (auto.enabled) "点开关即可随时暂停；手动出牌会关闭此模式" else
-            "开启后按 AI 首选自动出牌，可随时停止", 10f, style.faint).apply {
+        val hint = style.text(t(if (auto.enabled) "点开关即可随时暂停；手动出牌会关闭此模式" else
+            "开启后按 AI 首选自动出牌，可随时停止"), 10f, style.faint).apply {
             maxLines = 2
             setPadding(0, dp(4), 0, 0)
         }
@@ -521,7 +612,23 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      */
     private fun renderState() {
         renderHeader()
+        relabelCards()
         renderAutoCard()
+    }
+
+    /**
+     * Re-labels every text this window owns that is not covered by [applyPanel] /
+     * [applyRematch] / [renderHeader]. Only text and content descriptions are written:
+     * no view is added or removed and no switch state or callback is touched, so it is
+     * safe on the 200 ms tick and on a language switch alike.
+     */
+    private fun relabelCards() {
+        autoName?.text = t("无人值守")
+        autoSwitch?.contentDescription = t("无人值守模式开关")
+        rematchName?.text = t("自动下一局")
+        rematchSwitch?.contentDescription = t("整场结束后自动匹配（实验性）")
+        panelName?.text = t("推荐与番点")
+        panelSwitch?.contentDescription = t("推荐与番点面板开关")
     }
 
     private fun renderAutoCard() {
@@ -534,7 +641,11 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         autoName?.setTextColor(if (auto.enabled) style.accentText else style.ink)
         autoState?.text = autoSummary()
         autoState?.setTextColor(if (auto.enabled) style.accentText else style.muted)
-        autoDetail?.text = auto.message.ifBlank { "无人值守模式已关闭" }
+        // The controller's own message: the manager's status-line table knows its known
+        // phrases, and anything else (an engine or unknown diagnostic) is shown exactly as
+        // produced — never rewritten.
+        autoDetail?.text = if (auto.message.isBlank()) t("无人值守模式已关闭")
+            else ManagerLanguageText.trim(auto.message, language)
         autoDetail?.setTextColor(if (auto.enabled) style.inkSoft else style.muted)
         autoDetail?.setPadding(0, dp(2), 0, 0)
     }
@@ -550,8 +661,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             background = style.card(opacity)
             setPadding(dp(12), dp(8), dp(10), dp(10))
         }
-        card.addView(style.text("牌局续接", 10f, style.muted, true))
-        val name = style.text("自动下一局", 14f, style.ink, true).apply { maxLines = 1 }
+        card.addView(style.text(t("牌局续接"), 10f, style.muted, true))
+        val name = style.text(t("自动下一局"), 14f, style.ink, true).apply { maxLines = 1 }
         rematchName = name
         val row = style.row(44)
         row.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -562,7 +673,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         rematchStateLabel = stateLabel
         row.addView(stateLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
-        val toggle = switchOn(rematchState.enabled, "整场结束后自动匹配（实验性）")
+        val toggle = switchOn(rematchState.enabled, t("整场结束后自动匹配（实验性）"))
         rematchSwitch = toggle
         toggle.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
             onRematchTap(checked)
@@ -574,7 +685,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val detail = style.text("", 11f, style.muted).apply { maxLines = 3 }
         rematchDetail = detail
         card.addView(detail)
-        val hint = style.text("整场结束后调用游戏的结算与“下一局”，不新建或伪造请求", 10f, style.faint).apply {
+        val hint = style.text(t("整场结束后调用游戏的结算与“下一局”，不新建或伪造请求"), 10f, style.faint).apply {
             maxLines = 2
             setPadding(0, dp(4), 0, 0)
         }
@@ -597,8 +708,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             background = style.card(opacity)
             setPadding(dp(12), dp(8), dp(10), dp(10))
         }
-        card.addView(style.text("固定面板", 10f, style.muted, true))
-        val name = style.text("推荐与番点", 14f, style.ink, true).apply { maxLines = 1 }
+        card.addView(style.text(t("固定面板"), 10f, style.muted, true))
+        val name = style.text(t("推荐与番点"), 14f, style.ink, true).apply { maxLines = 1 }
         panelName = name
         val row = style.row(44)
         row.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -610,7 +721,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         panelStateLabel = stateLabel
         row.addView(stateLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
-        val toggle = switchOn(stored, "推荐与番点面板开关")
+        val toggle = switchOn(stored, t("推荐与番点面板开关"))
         panelSwitch = toggle
         appliedPanelEnabled = null
         toggle.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
@@ -623,7 +734,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val detail = style.text("", 11f, style.muted).apply { maxLines = 3 }
         panelDetail = detail
         card.addView(detail)
-        val hint = style.text("只控制点击穿透固定面板的内容；猫头提示与其他开关各自独立",
+        val hint = style.text(t("只控制点击穿透固定面板的内容；猫头提示与其他开关各自独立"),
             10f, style.faint).apply {
             maxLines = 2
             setPadding(0, dp(4), 0, 0)
@@ -642,9 +753,12 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         applyPanel(saved)
     }
 
-    /** Keeps switch, caption and explanation in one place so they can never disagree. */
-    private fun applyPanel(enabled: Boolean) {
-        if (panelSwitch == null || appliedPanelEnabled == enabled) return
+    /**
+     * Keeps switch, caption and explanation in one place so they can never disagree.
+     * Returns false when nothing was written (already applied).
+     */
+    private fun applyPanel(enabled: Boolean): Boolean {
+        if (panelSwitch == null || appliedPanelEnabled == enabled) return false
         appliedPanelEnabled = enabled
         panelSwitch?.let { applyChecked(it, enabled) }
         switchColors(panelSwitch, enabled, enabled)
@@ -652,13 +766,18 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         panelName?.setTextColor(if (enabled) style.accentText else style.ink)
         panelStateLabel?.text = panelSummary(enabled)
         panelStateLabel?.setTextColor(if (enabled) style.accentText else style.muted)
-        panelDetail?.text = if (enabled) "固定面板显示建议牌与番点；可随时在此关闭"
-            else "已隐藏建议牌与番点，其他功能不受影响"
+        panelDetail?.text = t(if (enabled) "固定面板显示建议牌与番点；可随时在此关闭"
+            else "已隐藏建议牌与番点，其他功能不受影响")
         panelDetail?.setTextColor(if (enabled) style.inkSoft else style.muted)
         panelDetail?.setPadding(0, dp(2), 0, 0)
+        // The card's title and switch label are the same copy: written here, and reached
+        // again on a language switch because `refreshLanguage` clears the marker above.
+        panelName?.text = t("推荐与番点")
+        panelSwitch?.contentDescription = t("推荐与番点面板开关")
+        return true
     }
 
-    private fun panelSummary(enabled: Boolean) = if (enabled) "开" else "关"
+    private fun panelSummary(enabled: Boolean) = t(if (enabled) "开" else "关")
 
     /**
      * Sets the thumb without notifying the listener. [CompoundButton.setChecked] only
@@ -693,11 +812,11 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         rematchDetail?.setPadding(0, dp(2), 0, 0)
     }
 
-    private fun rematchText(): String = when {
+    private fun rematchText(): String = t(when {
         rematchState.demo -> "模型自检中不会自动匹配"
         rematchState.enabled -> "仅调用游戏的“下一局”原按钮；可随时在此关闭"
         else -> "默认关闭。与无人值守独立，开启后自动续局"
-    }
+    })
 
     /**
      * One tap = one preference write. The switch first snaps to the *stored* result of
@@ -717,7 +836,9 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     /** Live recommendation block: the content the user opens the panel for. */
     private fun renderStatus(parent: LinearLayout) {
         val status = result.optString("status")
-        val message = result.optString("message", "等待牌局").ifBlank { "等待牌局" }
+        // A status line the manager produced is translated when it is a known phrase;
+        // an engine/unknown diagnostic is shown exactly as received.
+        val message = GameMenuText.text(result.optString("message", "等待牌局").ifBlank { "等待牌局" }, language)
         val messageColor = when {
             status == "demo" -> style.warn
             auto.enabled -> style.inkSoft
@@ -725,24 +846,24 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         }
         parent.addView(style.text(message, 11.5f, messageColor).apply { maxLines = 3 })
         if (status != "live" && status != "demo") {
-            parent.addView(style.text("先开启助手，再启动雀魂进入对局。中途开启或重连后，需等待完整牌局同步。",
+            parent.addView(style.text(t("先开启助手，再启动雀魂进入对局。中途开启或重连后，需等待完整牌局同步。"),
                 11f, style.faint).apply {
                 maxLines = 3
                 setPadding(0, dp(6), 0, 0)
             })
             return
         }
-        parent.addView(style.text(result.optString("round").replace("E", "东").replace("S", "南")
-            .replace("W", "西").replace("N", "北") + " · ${result.optInt("players", 4)}人",
+        parent.addView(style.text(
+            localizeRound(result.optString("round"), result.optInt("players", 4)),
             11f, style.muted).apply { setPadding(0, dp(4), 0, 0) })
         val analysis = result.optJSONObject("analysis") ?: return
-        if (result.optBoolean("modelExperimental")) parent.addView(style.text("实验性 Mortal v4 · 特征含近似计算",
+        if (result.optBoolean("modelExperimental")) parent.addView(style.text(t("实验性 Mortal v4 · 特征含近似计算"),
             10f, style.faint).apply { setPadding(0, dp(4), 0, 0) })
         val rows = result.optJSONArray("recommendations") ?: JSONArray()
         parent.addView(style.spacer(6))
         if (rows.length() > 0) parent.addView(recommendationHeader())
         if (rows.length() == 0) {
-            parent.addView(style.text("等待操作机会", 18f, style.accentText, true).apply {
+            parent.addView(style.text(t("等待操作机会"), 18f, style.accentText, true).apply {
                 setPadding(dp(4), dp(8), dp(4), dp(2))
             })
             analysis.optJSONObject("hand13")?.let {
@@ -756,17 +877,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             val row = rows.getJSONObject(i)
             val tile = row.optString("tile")
             val kind = row.optString("kind")
-            val name = when (kind) {
-                "discard" -> "切 ${tileName(tile)}"
-                "riichi" -> if (tile.isBlank()) "立直" else "立直 · 切 ${tileName(tile)}"
-                "pon" -> "碰 ${tileName(tile)}"
-                "chi" -> "吃 ${tileName(tile)}"
-                "kan", "ankan", "kakan" -> "杠 ${tileName(tile)}"
-                "hora" -> "和牌"
-                "kita" -> "拔北"
-                "abort" -> "九种九牌流局"
-                else -> "跳过"
-            }
+            val name = actionName(kind, tile)
             val weight = row.optDouble("weight", -1.0)
             parent.addView(recommendationRow(name,
                 if (weight > 0.0) String.format(Locale.ROOT, "%.1f%%", weight * 100) else "", i))
@@ -779,9 +890,11 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
                     setPadding(dp(8), 0, dp(4), dp(2))
                 })
                 else {
-                    val chance = if (hand?.optInt("shanten") == 0) "估计和率 ${number(hand.optDouble("avg_agari_rate"))}%"
-                        else "${hand?.optInt("shanten") ?: "—"}向听"
-                    parent.addView(style.text("$chance · 风险 $risk", 10.5f, style.muted).apply {
+                    val chance = if (hand?.optInt("shanten") == 0) GameMenuText.text(
+                        "估计和率 ${number(hand.optDouble("avg_agari_rate"))}%", language)
+                        else GameMenuText.text("${hand?.optInt("shanten") ?: "—"}向听", language)
+                    parent.addView(style.text(
+                        "$chance · ${GameMenuText.text("风险 $risk", language)}", 10.5f, style.muted).apply {
                         setPadding(dp(8), 0, dp(4), dp(2))
                     })
                 }
@@ -796,7 +909,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val defence = analysis.optString("best_defence_discard").takeUnless { it == "null" || it.isBlank() }
         val mixed = analysis.optJSONArray("mixed_risk") ?: JSONArray()
         if (defence != null && rows.length() > 0 && (0 until mixed.length()).any { mixed.optDouble(it) > 0.0 }) {
-            parent.addView(style.text("🛡️ 防守参考  ${tileName(defence)}", 11f, style.inkSoft).apply {
+            parent.addView(style.text(
+                "${GameMenuText.text("🛡️ 防守参考", language)}  ${tileName(defence)}", 11f, style.inkSoft).apply {
                 setPadding(0, dp(2), 0, 0)
             })
         }
@@ -804,19 +918,22 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val riichiSeats = (0 until opponents.length()).map { opponents.getJSONObject(it) }
             .filter { it.optBoolean("is_riichi") }
             .map { relativeSeat(it.optInt("seat"), result.optInt("seat"), result.optInt("players", 4)) }
-        if (riichiSeats.isNotEmpty()) parent.addView(style.text("⚠️ 已立直：${riichiSeats.joinToString("、")}",
+        if (riichiSeats.isNotEmpty()) parent.addView(style.text(
+            "${GameMenuText.text("⚠️ 已立直：", language)}${riichiSeats.joinToString(seatJoiner())}",
             11f, style.warn))
-        parent.addView(style.text("和牌率为听牌后的估计；风险指数越低越好，含打点权重，并非实际放铳概率。",
+        parent.addView(style.text(t("和牌率为听牌后的估计；风险指数越低越好，含打点权重，并非实际放铳概率。"),
             9.5f, style.faint).apply { setPadding(0, dp(6), 0, 0) })
         val duration = if (status == "demo") result.optLong("loadAndInferenceMs") else result.optLong("elapsedMs")
-        parent.addView(style.text("手机本地计算 · ${duration} ms${if (status == "demo") "（含模型加载）" else ""}",
+        parent.addView(style.text(
+            GameMenuText.text("手机本地计算 · ", language) + "$duration ms" +
+                (if (status == "demo") GameMenuText.text("（含模型加载）", language) else ""),
             9.5f, style.faint).apply { setPadding(0, dp(2), 0, 0) })
     }
 
     private fun recommendationHeader() = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(4), dp(4), dp(4), dp(4))
-        addView(style.text("🎯 推荐切牌", 12f, style.muted, true))
+        addView(style.text(t("🎯 推荐切牌"), 12f, style.muted, true))
         addView(style.spacer(4))
     }
 
@@ -835,7 +952,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             1 -> style.pill(style.accentSoft, dp(12).toFloat())
             else -> style.pill(Color.TRANSPARENT, dp(12).toFloat())
         }
-        addView(style.text(if (rank == 0) "首选" else "${rank + 1}", 10f,
+        addView(style.text(if (rank == 0) t("首选") else "${rank + 1}", 10f,
             if (filled) style.onAccent else style.accentText, true).apply {
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(dp(34), LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -864,24 +981,26 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         }
         val pane = settingsPane ?: return
         pane.removeAllViews()
-        pane.addView(style.text("窗口外观", 10f, style.muted, true).apply { setPadding(dp(2), 0, 0, dp(2)) })
-        addSlider(pane, "背景不透明度", 25, 95, opacity, { "$it%" }, live = true) { value ->
+        pane.addView(style.text(t("窗口外观"), 10f, style.muted, true).apply { setPadding(dp(2), 0, 0, dp(2)) })
+        opacitySliderName = "背景不透明度"
+        addSlider(pane, t(opacitySliderName), 25, 95, opacity, { "$it%" }, live = true) { value ->
             opacity = value; root?.background = style.panelBackground(opacity, collapsed); save()
-        }.also { opacityCaption = it }
-        addSlider(pane, "窗口宽度", 220, 420, width, { "$it dp" }, live = false) { value ->
+        }.also { opacityCaption = it; opacityCaptionText = it.text?.toString() }
+        widthSliderName = "窗口宽度"
+        addSlider(pane, t(widthSliderName), 220, 420, width, { "$it dp" }, live = false) { value ->
             width = value
             layout.width = dp(width).coerceAtMost(screenWidth() - dp(12)).coerceAtMost(maxPanelWidth())
             clampPosition()
             root?.let { panel -> windows.updateViewLayout(panel, layout) }
             save()
-        }.also { widthCaption = it }
+        }.also { widthCaption = it; widthCaptionText = it.text?.toString() }
         pane.addView(style.divider())
-        pane.addView(style.text("助手操作", 10f, style.muted, true).apply { setPadding(dp(2), 0, 0, dp(4)) })
-        pane.addView(style.text("停止助手会关闭无人值守模式并隐藏悬浮窗；拖动标题栏移动，点“收起”变成浮标。",
+        pane.addView(style.text(t("助手操作"), 10f, style.muted, true).apply { setPadding(dp(2), 0, 0, dp(4)) })
+        pane.addView(style.text(t("停止助手会关闭无人值守模式并隐藏悬浮窗；拖动标题栏移动，点“收起”变成浮标。"),
             10.5f, style.faint).apply { setPadding(dp(2), 0, dp(2), dp(8)) })
-        val stopAction = style.text("停止助手", 13f, style.danger, true).apply {
+        val stopAction = style.text(t("停止助手"), 13f, style.danger, true).apply {
             gravity = Gravity.CENTER
-            contentDescription = "关闭 AI 助手"
+            contentDescription = t("关闭 AI 助手")
             isClickable = true
             background = style.tinted(style.dangerTrack, dp(14).toFloat(), Color.argb(90, 214, 64, 66),
                 Color.argb(60, 214, 64, 66))
@@ -903,7 +1022,12 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
-                        caption.text = "$name · ${format(progress + min)}"
+                        val rendered = "$name · ${format(progress + min)}"
+                        caption.text = rendered
+                        // Remember what was rendered so a language switch can keep the
+                        // value and only swap the label.
+                        if (name == t(opacitySliderName)) opacityCaptionText = rendered
+                        else widthCaptionText = rendered
                         if (live) change(progress + min)
                     }
                 }
@@ -1005,19 +1129,25 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
 
     private fun handDescription(hand: JSONObject): String {
         val shanten = hand.optInt("shanten", 99)
-        val stage = when { shanten == 0 -> "听牌"; shanten < 0 -> "和牌形"; else -> "${shanten}向听" }
-        val chance = if (shanten == 0) "估计和牌率 ${number(hand.optDouble("avg_agari_rate"))}%" else "和牌率 —（未听牌）"
-        return "$stage · 进张 ${hand.optInt("waits_total")} 枚\n$chance${if (hand.optBoolean("is_furiten")) " · 振听" else ""}"
+        val stage = t(when { shanten == 0 -> "听牌"; shanten < 0 -> "和牌形"; else -> "${shanten}向听" })
+        val chance = if (shanten == 0) GameMenuText.text(
+            "估计和牌率 ${number(hand.optDouble("avg_agari_rate"))}%", language)
+            else GameMenuText.text("和牌率 —（未听牌）", language)
+        val waits = GameMenuText.text("进张 ${hand.optInt("waits_total")} 枚", language)
+        val furiten = if (hand.optBoolean("is_furiten")) " · " + t("振听") else ""
+        return "$stage · $waits\n$chance$furiten"
     }
 
     private fun mainDetail(hand: JSONObject?, risk: String): String {
-        if (hand == null) return "放铳风险指数 $risk"
+        if (hand == null) return GameMenuText.text("放铳风险指数 $risk", language)
         val shanten = hand.optInt("shanten", 99)
-        val stage = when { shanten == 0 -> "听牌"; shanten < 0 -> "和牌形"; else -> "${shanten}向听" }
-        val waits = hand.optInt("waits_total")
-        val rate = if (shanten == 0) "和率 ${number(hand.optDouble("avg_agari_rate"))}%" else null
-        return listOfNotNull(stage, "进张 $waits 枚", rate,
-            if (hand.optBoolean("is_furiten")) "振听" else null, "风险 $risk").joinToString(" · ")
+        val stage = t(when { shanten == 0 -> "听牌"; shanten < 0 -> "和牌形"; else -> "${shanten}向听" })
+        val waits = GameMenuText.text("进张 ${hand.optInt("waits_total")} 枚", language)
+        val rate = if (shanten == 0) GameMenuText.text(
+            "和率 ${number(hand.optDouble("avg_agari_rate"))}%", language) else null
+        val furiten = if (hand.optBoolean("is_furiten")) t("振听") else null
+        return listOfNotNull(stage, waits, rate, furiten,
+            GameMenuText.text("风险 $risk", language)).joinToString(" · ")
     }
 
     private fun number(value: Double) = if (value.isFinite()) String.format(Locale.ROOT, "%.1f", value) else "—"
@@ -1026,12 +1156,82 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         1 -> "下家"; 2 -> if (players == 3) "上家" else "对家"; else -> "上家"
     }
 
+    // ---- copy for the current language --------------------------------------
+
+    /**
+     * One recommendation as a phrase. Chinese keeps the original wording byte for byte;
+     * the other languages use the mahjong words the app's players use (ポン/チー/カン/
+     * リーチ/北抜き and the English discard/call/win forms).
+     */
+    private fun actionName(kind: String, tile: String): String {
+        val face = tileName(tile)
+        val blank = tile.isBlank()
+        return when (language) {
+            ManagerLanguage.SIMPLIFIED -> when (kind) {
+                "discard" -> "切 $face"
+                "riichi" -> if (blank) "立直" else "立直 · 切 $face"
+                "pon" -> "碰 $face"
+                "chi" -> "吃 $face"
+                "kan", "ankan", "kakan" -> "杠 $face"
+                "hora" -> "和牌"
+                "kita" -> "拔北"
+                "abort" -> "九种九牌流局"
+                else -> "跳过"
+            }
+            ManagerLanguage.ENGLISH -> when (kind) {
+                "discard" -> "Discard $face"
+                "riichi" -> if (blank) "Riichi" else "Riichi · discard $face"
+                "pon" -> "Pon $face"
+                "chi" -> "Chi $face"
+                "kan", "ankan", "kakan" -> "Kan $face"
+                "hora" -> "Win"
+                "kita" -> "Kita"
+                "abort" -> "Nine terminals draw"
+                else -> "Pass"
+            }
+            ManagerLanguage.JAPANESE -> when (kind) {
+                "discard" -> "打 $face"
+                "riichi" -> if (blank) "リーチ" else "リーチ・打 $face"
+                "pon" -> "ポン $face"
+                "chi" -> "チー $face"
+                "kan", "ankan", "kakan" -> "カン $face"
+                "hora" -> "和了"
+                "kita" -> "北抜き"
+                "abort" -> "九種九牌流局"
+                else -> "パス"
+            }
+        }
+    }
+
+    /** Separator between several riichi seats, in the current language. */
+    private fun seatJoiner(): String = if (language == ManagerLanguage.ENGLISH) ", " else "、"
+
+    /**
+     * The round line: the engine's shorthand ("E1", "S2") plus the player count.
+     *
+     * The letters are the engine's own notation, translated only for display; an
+     * unrecognised remainder is shown as received.
+     */
+    private fun localizeRound(round: String, players: Int): String {
+        val text = if (language == ManagerLanguage.SIMPLIFIED) {
+            round.replace("E", "东").replace("S", "南").replace("W", "西").replace("N", "北")
+        } else {
+            GameMenuText.roundLabel(round, language)
+        }
+        return text + " · " + GameMenuText.text("$players 人", language)
+    }
+
     private fun tileName(tile: String): String {
-        val honors = mapOf("E" to "东", "S" to "南", "W" to "西", "N" to "北", "P" to "白", "F" to "发", "C" to "中")
-        honors[tile]?.let { return it }
-        if (tile.length < 2) return "—"
-        val suit = when (tile[1]) { 'm' -> "万"; 'p' -> "筒"; 's' -> "索"; else -> "" }
-        return (if (tile.endsWith("r")) "赤" else "") + tile[0] + suit
+        if (language == ManagerLanguage.SIMPLIFIED) {
+            val honors = mapOf("E" to "东", "S" to "南", "W" to "西", "N" to "北", "P" to "白", "F" to "发", "C" to "中")
+            honors[tile]?.let { return it }
+            if (tile.length < 2) return "—"
+            val suit = when (tile[1]) { 'm' -> "万"; 'p' -> "筒"; 's' -> "索"; else -> "" }
+            return (if (tile.endsWith("r")) "赤" else "") + tile[0] + suit
+        }
+        // Same codes, rendered by the shared helper so the panel and this window agree.
+        val face = GameMenuText.tileName(tile, language)
+        return if (tile.length < 2 && face == tile) "—" else face
     }
 
     private fun tileIndex(tile: String): Int {
