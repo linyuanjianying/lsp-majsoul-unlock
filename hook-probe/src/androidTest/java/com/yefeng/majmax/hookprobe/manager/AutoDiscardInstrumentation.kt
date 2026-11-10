@@ -1062,7 +1062,14 @@ class AutoDiscardInstrumentation : Instrumentation() {
                     resize(1600, 720)
                     panel.update(state(.84), true)
                     check(frame.visibility == android.view.View.VISIBLE && pane.getChildAt(1) === row)
-                    check((pane.layoutParams as android.widget.FrameLayout.LayoutParams).leftMargin == (1600 * (.287f - .22f / 2f)).toInt())
+                    val bounds = targetContext.getSystemService(android.view.WindowManager::class.java).currentWindowMetrics.bounds
+                    val origin = IntArray(2).also { frame.getLocationOnScreen(it) }
+                    val params = pane.layoutParams as android.widget.FrameLayout.LayoutParams
+                    val expectedLeft = ((bounds.width() * (519f / 2376f)).toInt() + bounds.left - origin[0])
+                        .coerceIn(0, (frame.width - params.width).coerceAtLeast(0))
+                    check(params.leftMargin == expectedLeft)
+                    val expectedBottom = (bounds.height() * .645f).toInt() + bounds.top - origin[1]
+                    check(params.topMargin == (expectedBottom - pane.measuredHeight).coerceAtLeast(0))
                     panel.close()
                     check(host.childCount == 0)
                 }
