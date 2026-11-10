@@ -42,6 +42,11 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
         val existing = root
         val frame = existing ?: object : FrameLayout(context) {
             override fun dispatchTouchEvent(event: android.view.MotionEvent) = false
+            override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+                // The screen origin is reliable only once the hook frame is laid out.
+                if (host != null) positionPanel(this)
+                super.onLayout(changed, left, top, right, bottom)
+            }
             override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
                 super.onSizeChanged(w, h, oldw, oldh)
                 if (root === this && visibility == View.VISIBLE && (w != renderedWidth || h != renderedHeight)) {
@@ -100,9 +105,18 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
         val widthSpec = android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY)
         val free = android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED)
         pane.measure(widthSpec, free)
-        // Screenshot calibration: own avatar centre x=.287, top y=.659.
-        // Anchor the panel BOTTOM above it, independent of the number of rows.
-        val bottom = (h * .645f).toInt()
+        // Hook host coordinates can start after a display inset. Calibrate against
+        // the full game window, then translate into this frame's local coordinates.
+        // Reference (2376x1080): panel left=519, bottom=696, above our avatar.
+        val origin = IntArray(2)
+        val gameBounds = if (host != null && android.os.Build.VERSION.SDK_INT >= 30)
+            windows?.currentWindowMetrics?.bounds else null
+        val gameWidth = gameBounds?.width() ?: context.resources.displayMetrics.widthPixels
+        val gameHeight = gameBounds?.height() ?: context.resources.displayMetrics.heightPixels
+        if (host != null) frame.getLocationOnScreen(origin)
+        val bottom = if (host != null)
+            (gameHeight * .645f).toInt() + (gameBounds?.top ?: 0) - origin[1]
+        else (h * .645f).toInt()
         val available = h * .62f
         if (pane.measuredHeight > available) {
             val ratio = available / pane.measuredHeight
@@ -112,7 +126,10 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
             }
             pane.measure(widthSpec, free)
         }
-        val left = (w * (.287f - .22f / 2f)).toInt()
+        val left = if (host != null)
+            ((gameWidth * (519f / 2376f)).toInt() + (gameBounds?.left ?: 0) - origin[0])
+                .coerceIn(0, (w - width).coerceAtLeast(0))
+        else (w * (.287f - .22f / 2f)).toInt()
         val top = (bottom - pane.measuredHeight).coerceAtLeast(0)
         val current = pane.layoutParams as? FrameLayout.LayoutParams
         if (current?.width != width || current.leftMargin != left || current.topMargin != top) {
