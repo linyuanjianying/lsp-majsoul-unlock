@@ -1,21 +1,24 @@
 #!/bin/sh
-# JVM pure-logic regression for the assistant display-mode lease (overlay vs in-game).
+# JVM pure-logic regression for the single-surface display mode (overlay vs in-game hook).
 # Read-only w.r.t. project sources: compiles only the probe file against the already
 # built universalDebug kotlin classes (-Xfriend-paths exposes `internal`).
 #
 # Build the classes first:  (cd hook-probe && ./gradlew :compileUniversalDebugKotlin)
 # The same cases exist as instrumentation checks (DisplayModeChecks), but this runs on a
-# plain JVM with an injected clock, so the "both surfaces at once" orderings can be
-# replayed without a device, a window or the game process.
+# plain JVM, so the "only one surface is ever created" orders can be replayed without a
+# device, a window or the game process.
 #
 # Every artifact is pinned to the version the project builds with. A newer cached
 # kotlin-stdlib/compiler on the classpath makes the compiler accept code it cannot link,
-# and the probe then exercises a differently-compiled lease — the exact trap that made an
+# and the probe then exercises differently-compiled mode code — the exact trap that made an
 # earlier run report results of a stale build.
 set -eu
 PROJ=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-CLASSES="$PROJ/hook-probe/build/tmp/kotlin-classes/universalDebug"
-OUT="$PROJ/hook-probe/build/display-leases"
+# Class directory to compile against. `KOTLIN_CLASSES` lets a caller point at a fresh
+# standalone :main compile (see the note in the header) when the Gradle task is
+# unavailable in this build environment.
+CLASSES="${KOTLIN_CLASSES:-$PROJ/hook-probe/build/tmp/kotlin-classes/universalDebug}"
+OUT="$PROJ/hook-probe/build/display-mode-probe"
 ANDROID_JAR=${ANDROID_HOME:-/workspace/android-sdk}/platforms/android-35/android.jar
 GC=${GRADLE_CACHE:-/root/.gradle/caches/modules-2/files-2.1}
 KOTLIN_VERSION=2.0.21
@@ -57,5 +60,16 @@ echo "compiler: $KOTLINC" >&2
 "$JAVA" -cp "$COMPILER_CP" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
   -no-stdlib -no-reflect -classpath "$PROBE_CP" \
   -Xfriend-paths="$CLASSES" -jvm-target 21 -nowarn \
-  -d "$OUT/classes" "$PROJ/tools/tests/DisplayModeLeaseProbe.kt"
-"$JAVA" -cp "$OUT/classes:$PROBE_CP" DisplayModeLeaseProbeKt
+  -d "$OUT/classes" "$PROJ/tools/tests/DisplayModeProbe.kt"
+# `-Xskip-metadata-version-check` is needed when $CLASSES comes from a standalone compile
+# against a cache that also holds jars built by a newer Kotlin; harmless otherwise.
+set +e
+"$JAVA" -cp "$OUT/classes:$PROBE_CP" DisplayModeProbeKt
+STATUS=$?
+set -e
+# The probe calls exitProcess(1) on a failed case, so a non-zero status is a regression and
+# must not be swallowed by the surrounding pipeline.
+if [ "$STATUS" -ne 0 ]; then
+  echo "display-mode probe FAILED (exit $STATUS)" >&2
+  exit "$STATUS"
+fi

@@ -15,6 +15,9 @@ import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
 
+/** `overlayError` value meaning "this process could not read its display state". */
+internal const val DISPLAY_MODE_UNAVAILABLE = "display_mode_unavailable"
+
 /** Delivers a temporary loopback capability only to the game UID. */
 class AiEndpointProvider : ContentProvider() {
     override fun onCreate() = true
@@ -51,19 +54,11 @@ class AiEndpointProvider : ContentProvider() {
             return Bundle().apply { putLong("ackSeq", ack) }
         }
         if (method == "autoPoll") {
-            // No lease bookkeeping here on purpose. A heartbeat only proves the process
-            // runs; it says nothing about whether the in-game surface has already hidden
-            // for the current selection. The acknowledgement is the explicit
-            // `displayGeneration` extra of `autoStatus` below.
             return Bundle().apply {
                 putString("command", AiOverlayService.autoPoll(extras?.getString("acks")))
             }
         }
         if (method == "autoStatus" || method == "autoSet") {
-            // Explicit acknowledgement: the in-game control sends, in `displayGeneration`,
-            // the generation it has applied and finished hiding its surface for. Anything
-            // else (a missing extra, a poll in flight) leaves the manager's overlay paused.
-            ackDisplayGeneration(extras)
             if (method == "autoSet") {
                 // Mode only: the service keeps running, so a later enable is instant and
                 // the foreground notification still explains what is running.
@@ -94,18 +89,30 @@ class AiEndpointProvider : ContentProvider() {
             RecommendationPanelSettings.save(app, requested)
             return AssistLaunch.withDisplayMode(app, AssistLaunch.status())
         }
-        if (method == "displayMode") {
-            // Read-only projection of the persisted presentation mode. The game process
-            // reads this so its in-game control can hide itself (while still polling)
-            // when the user switched to the system-overlay surface.
-            val mode = AssistantDisplayModeSettings.read(app)
+        if (method == "displayMode" || method == "runMode") {
+            // Read-only projection of the mode that is actually in effect: the running
+            // service's onCreate snapshot, or the stored selection while no service exists.
+            // `mode` is the single answer — a status reply carries the same fields, so the
+            // two can never disagree. A failed read is reported as UNKNOWN (`source = 0`, no
+            // `mode`), never as a defaulted hook: the game process must be able to tell
+            // "I could not tell" from "hook", because the second one builds a surface.
+            val snapshot = runCatching { AssistLaunch.readDisplaySnapshot(app) }.getOrNull()
             return Bundle().apply {
-                putString("mode", mode.wire)
-                putBoolean("overlay", AssistantDisplayModeSettings.overlayActive(app))
-                // The lease fields are the ones a status reply carries; this method exists
-                // for callers that only want the mode and must not disagree with it.
-                AssistLaunch.putLease(app, this)
-                putString("displayEffective", AssistantDisplayModeSettings.effective(app).wire)
+                if (snapshot == null ||
+                    snapshot.source == DisplayModeSnapshotStore.MODE_SOURCE_UNKNOWN) {
+                    putInt("source", DisplayModeSnapshotStore.MODE_SOURCE_UNKNOWN)
+                    putString("overlayError", DISPLAY_MODE_UNAVAILABLE)
+                } else {
+                    putString("mode", snapshot.mode.wire)
+                    putBoolean("overlay", snapshot.mode == AssistantDisplayMode.OVERLAY)
+                    putBoolean("overlayReady", snapshot.overlayReady)
+                    putInt("source", snapshot.source)
+                    putString("nonce", snapshot.nonce)
+                    if (snapshot.overlayError != null) putString("overlayError", snapshot.overlayError)
+                }
+                putString("selected",
+                    runCatching { AssistantDisplayModeSettings.read(app).wire }
+                        .getOrDefault(AssistantDisplayMode.HOOK.wire))
             }
         }
         if (method == "hintSnapshot") return AiOverlayService.hintSnapshot()
@@ -152,20 +159,6 @@ class AiEndpointProvider : ContentProvider() {
     override fun update(uri: Uri, values: ContentValues?, selection: String?,
         selectionArgs: Array<out String>?): Int = 0
 }
-
-    /**
-     * Records the generation the in-game control says it has applied.
-     *
-     * Only the caller's own extra is trusted: the provider is exported, so a value it
-     * invents or infers would let any caller lift the manager's pause. A missing or
-     * non-positive value is "not acknowledged" and changes nothing.
-     */
-    private fun ackDisplayGeneration(extras: Bundle?) {
-        val acked = extras?.takeIf { it.containsKey("displayGeneration") }
-            ?.getInt("displayGeneration", 0) ?: return
-        if (acked <= 0) return
-        DisplayModeLeaseLocal.acknowledge(acked)
-    }
 
 /**
  * Starts, observes and switches the manager's foreground analysis service for the
@@ -414,59 +407,74 @@ object AssistLaunch {
     }
 
     /**
-     * Writes the presentation lease the in-game control mirrors ([DisplayModeLease]).
+     * What every status reply says about the display mode. One field set, one meaning:
      *
-     * `displayOwner` says which surface may paint, `displayGeneration` says for which
-     * selection, `displayOverlayFailed` says overlay mode is selected but its window is not
-     * on screen (so the in-game control has to stand in, never "neither surface").
+     *  - `mode` / `displayMode`: the mode in effect — the running service's snapshot, or the
+     *    stored selection while no service exists. This is the only value a caller should act
+     *    on, and it is exactly what `displayMode` returns.
+     *  - `overlayReady`: overlay selected and its windows believed to be on screen. False
+     *    never means "use hook"; `mode` stays `overlay` and `overlayError` says why not.
+     *  - `source`: 1 = running service, 2 = stored selection (no service), 0 = unreadable.
+     *  - `nonce`: identifies the service instance whose snapshot was reported.
+     *  - `selected`: the preference for the *next* start. Informational only; while the
+     *    service runs it may legitimately differ from `mode`.
      *
-     * The generation is captured **before** the values are read, and the lease is only
-     * reported once the publisher has caught up with it. A reply assembled across a switch
-     * therefore carries the new generation with `displayOwner = NONE` — the lease of the
-     * previous selection is never re-stamped as if it belonged to the new one, which is
-     * what used to let the overlay be treated as "already showing" for a selection it had
-     * never painted.
+     * There is no owner, no acknowledgement and no lease: the game decides whether to build
+     * its Control / HintLayer from `mode` alone, and only a game restart or the next service
+     * start can change that answer.
      *
-     * With the service down nothing owns the surface: the overlay windows went away with
-     * it, so `displayOwner` is NONE regardless of what the last publisher left behind.
+     * **Unreadable state is never reported as a mode.** When the snapshot cannot be read, the
+     * reply carries `displaySource = 0` and an `overlayError = "display_mode_unavailable"`,
+     * but no `mode` / `displayMode` / `overlayMode` at all — a missing key is the only shape
+     * that cannot be mistaken for a real "hook" answer by the game process.
      */
     @JvmStatic
-    fun putLease(context: Context, bundle: Bundle) {
-        // A restarted manager continues the persisted generation instead of restarting the
-        // counter at 0, which the game would drop as stale forever (see
-        // AssistantDisplayModeSettings.ensureLoaded).
-        AssistantDisplayModeSettings.ensureLoaded(context)
-        val generation = AssistantDisplayModeSettings.generation()
-        bundle.putInt("displayGeneration", generation)
-        // `overlaySelected` is the instruction the game acts on: while it is true the game
-        // hides everything it draws and acknowledges; while it is false the game paints.
-        // It is published by the service and is true on the way back to hook mode until the
-        // windows are actually removed, so the game never paints next to a live window.
-        val lease = DisplayModeBroadcastState.current()
-        val alive = AiOverlayService.isAlive()
-        val current = alive && lease.generation == generation
-        bundle.putBoolean("overlaySelected", current && lease.overlaySelected)
-        bundle.putBoolean("displayOverlayFailed", current && lease.overlayFailed)
-        // Ownership is only ever claimed by the service after the game's acknowledgement.
-        bundle.putInt("displayOwner",
-            if (current && !lease.overlayFailed) lease.owner else DisplayModeOwner.NONE)
-        // Backwards-compatible field for an in-game control that predates this protocol: it
-        // keys off `overlayMode` alone, so it must keep reading "hide" for as long as this
-        // side intends to show the system surface.
-        bundle.putBoolean("overlayMode", current && lease.overlaySelected)
+    fun putDisplaySnapshot(context: Context, bundle: Bundle) {
+        val snapshot = runCatching { readDisplaySnapshot(context) }.getOrNull()
+        if (snapshot == null || snapshot.source == DisplayModeSnapshotStore.MODE_SOURCE_UNKNOWN) {
+            bundle.putInt("displaySource", DisplayModeSnapshotStore.MODE_SOURCE_UNKNOWN)
+            bundle.putString("overlayError", DISPLAY_MODE_UNAVAILABLE)
+            return
+        }
+        bundle.putString("mode", snapshot.mode.wire)
+        bundle.putString("displayMode", snapshot.mode.wire)
+        // Kept for any caller that predates `mode`; identical by construction.
+        bundle.putBoolean("overlayMode", snapshot.mode == AssistantDisplayMode.OVERLAY)
+        bundle.putBoolean("overlayReady", snapshot.overlayReady)
+        bundle.putInt("displaySource", snapshot.source)
+        bundle.putString("displayNonce", snapshot.nonce)
+        if (snapshot.overlayError != null) bundle.putString("overlayError", snapshot.overlayError)
+        bundle.putString("displaySelected",
+            runCatching { AssistantDisplayModeSettings.read(context).wire }
+                .getOrDefault(AssistantDisplayMode.HOOK.wire))
     }
 
+    /**
+     * The display snapshot this process can honestly report.
+     *
+     * With no service instance at all, the stored selection is the answer (that is what the
+     * *next* start will use). While an instance exists — even one that has not finished
+     * `startForeground` — only its own snapshot is reported: reporting anything else would
+     * disagree with the surface that instance is about to draw. A read failure returns null
+     * and the caller keeps whatever it knew.
+     */
+    @JvmStatic
+    internal fun readDisplaySnapshot(context: Context): DisplayModeSnapshotStore.Snapshot? {
+        DisplayModeSnapshotStore.ofService()?.let { return it }
+        if (AiOverlayService.hasInstance()) return null
+        val snapshot = runCatching { DisplayModeSnapshotStore.snapshot(context) }.getOrNull()
+            ?: return null
+        return if (snapshot.source == DisplayModeSnapshotStore.MODE_SOURCE_UNKNOWN) null else snapshot
+    }
 
     /**
-     * Appends the persisted presentation mode to a status bundle for the game process.
-     * Kept separate from [status] because the mode read needs an app [Context], which
-     * the provider always has but [status] itself does not hold a stable reference to.
+     * Appends the display snapshot to a status bundle for the game process. Kept separate
+     * from [status] because the snapshot needs an app [Context], which the provider always
+     * has but [status] itself does not hold a stable reference to.
      */
     @JvmStatic
     fun withDisplayMode(context: Context, bundle: Bundle): Bundle {
-        val mode = AssistantDisplayModeSettings.read(context)
-        bundle.putString("displayMode", mode.wire)
-        putLease(context, bundle)
+        putDisplaySnapshot(context, bundle)
         // Auto-rematch opt-in, read-only projection. `rematch` is the stored setting,
         // `rematchActive` is the effective gate (stored AND not demo) and
         // matches the `autoRematch` field of the next autoPoll heartbeat exactly, so the

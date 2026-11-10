@@ -13,7 +13,18 @@ import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Read-only tile hints in the game window; no system overlay or touch interception. */
+/**
+ * Read-only tile hints in the game window; no system overlay or touch interception.
+ *
+ * This layer only exists when the assistant runs in Hook mode: [GameTopControl] constructs it
+ * right before attaching, and only after the provider confirmed that mode. In overlay mode it
+ * is never created at all, so there is no "hidden but built" state to keep in sync.
+ *
+ * [presentationAllowed] remains the cheap gate for the moment before the first answer is
+ * known; it is not a lease and it never switches modes. The provider already reports
+ * `overlayMode` / `runMode` for the authoritative answer, so the layer clears itself when it
+ * sees overlay mode instead of re-deriving the decision locally.
+ */
 class GameHintLayer {
     private val main = Handler(Looper.getMainLooper())
     private val uri = Uri.parse("content://com.yefeng.majmax.hookprobe.ai/capture")
@@ -47,16 +58,13 @@ class GameHintLayer {
                     main.post {
                         busy.set(false)
                         if (token != generation || host !== container) return@post
+                        // The provider reports "not running" and `overlayMode = true` for a
+                        // service that runs in overlay mode; either one clears the hints.
                         if (!presentationEnabled || !allowed() || snapshot?.getBoolean("overlayMode", false) == true) {
                             clearSurfaces()
                             return@post
                         }
-                        // A snapshot fetched before the user switched modes carries the
-                        // previous generation. Painting it would put one frame of the old
-                        // surface on top of the new one, so it is dropped and the next
-                        // tick simply asks again.
-                        if (snapshot != null && !presentationStale(
-                                snapshot.getInt("displayGeneration", 0))) {
+                        if (snapshot != null && snapshot.getString("runMode") == "overlay") {
                             clearSurfaces()
                             return@post
                         }
@@ -140,22 +148,10 @@ class GameHintLayer {
     }
 
     /**
-     * Called by the control right before it acknowledges a switch: drops every surface this
-     * layer drew, so the acknowledgement cannot race a still-visible hint.
+     * Called by the control when it hides the in-game surface: drops every view this layer
+     * drew so a hidden control never leaves a hint behind.
      */
     fun hideNow() = clearSurfaces()
-
-    /**
-     * True when the snapshot was taken for a display-mode generation that has already been
-     * superseded by the decision this layer paints under. Same rule as the manager's
-     * generation stamp: the in-game hint surface and the system overlays must never paint
-     * for two different modes. A snapshot without the field (older manager) is accepted.
-     */
-    private fun presentationStale(snapshotGeneration: Int): Boolean {
-        if (snapshotGeneration == 0) return false
-        val current = modeGeneration()
-        return current != 0 && snapshotGeneration != current
-    }
 
     private fun clearSurfaces() {
         panel?.close()
@@ -168,6 +164,7 @@ class GameHintLayer {
         previousButtonSource = ""
     }
 
+    /** Builds and shows the in-game hints. Only ever called in Hook mode. */
     fun attach(activity: Activity) {
         detach()
         val decor = activity.window?.decorView as? FrameLayout ?: return
@@ -177,18 +174,18 @@ class GameHintLayer {
         main.post(tick)
     }
 
-    /** Supplies the mode generation the in-game surface currently paints under. */
     /**
-     * False while the in-game hint surface must stay down (overlay mode, switch window).
-     * The tick consults it, so "hidden" covers the hints and not only the control bar: the
-     * acknowledgement the control sends promises exactly this.
+     * False while the in-game hint surface must stay down (gate not decided yet, no activity).
+     * The tick consults it, so hiding covers the hints and not only the control bar.
      */
     @JvmField var presentationAllowed: () -> Boolean = { true }
 
-    /** Mode generation the in-game surface currently paints under. */
-    @JvmField var modeGeneration: () -> Int = { 0 }
+    /** Java setter for [presentationAllowed] (GameTopControl runs in the game process). */
+    fun setPresentationAllowed(allowed: () -> Boolean) {
+        presentationAllowed = allowed
+    }
 
-    private fun allowed(): Boolean = runCatching { presentationAllowed() }.getOrDefault(true)
+    private fun allowed(): Boolean = runCatching { presentationAllowed() }.getOrDefault(false)
 
     fun detach() {
         generation++

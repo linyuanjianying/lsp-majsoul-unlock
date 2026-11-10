@@ -81,8 +81,9 @@ internal fun AiScreen(padding: PaddingValues) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 overlayAllowed = Settings.canDrawOverlays(context)
+                // The stored selection only. It is what the next service start will use;
+                // resuming this screen never pushes a mode into a running service.
                 displayMode = AssistantDisplayModeSettings.read(context)
-                AiOverlayService.refreshDisplayMode()
             }
         }
         lifecycle.addObserver(observer)
@@ -209,37 +210,48 @@ internal fun AiScreen(padding: PaddingValues) {
         Text(modelMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         ManagerCard {
             Text("显示与控制模式", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("提示和无人值守控制共用同一个显示位置，两种模式二选一，避免重复显示。", style = MaterialTheme.typography.bodySmall)
+            Text("提示和无人值守控制只用一套界面：游戏内 Hook 或系统悬浮窗，二选一，不会同时出现。", style = MaterialTheme.typography.bodySmall)
+            // A running service keeps the mode it snapshotted when it started; the selection
+            // below is therefore stored for the *next* start and the buttons are disabled
+            // while the assistant runs, so no click can create the impression of a live switch.
+            val modeLocked = status.running
             ManagerActions(
                 first = {
                     ManagerOutlinedButton(onClick = {
+                        if (modeLocked) return@ManagerOutlinedButton
                         displayMode = AssistantDisplayMode.HOOK
-                        // The save itself asks the service to rebuild; passing the local
-                        // rebuild here keeps one code path for both.
-                        AssistantDisplayModeSettings.save(context, displayMode) { AiOverlayService.refreshDisplayMode() }
-                    }, modifier = it) {
+                        AssistantDisplayModeSettings.save(context, displayMode)
+                    }, modifier = it, enabled = !modeLocked) {
                         Text(if (displayMode == AssistantDisplayMode.HOOK) "已选：游戏内 Hook" else "游戏内 Hook")
                     }
                 },
                 second = {
                     ManagerOutlinedButton(onClick = {
+                        if (modeLocked) return@ManagerOutlinedButton
                         displayMode = AssistantDisplayMode.OVERLAY
-                        AssistantDisplayModeSettings.save(context, displayMode) { AiOverlayService.refreshDisplayMode() }
-                    }, modifier = it) {
+                        AssistantDisplayModeSettings.save(context, displayMode)
+                    }, modifier = it, enabled = !modeLocked) {
                         Text(if (displayMode == AssistantDisplayMode.OVERLAY) "已选：系统悬浮窗" else "系统悬浮窗")
                     }
                 },
             )
+            if (modeLocked) {
+                Text("助手正在运行：以上选择将在下次开启助手时生效。本次运行固定使用启动时读取的模式，运行中不会切换，也不会重建界面。",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text("当前选择将在下一次开启助手（以及随后启动的游戏）时生效。",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             when (displayMode) {
                 AssistantDisplayMode.HOOK -> {
-                    Text("游戏内 Hook（默认）：控制把手、胶囊菜单和牌面提示都画在游戏窗口内，不需要悬浮窗权限。")
+                    Text("游戏内 Hook（默认）：控制把手、胶囊菜单和牌面提示都画在游戏窗口内，不需要悬浮窗权限。改选后请完全重启游戏，游戏内界面才会按新选择创建。")
                 }
                 AssistantDisplayMode.OVERLAY -> {
-                    Text("系统悬浮窗：使用独立的悬浮窗和牌面提示浮层，需要悬浮窗权限。")
+                    Text("系统悬浮窗：只使用独立的悬浮窗和牌面提示浮层，不会在游戏窗口内创建把手或提示。")
                     if (overlayAllowed) {
                         Text("已获得悬浮窗权限，助手开启后悬浮窗即可显示。")
                     } else {
-                        Text("尚未获得悬浮窗权限；授权前会继续使用游戏内 Hook 方式，不会强制跳转。")
+                        Text("尚未获得悬浮窗权限：助手仍按悬浮窗模式运行，但不会显示界面，也不会自动改用游戏内 Hook；日志会记录原因。")
                         ManagerTextButton(onClick = {
                             context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                                 Uri.parse("package:${context.packageName}")))

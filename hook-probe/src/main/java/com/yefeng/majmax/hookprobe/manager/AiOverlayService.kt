@@ -69,19 +69,18 @@ class AiOverlayService : Service() {
         @Volatile private var hintButtonSourceH = 0
         internal fun hintSnapshot(): android.os.Bundle = android.os.Bundle().apply {
             val service = instance
-            // The in-game hint layer is only meaningful in Hook mode. In overlay mode
-            // the system tile-badge overlay renders the same hints, so report
-            // "not running" here to make the in-game layer clear itself and stop
-            // painting, without tearing down the service or its polling.
-            val overlayMode = service?.let { AssistantDisplayModeSettings.overlayActive(it) } == true
-            // The generation at the moment the snapshot was taken. The in-game hint layer
-            // compares it with the generation of the decision the control currently paints
-            // under; a snapshot computed before the user switched modes is discarded
-            // instead of painting one last frame of the old surface.
-            putInt("displayGeneration", AssistantDisplayModeSettings.generation())
+            // Hints are owned by exactly one surface, decided by the service's own
+            // onCreate snapshot. In overlay mode the system tile-badge overlay renders
+            // them, so this in-game snapshot reports "not running" and the in-game layer
+            // (when a game process built one) clears itself. A display error never
+            // switches this to hook: the overlay selection stands and reports the error.
+            val run = AssistantDisplayRun.current
+            val overlayMode = run?.mode == AssistantDisplayMode.OVERLAY
             val running = service?.let { svc ->
                 svc.alive.get() && !svc.demoMode.get() && !overlayMode
             } == true
+            putString("runMode", run?.mode?.wire ?: "")
+            if (run?.overlayError != null) putString("displayError", run.overlayError)
             putBoolean("overlayMode", overlayMode)
             putBoolean("running", running)
             putBoolean("recommendationPanel", service?.let { RecommendationPanelSettings.read(it) } ?: false)
@@ -165,22 +164,15 @@ class AiOverlayService : Service() {
             ?.auto?.isEnabled()
 
         /**
-         * Re-reads the persisted display mode and (re)builds or tears down the two
-         * system overlays accordingly. Called by the settings UI right after the user
-         * changes the mode while the service is running, so the switch is immediate
-         * instead of waiting for a service restart. Safe to call when not running.
-         */
-        internal fun refreshDisplayMode() {
-            instance?.let { service -> service.main.post { service.applyDisplayMode() } }
-        }
-
-        /**
          * True only once the service reached onCreate AND its startForeground call
          * completed without the platform refusing the background start. This is the
          * real "start succeeded" signal; `alive` alone is true from the first line of
          * onCreate, before startForeground has even run.
          */
         internal fun isAlive(): Boolean = instance?.foregroundReady?.get() == true
+
+        /** True once this process holds a live service instance (even before foreground). */
+        internal fun hasInstance(): Boolean = instance != null
 
         internal fun currentEndpoint(): CaptureEndpoint? = advertisedEndpoint?.let {
             CaptureEndpoint(it.port, it.token.copyOf())
@@ -207,11 +199,14 @@ class AiOverlayService : Service() {
         }
     }
 
+    /**
+     * One queued unit of work. There is deliberately no display-mode stamp: the mode cannot
+     * change while this service instance runs, so a result computed here is always for the
+     * surface this run owns.
+     */
     private data class Packet(val epoch: Long, val revision: Long, val connection: Long = 0,
         val kind: Int, val bytes: ByteArray = byteArrayOf(), val message: String = "",
-        val source: Long = 0, val sequence: Long = 0,
-        /** Display-mode generation the frame was accepted under (0 = replay/posted). */
-        val displayGeneration: Int = 0)
+        val source: Long = 0, val sequence: Long = 0)
     private val auto by lazy { AutoDiscardController(log = { message ->
         val parts = message.split(' ', limit = 2)
         DiagnosticsStore.appendAssistant(this, "INFO", "assistant.autoplay", parts[0].removeSuffix(":"),
@@ -234,6 +229,10 @@ class AiOverlayService : Service() {
     private val demoMode = AtomicBoolean(false)
     private val epoch = AtomicLong(0)
     private val revision = AtomicLong(0)
+    /** Identifies this service instance in the display-mode diagnostics. */
+    private val runNonce = AtomicLong(0)
+    /** Elapsed-realtime stamp of this instance's onCreate; guards [AssistantDisplayRun]. */
+    @Volatile private var runStartedAt = 0L
     private val queue = ArrayBlockingQueue<Packet>(64)
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var server: ServerSocket? = null
@@ -248,6 +247,18 @@ class AiOverlayService : Service() {
     private var previousPanelEnabled = true
 
     private fun updateRecommendationPanel() {
+        runCatching { renderRecommendationPanel() }
+            .onFailure { DiagnosticsStore.appendAssistant(this, "WARN", "assistant.service",
+                "RECOMMENDATION_PANEL_UPDATE_FAILED",
+                JSONObject().put("error", it.javaClass.simpleName)) }
+    }
+
+    /**
+     * Same work as [updateRecommendationPanel] but throws: used where a failure is a real
+     * error (the first render after the panel window is created) rather than a repaint
+     * hiccup on an already working overlay.
+     */
+    private fun renderRecommendationPanel() {
         val panel = recommendationPanel ?: return
         val value = hintResult
         val enabled = RecommendationPanelSettings.read(this)
@@ -261,7 +272,7 @@ class AiOverlayService : Service() {
     private val autoUiTick = object : Runnable {
         override fun run() {
             if (!alive.get()) return
-            applyDisplayMode()
+            applyOverlaySurface()
             updateRecommendationPanel()
             overlay?.updateAuto(AutoDiscardState.mutable.value)
             // Pushed on the same 200 ms tick as the mode: the switch follows a change made
@@ -325,116 +336,174 @@ class AiOverlayService : Service() {
         // overlay permission is off. Binding here is harmless when no overlay window is
         // ever shown.
         GeometryTrace.bind(this)
-        applyDisplayMode()
+        // The single decision of this run. Everything below (which windows are created, which
+        // hints are exported, what the game process is told) reads this snapshot and never the
+        // stored preference again, so a settings change made later cannot rebuild a surface.
+        val selection = AssistantDisplayModeSettings.read(this)
+        val startedAt = SystemClock.elapsedRealtime()
+        runStartedAt = startedAt
+        val run = AssistantDisplayRun.start(selection, startedAt, runNonce.incrementAndGet().toString())
+        DiagnosticsStore.appendAssistant(this, "INFO", "assistant.display", "RUN_MODE",
+            JSONObject().put("mode", run.mode.wire)
+                .put("overlayPermission", android.provider.Settings.canDrawOverlays(this))
+                .put("selected", selection.wire))
+        applyOverlaySurface()
         main.post(autoUiTick)
         worker = Thread({ consume() }, "majmax-ai-engine").also { it.start() }
         reader = Thread({ listen() }, "majmax-ai-reader").also { it.start() }
     }
 
     /**
-     * Builds or tears down the system overlay surfaces to match the persisted display
-     * mode. In overlay mode both the floating window and the system tile-badge overlay
-     * are shown (only when the app actually holds the overlay permission); in Hook mode
-     * they are both removed, leaving the in-game controls and hints as the single
-     * surface. This is idempotent and never force-opens the permission page.
+     * Maintains the system overlay windows **of this run only**.
      *
-     * It runs on the service's 200 ms tick, so it is also what keeps the overlay away while
-     * a switch made in the settings screen is still unanswered by the game — the one window
-     * in which the in-game control could paint from its previous reply.
+     * The mode is the snapshot taken in [onCreate]; the stored selection is never read here,
+     * so changing the setting while the service runs cannot rebuild anything. That is what
+     * makes the two surfaces strictly one-or-the-other:
      *
-     * It also owns the manager half of the presentation lease: the overlay surface is
-     * only published as the owner once both windows are actually on screen, and a failed
-     * build ([AssistantDisplayModeSettings.noteOverlayFailed]) hands the surface back to
-     * the in-game control instead of leaving the user with neither. That is what a
-     * revoked permission or a refused window type would otherwise cause, because the
-     * game hides its control from the persisted mode alone.
+     *  - `HOOK`: no overlay window is ever created. The service still measures the permission
+     *    for its diagnostics, but the in-game control and hint layer are the single surface.
+     *  - `OVERLAY`: the floating window, the tile badge and the recommendation panel are
+     *    created, and the in-game surface is not (see [hintSnapshot]). When the permission is
+     *    missing or any one of the three windows cannot be built, **every** window of this run
+     *    is closed, the OVERLAY selection is kept, and the reason is recorded
+     *    ([AssistantDisplayRun.noteOverlayError]) and logged. An error is only ever cleared on
+     *    a tick where all three windows are actually up. Nothing falls back to Hook: an
+     *    invisible overlay is reported, not replaced.
      *
-     * Runs on the main thread from [autoUiTick], [onCreate] and the settings UI, so the
-     * lease publication is ordered with the window add/remove calls above it.
+     * Idempotent and cheap, so it can run on the 200 ms tick: it only records and clears the
+     * error and replays the cached hints onto windows it created itself.
+     *
+     * Runs on the main thread from [onCreate], [autoUiTick] and the settings UI.
      */
-    private fun applyDisplayMode() {
-        AssistantDisplayModeSettings.ensureLoaded(this)
-        val mode = AssistantDisplayModeSettings.read(this)
-        val generation = AssistantDisplayModeSettings.generation()
-        val wantsOverlay = AssistantDisplayModeSettings.effective(this) == AssistantDisplayMode.OVERLAY
-        if (!wantsOverlay) {
-            // Hook mode: remove the windows first, and only then tell the game that the
-            // system surface is gone. Publishing "not selected" before the windows are
-            // detached would let the in-game control paint for one tick next to a window
-            // that is still attached.
-            val hadWindows = overlay != null || badges != null || recommendationPanel != null
-            recommendationPanel?.close(); recommendationPanel = null
-            overlay?.close(); overlay = null
-            badges?.close(); badges = null
+    private fun applyOverlaySurface() {
+        val run = AssistantDisplayRun.current ?: return
+        if (run.mode != AssistantDisplayMode.OVERLAY) return
+        if (!android.provider.Settings.canDrawOverlays(this)) {
+            // Keep the selection, drop any window that may still exist (a revoked app-op),
+            // and report the reason exactly once per run.
+            releaseOverlayWindows()
+            recordOverlayError("overlay_permission_missing")
+            return
+        }
+        val hadFloating = overlay != null
+        val hadBadges = badges != null
+        val hadPanel = recommendationPanel != null
+        // Every build below follows the same shape: construct into a local, show it, and only
+        // then publish it to the field. A throw (or a window manager refusal) closes that
+        // candidate, so a half-built window is never left attached and never stored.
+        if (recommendationPanel == null) {
+            val candidate = runCatching { RecommendationPanelOverlay(this) }.getOrNull()
+            if (candidate == null) {
+                failOverlayWindows("recommendation_panel_failed")
+                return
+            }
+            recommendationPanel = candidate
             previousPanelResult = null
             previousPanelEnabled = true
-            DisplayModeLeaseLocal.setOverlaySelected(false, generation)
-            if (hadWindows) {
-                DiagnosticsStore.appendAssistant(this, "INFO", "assistant.display", "OVERLAY_DISMISSED",
-                    JSONObject().put("mode", mode.wire))
-            }
-            return
         }
-        // Overlay wanted, but only the game's acknowledgement that it hid its own surfaces
-        // may start the window. There is no timeout here on purpose: showing the overlay
-        // while the in-game control still paints is the bug this protocol exists to stop,
-        // and "waiting" costs nothing but an empty screen for one poll.
-        if (!AssistantDisplayModeSettings.overlayMayPaint(this)) {
-            // Keep the selection intent visible to the game (it needs it to hide and
-            // acknowledge) without claiming the surface.
-            DisplayModeLeaseLocal.setOverlaySelected(true, generation)
-            DisplayModeLeaseLocal.drop(generation)
-            return
-        }
-        // Selected on purpose: overlay mode is wanted and acknowledged. Published before the
-        // build so a reply built during it already says "overlay wanted, nobody owns it yet".
-        DisplayModeLeaseLocal.setOverlaySelected(true, generation)
-        val existing = overlay != null || badges != null || recommendationPanel != null
-        if (recommendationPanel == null) {
-            recommendationPanel = RecommendationPanelOverlay(this)
-            previousPanelResult = null
-        }
-        val needsReplay = overlay == null || badges == null
-        var failed = false
         if (overlay == null) {
-            runCatching {
-                overlay = AiFloatingWindow(this, { stop(this) }, { auto.toggle() },
-                    { enabled -> setRematchEnabled(enabled) }, { rematchState() }).also { it.show() }
-            }.onFailure {
-                overlay?.close(); overlay = null; failed = true
-                DiagnosticsStore.appendAssistant(this, "WARN", "assistant.service", "LEGACY_OVERLAY_UNAVAILABLE")
+            val candidate = runCatching {
+                AiFloatingWindow(this, { stop(this) }, { auto.toggle() },
+                    { enabled -> setRematchEnabled(enabled) }, { rematchState() })
+            }.getOrNull()
+            if (candidate == null) {
+                failOverlayWindows("floating_window_failed", "LEGACY_OVERLAY_UNAVAILABLE")
+                return
             }
+            try {
+                candidate.show()
+            } catch (error: Throwable) {
+                runCatching { candidate.close() }
+                failOverlayWindows("floating_window_failed", "LEGACY_OVERLAY_UNAVAILABLE", error)
+                return
+            }
+            overlay = candidate
         }
         if (badges == null) {
-            runCatching {
-                badges = TileBadgeOverlay(this).also { it.show() }
-            }.onFailure {
-                badges?.close(); badges = null; failed = true
-                DiagnosticsStore.appendAssistant(this, "WARN", "assistant.service", "BADGE_OVERLAY_UNAVAILABLE")
+            val candidate = runCatching { TileBadgeOverlay(this) }.getOrNull()
+            if (candidate == null) {
+                failOverlayWindows("badge_overlay_failed", "BADGE_OVERLAY_UNAVAILABLE")
+                return
             }
+            try {
+                candidate.show()
+            } catch (error: Throwable) {
+                runCatching { candidate.close() }
+                failOverlayWindows("badge_overlay_failed", "BADGE_OVERLAY_UNAVAILABLE", error)
+                return
+            }
+            badges = candidate
         }
         // Re-read the permission after the build: a revoked app-op makes the window add
-        // throw, and a build that produced nothing is just as unusable.
-        if (failed || (!android.provider.Settings.canDrawOverlays(this)) ||
-            (overlay == null && badges == null)) {
-            // Hand the surface back instead of reporting an overlay nobody can see.
-            AssistantDisplayModeSettings.noteOverlayFailed(this)
-            overlay?.close(); overlay = null
-            badges?.close(); badges = null
-            recommendationPanel?.close(); recommendationPanel = null
-            previousPanelResult = null
+        // throw even though `canDrawOverlays` said yes a moment earlier. Every window is
+        // required — a mode whose badge or panel is missing is reported, not half-shown.
+        if (!android.provider.Settings.canDrawOverlays(this) ||
+            overlay == null || badges == null || recommendationPanel == null) {
+            failOverlayWindows(if (!android.provider.Settings.canDrawOverlays(this))
+                "overlay_permission_missing" else "badge_overlay_failed")
             return
         }
-        DisplayModeLeaseLocal.claim(generation)
-        if (!existing) {
-            DiagnosticsStore.appendAssistant(this, "INFO", "assistant.display", "OVERLAY_SHOWN",
-                JSONObject().put("mode", mode.wire).put("generation", generation))
+        // The panel's first render is the only place that can still throw on this run (the
+        // panel adds its window on the first active result); a failure there is a real error
+        // and must not be reported as a successful overlay.
+        val panelFailure = runCatching { renderRecommendationPanel() }.exceptionOrNull()
+        if (panelFailure != null) {
+            failOverlayWindows("recommendation_panel_failed",
+                "RECOMMENDATION_PANEL_UNAVAILABLE", panelFailure)
+            return
         }
-        // Push every cached hint surface onto the freshly created overlays so a mode switch
-        // (or the first overlay-mode tick) restores the last live state immediately, instead
-        // of showing an empty window until the next poll. Idempotent when the overlays
-        // already carried the same state.
-        if (needsReplay) replayHintSurface()
+        // Only here is the overlay genuinely on screen: clear a previous error.
+        if (AssistantDisplayRun.current?.overlayError != null) {
+            AssistantDisplayRun.clearOverlayError()
+            DiagnosticsStore.appendAssistant(this, "INFO", "assistant.display", "OVERLAY_RECOVERED",
+                JSONObject().put("mode", run.mode.wire))
+        }
+        if (!hadFloating || !hadBadges || !hadPanel) {
+            DiagnosticsStore.appendAssistant(this, "INFO", "assistant.display", "OVERLAY_SHOWN",
+                JSONObject().put("mode", run.mode.wire).put("floating", overlay != null)
+                    .put("badge", badges != null).put("panel", recommendationPanel != null)
+                    .put("nonce", run.nonce))
+        }
+        // Push every cached hint surface onto the windows that exist, so the first overlay
+        // tick restores the last live state instead of an empty window. Idempotent.
+        if (!hadFloating || !hadBadges) replayHintSurface()
+    }
+
+    /**
+     * Tears down every window of this run and records [reason]. Used for any failure of any
+     * of the three windows: the surface is either complete or completely absent, and the
+     * error is never cleared while a window is missing.
+     */
+    private fun failOverlayWindows(reason: String, diagnostic: String? = null, cause: Throwable? = null) {
+        releaseOverlayWindows()
+        recordOverlayError(reason)
+        if (diagnostic != null) {
+            DiagnosticsStore.appendAssistant(this, "WARN", "assistant.service", diagnostic,
+                JSONObject().put("reason", reason)
+                    .put("error", cause?.javaClass?.simpleName ?: ""))
+        }
+    }
+
+    /** Closes every system overlay window; the display selection is untouched. */
+    private fun releaseOverlayWindows() {
+        recommendationPanel?.close(); recommendationPanel = null
+        previousPanelResult = null
+        previousPanelEnabled = true
+        overlay?.close(); overlay = null
+        badges?.close(); badges = null
+    }
+
+    /**
+     * Records why the selected overlay is not on screen for this run. The mode stays
+     * OVERLAY; only the reason is published so the status reply and the diagnostics can
+     * explain the empty screen. Logged once per distinct reason.
+     */
+    private fun recordOverlayError(reason: String) {
+        val run = AssistantDisplayRun.current ?: return
+        if (run.overlayError == reason) return
+        AssistantDisplayRun.noteOverlayError(reason)
+        DiagnosticsStore.appendAssistant(this, "WARN", "assistant.display", "OVERLAY_UNAVAILABLE",
+            JSONObject().put("mode", run.mode.wire).put("reason", reason).put("nonce", run.nonce))
     }
 
 
@@ -442,7 +511,7 @@ class AiOverlayService : Service() {
      * Replays the cached hint state onto whichever overlays currently exist. The full
      * engine result (with `analysis`) goes to the floating window, while the trimmed
      * hint plus the captured hand/button coordinates go to the tile-badge overlay.
-     * Used both when a surface is first created ([applyDisplayMode]) and when a
+     * Used both when a surface is first created ([applyOverlaySurface]) and when a
      * configuration change rebuilds the surfaces ([onConfigurationChanged]), so a
      * rotation or resize that clears the badge anchors does not leave them empty
      * waiting for a Lua re-send that its own dedup signature will never emit.
@@ -690,12 +759,8 @@ class AiOverlayService : Service() {
                         }
                         sourceGeneration = source
                         if (kind == 4) continue
-                        // Stamp the frame with the display-mode generation it arrived
-                        // under: a frame captured before the user switched surfaces is
-                        // never painted by the surface that came after the switch.
                         val packet = Packet(epoch.get(), revision.incrementAndGet(), connection, kind, data,
-                            source = source, sequence = sequence,
-                            displayGeneration = AssistantDisplayModeSettings.generation())
+                            source = source, sequence = sequence)
                         if (!queue.offer(packet)) {
                             reset("分析未跟上牌局，等待恢复完整牌局同步")
                             break
@@ -753,7 +818,7 @@ class AiOverlayService : Service() {
                 }
                 // Process every event, but present only the latest state after
                 // a burst; stale inference is never posted over newer input.
-                if (queue.isEmpty()) post(last, packet.epoch, packet.revision, packet.displayGeneration)
+                if (queue.isEmpty()) post(last, packet.epoch, packet.revision)
             }
         } catch (_: InterruptedException) {
             // Normal service shutdown.
@@ -764,23 +829,12 @@ class AiOverlayService : Service() {
         }
     }
 
-    private fun post(result: JSONObject, generation: Long, ticket: Long, displayGeneration: Int = 0) {
+    private fun post(result: JSONObject, generation: Long, ticket: Long) {
         main.post {
             if (!alive.get() || epoch.get() != generation || revision.get() != ticket) return@post
-            // A result derived from a frame that arrived before the user switched display
-            // modes belongs to the surface that is being torn down. Painting it here would
-            // put one frame of the old surface on top of the new one, which is exactly the
-            // "both visible at once" report. Deliberately not cached either: the cache is
-            // what a later mode switch replays.
-            if (displayGeneration != 0 && AssistantDisplayModeSettings.stale(displayGeneration)) {
-                DiagnosticsStore.appendAssistant(this, "INFO", "assistant.display", "STALE_POST_DROPPED",
-                    JSONObject().put("frameGeneration", displayGeneration)
-                        .put("currentGeneration", AssistantDisplayModeSettings.generation()))
-                return@post
-            }
             // Cache both the trimmed hint (badges / in-game layer) and the full result
-            // (floating window) so a later mode switch or configuration change can
-            // replay them without waiting for the next poll.
+            // (floating window) so a configuration change or a reconnect can replay them
+            // without waiting for the next poll. Only this run's own surfaces are fed.
             hintResult = trimHint(result).toString()
             fullResult = result.toString()
             overlay?.update(result)
@@ -822,10 +876,11 @@ class AiOverlayService : Service() {
         worker?.interrupt()
         queue.clear()
         main.removeCallbacksAndMessages(null)
-        // Hand the presentation surface back before the windows go away, so the in-game
-        // control is never left hidden behind an overlay that no longer exists (service
-        // stopped by the user, by the system, or by a host-process hand-off).
-        AssistantDisplayModeSettings.resetLease()
+        // The run ends with the service: the snapshot is dropped (the stored selection is
+        // untouched), and with it every window this run created. A game process that is
+        // still alive keeps the mode it was started with; it only re-reads on its own
+        // restart, and the next service start snapshots the (possibly new) selection.
+        AssistantDisplayRun.finish(runStartedAt)
         badges?.close()
         recommendationPanel?.close(); recommendationPanel = null
         overlay?.close()

@@ -1113,7 +1113,7 @@ class AutoDiscardInstrumentation : Instrumentation() {
             CatalogChecks.run(targetContext, context)
             sendStatus(0, Bundle().apply { putString("stream", "PASS unlock catalog update, recovery and GitHub routes\n") })
             DisplayModeChecks.run(targetContext)
-            sendStatus(0, Bundle().apply { putString("stream", "PASS assistant display-mode switch (overlay vs in-game Hook) and provider broadcast\n") })
+            sendStatus(0, Bundle().apply { putString("stream", "PASS startup-selected single display mode; no fallback or live handoff\n") })
             if (!controllerOnly) {
                 ModelContractChecks.run(targetContext, context)
                 sendStatus(0, Bundle().apply { putString("stream", "PASS ONNX/JNI contracts: four-player and sanma, bool/float masks and crossed-pair rejection\n") })

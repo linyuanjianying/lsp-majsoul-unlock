@@ -3,21 +3,22 @@ package com.yefeng.majmax.hookprobe.manager
 import android.content.Context
 import android.content.ContextWrapper
 import android.os.Bundle
-import android.provider.Settings
 
 /**
- * Regression checks for the assistant display-mode switch (system overlay vs in-game
- * Hook). These exercise the pure decision logic, the preference round-trip and the
- * single-surface lease without touching the real overlay permission, a window, or the
- * game process.
+ * Regression checks for the single-surface display mode (system overlay vs in-game Hook).
  *
- * The reported bug these guard against: "the floating window and the in-game drawing were
- * occasionally active at the same time". The root cause was that each surface decided for
- * itself from the persisted mode, and each polling loop observes a switch a little later
- * than the other. The lease ([DisplayModeLease] / [DisplayModeLeaseLocal]) is the fix; the
- * cases below replay the orderings that used to overlap. The same cases run on a plain JVM
- * through `tools/tests/run-display-mode-lease.sh`, so they also catch a regression without
- * a device.
+ * The contract these guard is deliberately plain:
+ *
+ *  - the stored preference is a **selection for the next start**; saving it never rewrites a
+ *    running service's mode;
+ *  - a service instance snapshots that selection once, in `onCreate`, and that snapshot is
+ *    both the surface it builds and the answer it publishes;
+ *  - exactly one surface exists: hook mode creates no overlay window, overlay mode creates no
+ *    in-game view, and an overlay that cannot be built is **reported**, not replaced by hook;
+ *  - a caller that cannot read the mode keeps what it knew (never a silent "hook").
+ *
+ * The previous revision of this file tested a lease/acknowledgement protocol that has been
+ * removed. The stale cases were replaced instead of being kept as a facade.
  */
 internal object DisplayModeChecks {
     fun run(target: Context) {
@@ -27,7 +28,7 @@ internal object DisplayModeChecks {
                 super.getSharedPreferences("display-mode-checks-$name", mode)
         }
         isolated.getSharedPreferences("assistant-display", Context.MODE_PRIVATE).edit().clear().commit()
-        val overlayPermission = Settings.canDrawOverlays(isolated)
+        AssistantDisplayRun.reset()
 
         // Default is Hook (no overlay permission needed).
         check(AssistantDisplayModeSettings.read(isolated) == AssistantDisplayMode.HOOK)
@@ -37,246 +38,136 @@ internal object DisplayModeChecks {
         check(AssistantDisplayMode.fromWire("overlay") == AssistantDisplayMode.OVERLAY)
         check(AssistantDisplayMode.fromWire("hook") == AssistantDisplayMode.HOOK)
 
-        // Core decision: overlay only when selected AND permission held.
-        check(AssistantDisplayModeSettings.resolve(AssistantDisplayMode.OVERLAY, true) == AssistantDisplayMode.OVERLAY)
-        // Selected but no permission -> falls back to Hook, never "neither".
-        check(AssistantDisplayModeSettings.resolve(AssistantDisplayMode.OVERLAY, false) == AssistantDisplayMode.HOOK)
-        check(AssistantDisplayModeSettings.resolve(AssistantDisplayMode.HOOK, true) == AssistantDisplayMode.HOOK)
-        check(AssistantDisplayModeSettings.resolve(AssistantDisplayMode.HOOK, false) == AssistantDisplayMode.HOOK)
-
-        // Persistence round-trip survives a fresh read.
+        // Persistence round-trip survives a fresh read; the wire strings are the protocol.
         AssistantDisplayModeSettings.save(isolated, AssistantDisplayMode.OVERLAY)
         check(AssistantDisplayModeSettings.read(isolated) == AssistantDisplayMode.OVERLAY)
+        check(AssistantDisplayModeSettings.selectedIs(isolated, AssistantDisplayMode.OVERLAY))
         AssistantDisplayModeSettings.save(isolated, AssistantDisplayMode.HOOK)
-        check(AssistantDisplayModeSettings.read(isolated) == AssistantDisplayMode.HOOK)
-
-        // The wire strings and owner ids are part of the provider protocol.
+        check(AssistantDisplayModeSettings.read(isolated) == AssistantDisplayMode.HOOK
+            && AssistantDisplayModeSettings.selectedIs(isolated, AssistantDisplayMode.HOOK))
         check(AssistantDisplayMode.HOOK.wire == "hook")
         check(AssistantDisplayMode.OVERLAY.wire == "overlay")
-        check(DisplayModeOwner.NONE == 0)
-        check(DisplayModeOwner.OVERLAY == 1)
-        check(DisplayModeOwner.HOOK == 2)
 
-        // A switch starts a new generation; a reply stamped with the old one is stale.
-        val beforeSwitch = AssistantDisplayModeSettings.generation()
-        AssistantDisplayModeSettings.save(isolated, AssistantDisplayMode.OVERLAY)
-        check(AssistantDisplayModeSettings.generation() != beforeSwitch)
-        check(AssistantDisplayModeSettings.stale(beforeSwitch))
-        check(!AssistantDisplayModeSettings.stale(AssistantDisplayModeSettings.generation()))
-
-        // A failed overlay build hands the surface back instead of leaving neither.
-        // Regression: the marker used to be stamped on the *old* generation and then the
-        // counter was bumped, so overlayUnavailable() was permanently false.
-        check(!AssistantDisplayModeSettings.overlayUnavailable())
-        val failedAt = AssistantDisplayModeSettings.generation()
-        AssistantDisplayModeSettings.noteOverlayFailed(isolated)
-        check(AssistantDisplayModeSettings.generation() != failedAt) {
-            "noteOverlayFailed must start a new generation"
-        }
-        check(AssistantDisplayModeSettings.overlayUnavailable()) {
-            "overlayUnavailable must report the failure for the live generation"
-        }
-        check(AssistantDisplayModeSettings.effective(isolated) == AssistantDisplayMode.HOOK)
-        // A second report for the same failure is idempotent, not a generation churn.
-        val afterFirst = AssistantDisplayModeSettings.generation()
-        AssistantDisplayModeSettings.noteOverlayFailed(isolated)
-        check(AssistantDisplayModeSettings.generation() == afterFirst) {
-            "repeated failure reports must not advance the live generation"
-        }
-        check(AssistantDisplayModeSettings.overlayUnavailable())
-        // The next selection clears it (the user may have granted the permission).
-        AssistantDisplayModeSettings.save(isolated, AssistantDisplayMode.HOOK)
-        check(!AssistantDisplayModeSettings.overlayUnavailable())
-
-        // The status bundle carries the mode and the lease to the in-game control; a
-        // missing key (older manager) reads back as "not overlay" so the control stays.
-        val status = AssistLaunch.status()
-        check(!status.getBoolean("overlayMode", false))
-        check(status.getString("displayMode", "hook") == "hook")
-
-        val hooked = AssistLaunch.withDisplayMode(isolated, Bundle())
-        check(!hooked.getBoolean("overlayMode", true))
-        check(hooked.containsKey("displayOwner"))
-        check(hooked.containsKey("displayGeneration"))
-        check(hooked.containsKey("displayOverlayFailed"))
-        // A reply computed before the last switch reports "nobody owns the surface" for the
-        // new generation, which is what keeps the two surfaces from overlapping.
-        check(hooked.getInt("displayOwner", -1) == DisplayModeOwner.NONE)
-        check(hooked.getInt("displayGeneration", -1) == AssistantDisplayModeSettings.generation())
-
-        AssistantDisplayModeSettings.save(isolated, AssistantDisplayMode.OVERLAY)
-        val overlay = AssistLaunch.withDisplayMode(isolated, Bundle())
-        check(overlay.getString("displayMode") == "overlay")
-        // `overlayMode` is the permission-checked persisted selection; whether the in-game
-        // control may paint is decided by the lease fields of the same bundle.
-        check(!overlay.getBoolean("overlayMode", false)) // no system window owns the lease yet
-        AssistantDisplayModeSettings.save(isolated, AssistantDisplayMode.HOOK)
-        DisplayModeLeaseLocal.setOverlaySelected(false, AssistantDisplayModeSettings.generation())
-
-        persistedGenerationChecks(isolated)
-        leaseChecks()
-        managerLeaseChecks()
+        selectionVersusRunChecks(isolated)
+        overlayErrorChecks(isolated)
+        selectionReplyChecks(isolated)
     }
 
     /**
-     * Regression: the generation must survive a manager restart.
-     *
-     * It used to live only in the manager process, so a restarted manager handed out
-     * generation 1 again. The game drops every reply stamped below the newest generation it
-     * applied, so it would have rejected all of them and kept painting next to the overlay.
+     * The selection is not the run. Saving overlay while a hook service runs must not change
+     * what that service reports, and a later save back to hook must not change a running
+     * overlay service either.
      */
-    private fun persistedGenerationChecks(target: Context) {
-        val first = AssistantDisplayModeSettings.generation()
-        check(first > 0) { "a generation must exist after the first read" }
-        AssistantDisplayModeSettings.ensureLoaded(target)
-        check(AssistantDisplayModeSettings.generation() == first) {
-            "loading twice must not change the generation"
-        }
-        // The stored value is what a fresh process resumes; it is committed, not applied.
-        val stored = target.getSharedPreferences("assistant-display", Context.MODE_PRIVATE)
-        val persisted = stored.getInt("displayGeneration", -1)
-        check(persisted == first) { "persisted generation $persisted != live $first" }
-        // Selecting another mode advances it and commits again.
+    private fun selectionVersusRunChecks(target: Context) {
         AssistantDisplayModeSettings.save(target, AssistantDisplayMode.HOOK)
-        val after = AssistantDisplayModeSettings.generation()
-        check(after > first) { "a switch must advance the generation" }
-        check(stored.getInt("displayGeneration", -1) == after) {
-            "the new generation must be persisted immediately"
+        val hookRun = AssistantDisplayRun.start(AssistantDisplayMode.HOOK, 1_000L, "run-1")
+        check(hookRun.mode == AssistantDisplayMode.HOOK)
+        check(!hookRun.overlayReady)
+        // The user picks overlay while the service runs: nothing is rebuilt.
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.OVERLAY)
+        check(AssistantDisplayRun.mode == AssistantDisplayMode.HOOK) {
+            "a settings save must not change the running mode"
         }
-        // A stamp newer than this process knows is not stale (the restart case, other side).
-        check(!AssistantDisplayModeSettings.stale(after + 1))
-        check(AssistantDisplayModeSettings.stale(first))
+        check(DisplayModeSnapshotStore.ofService()?.mode == AssistantDisplayMode.HOOK)
+        check(DisplayModeSnapshotStore.ofService()?.source == DisplayModeSnapshotStore.MODE_SOURCE_SERVICE)
+        // The next start takes the new selection.
+        AssistantDisplayRun.finish(1_000L)
+        check(AssistantDisplayRun.current == null) { "the run must not survive its service" }
+        check(AssistantDisplayModeSettings.read(target) == AssistantDisplayMode.OVERLAY) {
+            "the selection survives the run"
+        }
+        val overlayRun = AssistantDisplayRun.start(AssistantDisplayMode.OVERLAY, 2_000L, "run-2")
+        check(overlayRun.mode == AssistantDisplayMode.OVERLAY)
+        check(overlayRun.overlayReady) { "an overlay run without a reported error is ready" }
+        // And a save back to hook leaves it alone until the next start.
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.HOOK)
+        check(AssistantDisplayRun.mode == AssistantDisplayMode.OVERLAY)
+        // A superseded instance must not clear the current run's snapshot.
+        AssistantDisplayRun.finish(1_000L)
+        check(AssistantDisplayRun.current?.nonce == "run-2")
+        AssistantDisplayRun.finish(2_000L)
+        check(AssistantDisplayRun.current == null)
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.HOOK)
     }
 
     /**
-     * The lease as the **game** process decides it. Every case is a state of one status
-     * reply; the interleavings of the two real state machines live in
-     * `tools/tests/DisplayModeLeaseProbe.kt`, which runs on a plain JVM.
+     * A selected overlay that cannot be built keeps the OVERLAY mode and reports the reason.
+     * It never resolves to HOOK and never claims to be ready.
      */
-    private fun leaseChecks() {
-        // Overlay selected and owned: hide, and acknowledge that generation.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(true, DisplayModeOwner.OVERLAY, 3))
-            expect("an owned overlay hides the in-game control", lease.mustHide())
-            expect("an owned overlay is acknowledged", lease.generationToAcknowledge() == 3)
-            expect("the overlay holds the surface", lease.overlayOwnsSurface())
+    private fun overlayErrorChecks(target: Context) {
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.OVERLAY)
+        AssistantDisplayRun.start(AssistantDisplayMode.OVERLAY, 3_000L, "run-3")
+        AssistantDisplayRun.noteOverlayError("overlay_permission_missing")
+        val snapshot = DisplayModeSnapshotStore.ofService()
+        check(snapshot?.mode == AssistantDisplayMode.OVERLAY) {
+            "an unavailable overlay must not become hook mode"
         }
-
-        // The switch window: overlay selected, nobody owns it yet. The game hides first and
-        // acknowledges — this is what the manager waits for before it shows anything.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(true, DisplayModeOwner.NONE, 4))
-            expect("the switch window hides first", lease.mustHide())
-            expect("the switch window acknowledges its generation",
-                lease.generationToAcknowledge() == 4)
-            expect("nobody owns the surface yet", !lease.overlayOwnsSurface())
-        }
-
-        // Renewal: a live claim keeps the control down; only the manager dropping it (or
-        // going silent past the lease) releases the surface again.
-        run {
-            var now = 1_000L
-            val lease = DisplayModeLease({ now })
-            lease.apply(reply(true, DisplayModeOwner.OVERLAY, 5))
-            var hidden = true
-            repeat(30) {
-                now += 1_000L
-                lease.apply(reply(true, DisplayModeOwner.OVERLAY, 5))
-                hidden = hidden && lease.mustHide()
-            }
-            expect("a renewed claim never lapses", hidden)
-        }
-
-        // Hook mode after the overlay is gone: paint, acknowledge nothing new.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(false, DisplayModeOwner.NONE, 6))
-            expect("hook mode paints", !lease.mustHide())
-            expect("hook mode acknowledges nothing", lease.generationToAcknowledge() == 0)
-        }
-
-        // Returning to hook mode while the windows are still attached: the manager keeps
-        // publishing "overlay selected" until they are removed, so the game stays hidden.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(true, DisplayModeOwner.OVERLAY, 7))
-            lease.apply(reply(true, DisplayModeOwner.OVERLAY, 7))
-            expect("hidden while the window is still attached", lease.mustHide())
-            lease.apply(reply(false, DisplayModeOwner.NONE, 8))
-            expect("paints only after the window is gone", !lease.mustHide())
-        }
-
-        // Overlay failed (permission revoked): the manager reports it, the game paints.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(true, DisplayModeOwner.NONE, 9, unavailable = true))
-            expect("a failed overlay paints", !lease.mustHide())
-            expect("a failed overlay acknowledges nothing", lease.generationToAcknowledge() == 0)
-        }
-
-        // Manager unreachable: the in-game control is the only surface left.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(true, DisplayModeOwner.OVERLAY, 10))
-            lease.apply(DisplayModeLease.Reply(
-                overlaySelected = false,
-                owner = DisplayModeOwner.NONE,
-                generation = 10,
-                overlayUnavailable = false,
-                unreachable = true))
-            expect("a lost manager makes the control reachable", !lease.mustHide())
-        }
-
-        // A late reply for a superseded generation is dropped.
-        run {
-            val lease = DisplayModeLease({ 1_000L })
-            lease.apply(reply(false, DisplayModeOwner.NONE, 12))
-            lease.apply(reply(true, DisplayModeOwner.OVERLAY, 11))
-            expect("an older reply is dropped", !lease.mustHide() && lease.generation == 12)
-        }
+        check(snapshot?.overlayReady == false)
+        check(snapshot?.overlayError == "overlay_permission_missing")
+        // Idempotent: the tick repeats the same reason.
+        AssistantDisplayRun.noteOverlayError("overlay_permission_missing")
+        check(AssistantDisplayRun.current?.overlayError == "overlay_permission_missing")
+        // A different reason replaces it (the user granted the permission, the add failed).
+        AssistantDisplayRun.noteOverlayError("floating_window_failed")
+        check(AssistantDisplayRun.current?.overlayError == "floating_window_failed")
+        // Recovery clears it without touching the mode.
+        AssistantDisplayRun.clearOverlayError()
+        check(DisplayModeSnapshotStore.ofService()?.overlayReady == true)
+        check(DisplayModeSnapshotStore.ofService()?.mode == AssistantDisplayMode.OVERLAY)
+        AssistantDisplayRun.finish(3_000L)
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.HOOK)
     }
 
     /**
-     * The manager half: the overlay may only be shown after the game acknowledged that it
-     * hid for the current generation, and the selection flag is what tells the game to hide.
+     * The reply a game process reads. One mode, one answer; a missing service falls back to
+     * the stored selection, and nothing is ever reported as an "owner" or a "lease".
      */
-    private fun managerLeaseChecks() {
-        val generation = 900_001
-        DisplayModeLeaseLocal.publish(generation)
-        DisplayModeLeaseLocal.setOverlaySelected(true, generation)
-        expect("the overlay waits for the game's acknowledgement",
-            !DisplayModeLeaseLocal.mayShowOverlay(generation))
-        // An acknowledgement from before the switch does not count.
-        DisplayModeLeaseLocal.acknowledge(generation - 1)
-        expect("an older acknowledgement does not release the wait",
-            !DisplayModeLeaseLocal.mayShowOverlay(generation))
-        DisplayModeLeaseLocal.acknowledge(generation)
-        expect("the acknowledgement for that generation releases it",
-            DisplayModeLeaseLocal.mayShowOverlay(generation))
-        expect("the game is now known to exist", DisplayModeLeaseLocal.gameSeen())
-        // Back to hook: the flag itself is the instruction, no acknowledgement needed.
-        DisplayModeLeaseLocal.setOverlaySelected(false, generation)
-        expect("hook mode never shows the overlay", !DisplayModeLeaseLocal.mayShowOverlay(generation))
-        DisplayModeLeaseLocal.drop(generation)
-    }
+    private fun selectionReplyChecks(target: Context) {
+        // No service: the stored selection is the answer, marked as such.
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.OVERLAY)
+        val selectedOnly = DisplayModeSnapshotStore.snapshot(target)
+        check(selectedOnly.mode == AssistantDisplayMode.OVERLAY)
+        check(selectedOnly.source == DisplayModeSnapshotStore.MODE_SOURCE_SELECTION)
+        check(!selectedOnly.overlayReady) { "a selection alone is not a running overlay" }
 
-    /** Named check for the lease cases (the shared `check` above takes only a value). */
-    private fun expect(name: String, condition: Boolean) {
-        check(condition) { "display-mode lease: " + name }
-    }
+        // Running hook service: the reply says hook even though overlay is stored.
+        AssistantDisplayRun.start(AssistantDisplayMode.HOOK, 4_000L, "run-4")
+        val run = AssistLaunch.withDisplayMode(target, Bundle())
+        check(run.getString("mode") == "hook")
+        check(run.getString("displayMode") == "hook")
+        check(!run.getBoolean("overlayMode", true))
+        check(!run.getBoolean("overlayReady", true))
+        check(run.getInt("displaySource", -1) == DisplayModeSnapshotStore.MODE_SOURCE_SERVICE)
+        check(run.getString("displayNonce") == "run-4")
+        // The selection for the next start is still visible, but informational.
+        check(run.getString("displaySelected") == "overlay")
+        // The dedicated read-only endpoint agrees with the status reply.
+        val readOnly = AssistLaunch.readDisplaySnapshot(target)
+        check(readOnly?.mode == AssistantDisplayMode.HOOK)
+        // None of the removed protocol fields are published any more.
+        check(!run.containsKey("displayOwner")) { "the lease owner field must be gone" }
+        check(!run.containsKey("overlaySelected")) { "the lease selection field must be gone" }
+        check(!run.containsKey("displayOverlayFailed")) { "the lease failure field must be gone" }
+        check(!run.containsKey("displayGeneration")) { "the lease generation field must be gone" }
+        AssistantDisplayRun.finish(4_000L)
 
-    private fun reply(
-        overlay: Boolean,
-        owner: Int,
-        generation: Int,
-        unavailable: Boolean = false,
-    ) = DisplayModeLease.Reply(
-        overlaySelected = overlay,
-        owner = owner,
-        generation = generation,
-        overlayUnavailable = unavailable,
-        unreachable = false,
-    )
+        // Running overlay service with a broken window: overlay is still the answer.
+        AssistantDisplayRun.start(AssistantDisplayMode.OVERLAY, 5_000L, "run-5")
+        AssistantDisplayRun.noteOverlayError("badge_overlay_failed")
+        val broken = AssistLaunch.withDisplayMode(target, Bundle())
+        check(broken.getString("mode") == "overlay")
+        check(broken.getBoolean("overlayReady", true) == false)
+        check(broken.getString("overlayError") == "badge_overlay_failed")
+        check(broken.getInt("displaySource", -1) == DisplayModeSnapshotStore.MODE_SOURCE_SERVICE)
+        AssistantDisplayRun.finish(5_000L)
+
+        // A service exists but has not produced a snapshot yet: no invented answer.
+        // `AiEndpointProvider.putDisplaySnapshot` turns this into `displaySource = 0` with no
+        // `mode` key at all, which `GameDisplayGate.apply` refuses — the game process must be
+        // able to tell "I could not tell" from "hook", because only the latter builds a
+        // surface. The reply shape itself is asserted here; the gate's refusal is covered by
+        // `tools/tests/DisplayModeProbe.kt` (both are plain logic).
+        check(DisplayModeSnapshotStore.ofService() == null)
+        AssistantDisplayModeSettings.save(target, AssistantDisplayMode.HOOK)
+    }
 }
