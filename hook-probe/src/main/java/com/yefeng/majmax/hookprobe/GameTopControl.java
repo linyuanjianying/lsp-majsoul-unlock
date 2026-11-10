@@ -5,12 +5,7 @@ import android.app.Application;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
-import android.content.res.ColorStateList;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -18,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.text.TextUtils;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -31,6 +27,7 @@ import com.yefeng.majmax.hookprobe.manager.AssistLaunch;
 import com.yefeng.majmax.hookprobe.manager.ManagerLanguage;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -64,14 +61,32 @@ import java.util.function.Consumer;
  *       hints; the reply carries the stored value plus {@code recommendationPanel}.</li>
  * </ul>
  *
- * Surface behaviour: the control is a fixed, top-centre tab, never a draggable
- * floating window. It starts half-hidden at the top edge (a transparent rounded pill
- * with only ~8dp on screen), the first tap shows the full 雀魂助手 capsule, the second
- * tap opens the menu below the top edge, and the collapse row (or ~6s without use)
- * folds it back to the handle. Nothing in the provider protocol is involved in any of
- * that: the stages are pure local view state.
+ * Surface behaviour (three local stages, no provider involved):
  *
- * Nothing here blocks the game's main thread: provider calls run on a worker pool
+ * <ol>
+ *   <li>{@link #STAGE_HANDLE}: the resting entry at the top edge — an 84x30dp translucent
+ *       deep-blue U with a gold outline, its live state dot and its down chevron in one
+ *       row, inside a 108x44dp touch box so it is easy to hit without covering the table
+ *       (the padding is touch area only and is never painted).</li>
+ *   <li>{@link #STAGE_CAPSULE}: the assistant capsule — state dot, one short phrase
+ *       ("unattended running" / "assistant running" / "assistant off"), a hairline, and
+ *       the four-square menu grid. The whole capsule is one tap target.</li>
+ *   <li>{@link #STAGE_MENU}: the full panel — deep-blue surface with a gold outline,
+ *       a header (state dot, name, run-state pill, collapse arrow), a two-part Tab
+ *       (control / status), the switch cards and the status page.</li>
+ * </ol>
+ *
+ * The capsule folds back to the handle after {@link #IDLE_CAPSULE_MS}; the menu keeps
+ * its own, longer window. A start sequence, a write in flight or a finger still down
+ * always postpones the fold (busy / starting guard), so a reply never lands on a
+ * collapsed view.
+ *
+ * <p>Touch: the stage root is only as large as what it draws, and it is clickable only
+ * while the menu is open, where a touch outside the panel is an explicit "close" (the
+ * same action as the header arrow). No full-screen transparent view is ever added, so
+ * the game keeps every touch on its hand tiles and buttons.
+ *
+ * <p>Nothing here blocks the game's main thread: provider calls run on a worker pool
  * with a bounded timeout, results are compared against a generation counter so a
  * late reply can never paint over a newer activity, and only one poll and one user
  * action are ever in flight.
@@ -87,7 +102,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private static final int STAGE_CAPSULE = 1;
     private static final int STAGE_MENU = 2;
 
-    /** Sidebar sections of the expanded menu. */
+    /** Tab sections of the expanded menu, drawn as a two-part tab above the cards. */
     private static final int TAB_CONTROL = 0;
     private static final int TAB_STATUS = 1;
 
@@ -96,14 +111,58 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private static final int TAG_STATE = 0x7E010002;
     private static final int TAG_NOTE = 0x7E010003;
     private static final int TAG_SWITCH = 0x7E010004;
-
-    /** Top inset for the capsule and the menu; the half-hidden tab ignores it. */
-    private static final int TOP_GAP_DP = 8;
-    /** Idle window before the capsule / menu folds back into the handle. */
-    private static final long IDLE_COLLAPSE_MS = 6_000L;
+    /** Card slot of the expandable long explanation ({@link #rematchDetail}). */
+    private static final int TAG_DETAIL = 0x7E010005;
     /**
-     * Fall-back delay while something must not be interrupted: a touch still down, a
-     * start sequence running, or a provider write in flight.
+     * Card slot of the ⓘ button that toggles {@link #TAG_DETAIL}. It used to be read back
+     * through {@code TAG_DETAIL + 1}, a key nothing ever writes, so {@code rematchInfo}
+     * stayed null and {@link #buildControlPage} threw a NullPointerException on the main
+     * thread of the hooked game process the moment the control was attached.
+     */
+    private static final int TAG_INFO = 0x7E010006;
+
+    /**
+     * Touch target of a *primary action* (the start/stop cell and the hand-off row), in
+     * pre-scale dp. The menu is drawn at {@link ScaledMenuHost#SCALE} (.75), so 60dp inside
+     * is the ~45dp the finger gets. Deliberately NOT applied to the chrome: the reporter's
+     * device is 2376x1080 at 2.75, where 60dp becomes 135px of a ~648px menu, and the old
+     * build spent the header and the tab on exactly that budget, leaving one switch card
+     * visible. Content space wins there, so the header/tab/cards use their own compact
+     * constants below.
+     */
+    private static final int TARGET_DP = 60;
+    /**
+     * Header band, pre-scale dp. 28dp is 77px visible on the reporter's 2.75 density (the
+     * visible target was 70..85px) and holds the 16sp title, the 11sp state pill and the
+     * collapse chevron in one centred row of 28dp. The action below it measures its own
+     * 77x72dp touch box instead of inheriting {@link #TARGET_DP}.
+     */
+    private static final int HEADER_DP = 28;
+    /**
+     * Two-part tab band, pre-scale dp. 22dp is ~60px visible (target 55..65px): a 14sp
+     * label with 1dp of padding and 6dp of capsule margin still hits ~106px of width, and
+     * the whole row is one tap wide per half.
+     */
+    private static final int TAB_DP = 28;
+    /**
+     * Height of a switch card, pre-scale dp. 34dp is ~94px visible: title row (16sp + 13sp
+     * state) plus one 12sp note line, which is what the card actually needs. Cards stay the
+     * widest tap target on the page, so this is about density of information, not reach.
+     */
+    private static final int ROW_DP = 34;
+    /** Gutter between header, tab and pages, pre-scale dp (~8px visible). */
+    private static final int CHROME_GAP_DP = 4;
+    /** Inner padding of the menu surface, pre-scale dp (~10px visible). */
+    private static final int PANEL_PAD_DP = 5;
+    /** Top inset for the capsule and the menu; the half-hidden handle ignores it. */
+    private static final int TOP_GAP_DP = 8;
+    /** Idle window before the capsule folds back into the handle. */
+    private static final long IDLE_CAPSULE_MS = 3_000L;
+    /** Idle window before the open menu folds back into the handle. */
+    private static final long IDLE_MENU_MS = 6_000L;
+    /**
+     * Short fall-back delay while something must not be interrupted: a touch still down,
+     * a start sequence running, or a provider write in flight.
      */
     private static final long ACTION_HOLD_MS = 2_000L;
 
@@ -129,10 +188,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private StageRoot panel;
     private FrameLayout.LayoutParams panelParams;
 
-    /** Expanded menu: light rounded panel with a left sidebar and three switch cards. */
+    /** Expanded menu: deep-blue surface, header, two-part tab, two pages. */
     private LinearLayout menu;
-    private TextView title;
     private View titleDot;
+    private TextView title;
+    private TextView statePill;
+    private View collapseButton;
+
     private LinearLayout tabControl;
     private LinearLayout tabStatus;
     private TextView tabControlLabel;
@@ -147,6 +209,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private TextView unattendedState;
     private TextView unattendedNote;
     private GameTopUi.Switch unattendedSwitch;
+    /** The ⓘ button of card 1; hidden while the note line already explains everything. */
+    private GameTopUi.Glyph unattendedInfo;
 
     /* Switch card 2: auto-rematch (rematchSet), independent of card 1. */
     private LinearLayout rematchCard;
@@ -154,6 +218,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private TextView rematchState;
     private TextView rematchNote;
     private GameTopUi.Switch rematchSwitch;
+    /** ⓘ toggle of card 2: it opens the long explanation, it is not a link. */
+    private GameTopUi.Glyph rematchInfo;
+    /** Long explanation of card 2; built with the card, only shown while expanded. */
+    private TextView rematchDetail;
+    private boolean rematchDetailOpen;
 
     /* 开关卡 3：推荐与番点面板（panelSet），与卡 1、卡 2 完全独立。 */
     private LinearLayout panelCard;
@@ -162,14 +231,15 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private TextView panelNote;
     private GameTopUi.Switch panelSwitch;
 
-    /* Status page: runtime facts and the start/stop/manual/collapse actions. */
+    /* Status page: the name row with its state dot, the detail rows and the actions. */
+    private LinearLayout statusCard;
+    private View statusDot;
     private TextView statusMode;
     private TextView statusDetail;
     private TextView statusService;
     private TextView statusRematch;
     private TextView startStop;
     private LinearLayout manualRow;
-    private LinearLayout collapseRow;
 
     /**
      * Survives activity switches so the menu does not collapse on every transition.
@@ -196,17 +266,17 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /* Top-centre docking geometry: the control never drags, it always sits top-centre. */
     private View decor;
-    private TabView handleTab;
-    private TextView capsule;
+    private GameTopUi.HandleView handleTab;
+    private GameTopUi.CapsuleView capsule;
     /** Only keeps the wrap-content root clamped top-centre; it never drives a drag. */
     private SizeWatcher hooks;
 
     /**
      * Idle auto-collapse: while the capsule or the menu is showing, this brings the
-     * control back to the handle after {@link #IDLE_COLLAPSE_MS} without interaction.
-     * Only a user interaction (or an action still running) restarts it - polling and
-     * {@link #applyState()} never do, so a one-second status refresh cannot keep the
-     * menu open forever.
+     * control back to the handle after {@link #IDLE_CAPSULE_MS} (capsule) or
+     * {@link #IDLE_MENU_MS} (menu) without interaction. Only a user interaction (or an
+     * action still running) restarts it — polling and {@link #applyState()} never do, so
+     * a one-second status refresh cannot keep the menu open forever.
      */
     private final Runnable collapseTick = new Runnable() {
         @Override public void run() {
@@ -214,7 +284,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     };
     private long lastTouchAt;
-    /** True between ACTION_DOWN and ACTION_UP/CANCEL inside the menu area. */
+    /** True between ACTION_DOWN and ACTION_UP/CANCEL inside the control. */
     private boolean touching;
 
     /* Last reply from the manager app. */
@@ -275,6 +345,33 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /** Application the receiver is registered against; null while no activity is attached. */
     private Application application;
+
+    /**
+     * One tab / page pair. The two parts of the top tab and the two pages are toggled
+     * together from here. Buttons carry their listener exactly once (set at build time);
+     * a language switch rebuilds the tree instead of re-binding them, so nothing stacks.
+     */
+    private final TabView controlTab = new TabView(TAB_CONTROL);
+    private final TabView statusTab = new TabView(TAB_STATUS);
+
+    private final class TabView {
+        final int id;
+        /** Selectable container: background + ripple. */
+        LinearLayout shell;
+        TextView label;
+
+        TabView(int id) { this.id = id; }
+
+        void unbind() {
+            shell = null;
+            label = null;
+        }
+
+        boolean bound() { return shell != null && label != null; }
+    }
+
+    /* Language / rebuild helpers. */
+    private boolean languageStale;
 
     void register(Application app) {
         application = app;
@@ -351,26 +448,65 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         active = new WeakReference<>(activity);
         decor = decorView;
         seedLanguage(activity);
-        panel = build(activity);
-        // Wrap-content child of the decor view: it is only as large as the visible
-        // stage, never a full-screen surface, so the game keeps every other touch.
-        panelParams = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        ((ViewGroup) decorView).addView(panel, panelParams);
-        // Drag is gone by design: a fixed top-centre tab needs no travel, and the
-        // helper only keeps the (now trivial) position legal after a size change.
-        // The stage survives activity switches; a restored capsule / menu gets a fresh
-        // idle window instead of an already-expired one.
-        if (stage != STAGE_HANDLE) restartIdleTimer();
-        // The stage survived the activity switch, but not the presentation mode: a new
-        // activity must never inherit "in-game control visible" from before the user
-        // moved the surface to the overlay. The next reply re-evaluates it.
-        applyState();
-        hooks = new SizeWatcher(activity);
-        ((ViewGroup) decorView).addOnLayoutChangeListener(hooks);
-        attachHintLayer();
-        schedulePoll(0L);
+        // The control is a guest in the game's own process: a layout failure of the
+        // in-game surface must never become a crash of the game itself. Every build step
+        // stays inside this boundary, and a failure leaves the game running without the
+        // control (the overlay path is untouched).
+        try {
+            panel = build(activity);
+            // Wrap-content child of the decor view: it is only as large as the visible
+            // stage, never a full-screen surface, so the game keeps every other touch.
+            panelParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+            ((ViewGroup) decorView).addView(panel, panelParams);
+            installOutsideObserver(activity);
+            // Drag is gone by design: a fixed top-centre tab needs no travel, and the
+            // helper only keeps the (now trivial) position legal after a size change.
+            // The stage survives activity switches; a restored capsule / menu gets a fresh
+            // idle window instead of an already-expired one.
+            if (stage != STAGE_HANDLE) restartIdleTimer();
+            // The stage survived the activity switch, but not the presentation mode: a new
+            // activity must never inherit "in-game control visible" from before the user
+            // moved the surface to the overlay. The next reply re-evaluates it.
+            applyState();
+            hooks = new SizeWatcher(activity);
+            ((ViewGroup) decorView).addOnLayoutChangeListener(hooks);
+            attachHintLayer();
+            schedulePoll(0L);
+        } catch (RuntimeException | LinkageError failure) {
+            recordSurfaceFailure(activity, "ATTACH", failure);
+            detach();
+        }
+    }
+
+    /**
+     * Records a failed build of the in-game surface and gives up on it for this attach.
+     * Best effort: any failure inside this helper is swallowed, because it runs on the
+     * path that is already recovering from a failure.
+     */
+    private void recordSurfaceFailure(Activity activity, String code, Throwable failure) {
+        try {
+            HookDiagnostics.event("ERROR", "hook.topcontrol", code,
+                HookDiagnostics.fields(
+                    "error", failure.getClass().getName(),
+                    "message", String.valueOf(failure.getMessage()),
+                    "frame", topFrame(failure),
+                    "activities", activity == null ? "none"
+                        : activity.getClass().getName()));
+        } catch (Throwable ignored) {}
+    }
+
+    /** First stack frame inside this module, for a one-line report; empty when unknown. */
+    private static String topFrame(Throwable failure) {
+        String own = GameTopControl.class.getName();
+        for (StackTraceElement frame : failure.getStackTrace()) {
+            if (frame.getClassName().startsWith(own.substring(0, own.lastIndexOf('.')))) {
+                return frame.getClassName() + "." + frame.getMethodName()
+                    + ":" + frame.getLineNumber();
+            }
+        }
+        return "";
     }
 
     /**
@@ -388,6 +524,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     private void detach() {
+        removeOutsideObserver();
         stopIdleTimer();
         touching = false;
         if (hints != null) hints.detach();
@@ -410,23 +547,72 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         menu = null;
         title = null;
         titleDot = null;
-        tabControl = tabStatus = null;
-        tabControlLabel = tabStatusLabel = null;
+        statePill = null;
+        collapseButton = null;
+        controlTab.unbind();
+        statusTab.unbind();
         pageControl = pageStatus = null;
         unattendedCard = null;
         unattendedTitle = unattendedState = unattendedNote = null;
         unattendedSwitch = null;
+        unattendedInfo = null;
         rematchCard = null;
         rematchTitle = rematchState = rematchNote = null;
         rematchSwitch = null;
+        rematchInfo = null;
+        rematchDetail = null;
         panelCard = null;
         panelTitle = panelState = panelNote = null;
         panelSwitch = null;
+        statusCard = null;
+        statusDot = null;
         statusMode = statusDetail = statusService = statusRematch = null;
         startStop = null;
-        manualRow = collapseRow = null;
+        manualRow = null;
         active.clear();
     }
+
+    private android.view.Window observedWindow;
+    private android.view.Window.Callback savedCallback, tapCallback;
+    private void removeOutsideObserver() {
+        if (observedWindow != null && observedWindow.getCallback() == tapCallback)
+            observedWindow.setCallback(savedCallback);
+        observedWindow = null; savedCallback = null; tapCallback = null;
+    }
+    private void installOutsideObserver(Activity activity) {
+        removeOutsideObserver();
+        final android.view.Window window = activity.getWindow();
+        final android.view.Window.Callback original = window.getCallback();
+        if (original == null) return;
+        final float[] down = new float[2];
+        final boolean[] candidate = new boolean[1];
+        final int slop = android.view.ViewConfiguration.get(activity).getScaledTouchSlop();
+        android.view.Window.Callback wrapper = (android.view.Window.Callback)
+            java.lang.reflect.Proxy.newProxyInstance(android.view.Window.Callback.class.getClassLoader(),
+                new Class<?>[]{android.view.Window.Callback.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("dispatchTouchEvent") && args != null && args[0] instanceof MotionEvent) {
+                        MotionEvent e = (MotionEvent) args[0];
+                        android.graphics.Rect bounds = new android.graphics.Rect();
+                        boolean inside = panel != null && panel.getGlobalVisibleRect(bounds)
+                            && bounds.contains((int)e.getRawX(), (int)e.getRawY());
+                        if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                            down[0] = e.getRawX(); down[1] = e.getRawY();
+                            candidate[0] = stage == STAGE_MENU && !inside;
+                        } else if (e.getPointerCount() > 1 || e.getActionMasked() == MotionEvent.ACTION_CANCEL
+                            || Math.abs(e.getRawX()-down[0]) > slop || Math.abs(e.getRawY()-down[1]) > slop) {
+                            candidate[0] = false;
+                        } else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
+                            if (candidate[0] && !inside && stage == STAGE_MENU) main.post(() -> { if (stage == STAGE_MENU) collapse(); });
+                            candidate[0] = false;
+                        }
+                    }
+                    try { return method.invoke(original, args); }
+                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                });
+        observedWindow = window; savedCallback = original; tapCallback = wrapper;
+        window.setCallback(wrapper);
+    }
+
     /* ---------------------------------------------------------------------- UI */
 
     private static int dp(Context context, int value) {
@@ -435,19 +621,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /** Rounds a pressable background so taps get a ripple inside the rounded shape. */
     private static void ripple(View view, GradientDrawable shape) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            view.setBackground(new RippleDrawable(
-                ColorStateList.valueOf(0x1F2F6FE4), shape, null));
-        } else {
-            view.setBackground(shape);
-        }
+        GameTopUi.pressable(view, shape);
     }
 
     private TextView cell(Context context, float size, int color, boolean bold) {
         TextView view = GameTopUi.text(context, size, color, bold);
         view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6));
-        view.setMinHeight(dp(context, 32));
+        view.setPadding(dp(context, 10), dp(context, 8), dp(context, 10), dp(context, 8));
+        view.setMinHeight(dp(context, 34));
         return view;
     }
 
@@ -460,9 +641,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (stage == STAGE_MENU) return;
         stage = STAGE_MENU;
         tab = TAB_CONTROL;
+        resetTransientMenuState();
         restartIdleTimer();
         applyState();
         schedulePoll(0L);
+    }
+
+    /**
+     * A freshly opened menu starts with card 2's long explanation folded, so the panel
+     * keeps its compact height and every card stays reachable without scrolling.
+     */
+    private void resetTransientMenuState() {
+        rematchDetailOpen = false;
     }
 
     private StageRoot build(Activity activity) {
@@ -470,11 +660,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        // Compact dark handle matching the reference top-centre entry.
-        // The capsule body is drawn above the viewport; only its curved bottom remains.
-        handleTab = new TabView(activity,
-            GameTopUi.round(activity, 26, 0xDD141E25, 0x553F505C, 1));
+        // Resting entry: 30dp visible pill inside a 44dp touch box at the window edge.
+        handleTab = new GameTopUi.HandleView(activity);
         handleTab.setContentDescription(t("展开雀魂助手"));
+        handleTab.setStateColor(stateColor());
         handleTab.setOnClickListener(view -> {
             stage = STAGE_CAPSULE;
             restartIdleTimer();
@@ -486,21 +675,17 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         handleParams.topMargin = 0;
         root.addView(handleTab, handleParams);
 
-        // Full "雀魂助手" capsule, ~160x44dp, just below the top edge.
-        capsule = cell(activity, 13, 0xFFE3EAF0, false);
-        capsule.setGravity(Gravity.CENTER);
-        capsule.setPadding(dp(activity, 16), 0, dp(activity, 16), 0);
-        capsule.setMinHeight(dp(activity, 44));
+        // Assistant capsule: state dot, short phrase, hairline, four-icon grid.
+        capsule = new GameTopUi.CapsuleView(activity);
         capsule.setContentDescription(t("打开雀魂助手菜单"));
-        // One-line pill: translated copy trims inside the same measured box.
-        InGameLocalizer.layout(capsule, 1);
-        ripple(capsule, GameTopUi.round(activity, 22, 0xEE1C2732, 0x66536373, 1));
-        capsule.setElevation(dp(activity, 4));
+        capsule.setStateColor(stateColor());
         // openMenu() arms the idle window, so the capsule needs no touch listener of its
         // own; a plain click keeps the ripple and the accessibility tap working.
         capsule.setOnClickListener(view -> openMenu());
         FrameLayout.LayoutParams capsuleParams = new FrameLayout.LayoutParams(
-            dp(activity, 160), dp(activity, 44), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            dp(activity, GameTopUi.CapsuleView.HEIGHT_DP),
+            Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         capsuleParams.topMargin = dp(activity, TOP_GAP_DP);
         root.addView(capsule, capsuleParams);
 
@@ -513,10 +698,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         ScaledMenuHost menuHost = new ScaledMenuHost(activity);
         menuHost.addView(menu, new FrameLayout.LayoutParams(dp(activity, 500),
             ViewGroup.LayoutParams.WRAP_CONTENT));
+        // Outside the panel the menu stays open: the root below turns such a tap into the
+        // same explicit "collapse" the arrow performs (see StageRoot). The host itself stays
+        // click-through, so the idle window is not re-armed by touches outside the panel.
         root.addView(menuHost, menuParams);
 
         // Outer touch watcher. It only observes: every event is handed straight back to
-        // the normal child/click path (return false), so switches, rows and the scroll
+        // the normal child / click path (return false), so switches, rows and the scroll
         // behaviour of the panel keep working exactly as before.
         return root;
     }
@@ -551,6 +739,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /* ------------------------------------------------------------ idle collapse */
 
+    /** Idle window of the current stage. */
+    private long idleWindow() {
+        return stage == STAGE_CAPSULE ? IDLE_CAPSULE_MS : IDLE_MENU_MS;
+    }
+
     /** Restarts the idle window; the handle stage has no timer to run. */
     private void restartIdleTimer() {
         main.removeCallbacks(collapseTick);
@@ -558,7 +751,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (stage == STAGE_HANDLE) return;
         // A start sequence or a settings write must not land on a collapsed view: the
         // reply is kept and repainted, but the fall-back waits until it is done.
-        long delay = actionBusy.get() || starting ? ACTION_HOLD_MS : IDLE_COLLAPSE_MS;
+        long delay = actionBusy.get() || starting ? ACTION_HOLD_MS : idleWindow();
         main.postDelayed(collapseTick, delay);
     }
 
@@ -587,9 +780,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             main.postDelayed(collapseTick, ACTION_HOLD_MS);
             return;
         }
+        long window = idleWindow();
         long idle = SystemClock.elapsedRealtime() - lastTouchAt;
-        if (idle < IDLE_COLLAPSE_MS - 250L) {
-            main.postDelayed(collapseTick, Math.max(250L, IDLE_COLLAPSE_MS - idle));
+        if (idle < window - 250L) {
+            main.postDelayed(collapseTick, Math.max(250L, window - idle));
             return;
         }
         collapse();
@@ -600,6 +794,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         stopIdleTimer();
         if (stage == STAGE_HANDLE) return;
         stage = STAGE_HANDLE;
+        resolveOutsideClick();
         applyState();
     }
 
@@ -654,10 +849,48 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * what it draws, otherwise the game's touches would be eaten by an invisible box
      * around the menu. Children are measured exactly as FrameLayout would, against the
      * real window size, so the capped panel and CENTER_HORIZONTAL gravity still work.
+     *
+     * <p>Outside touches: while the menu is open the root becomes clickable and any tap
+     * that is not consumed by the panel reaches it, which closes the menu — the exact
+     * action of the header arrow. The root's own bounds are now the visible panel (the
+     * handle and the capsule are GONE), so the game's hand tiles and buttons outside it
+     * are untouched. While the handle or the capsule is showing the root is wrap-content
+     * around that small view and never clickable at all.
      */
     private final class StageRoot extends FrameLayout {
+        private float downX, downY;
+        private boolean swiping, moved;
         StageRoot(Context context) { super(context); }
-
+        @Override public boolean onInterceptTouchEvent(MotionEvent e) {
+            if (stage != STAGE_MENU) return false;
+            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                downX = e.getX(); downY = e.getY(); swiping = false; moved = false;
+            } else if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                float dx = e.getX() - downX, dy = e.getY() - downY;
+                int slop = android.view.ViewConfiguration.get(getContext()).getScaledTouchSlop();
+                if (Math.abs(dx) > slop || Math.abs(dy) > slop) moved = true;
+                if (Math.abs(dx) > slop * 2 && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                    swiping = true; return true;
+                }
+            }
+            return false;
+        }
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            if (stage != STAGE_MENU) return false;
+            if (e.getActionMasked() == MotionEvent.ACTION_UP) {
+                if (swiping) {
+                    int next = e.getX() < downX ? TAB_STATUS : TAB_CONTROL;
+                    selectTab(next);
+                    View page = next == TAB_CONTROL ? pageControl : pageStatus;
+                    if (page != null) {
+                        page.setTranslationX(dp(getContext(), next == TAB_STATUS ? 18 : -18));
+                        page.setAlpha(.5f);
+                        page.animate().translationX(0).alpha(1f).setDuration(160).start();
+                    }
+                } // Internal blank taps never collapse the menu.
+            }
+            return true;
+        }
         @Override public boolean dispatchTouchEvent(MotionEvent event) {
             noteMenuTouch(event);
             return super.dispatchTouchEvent(event);
@@ -697,8 +930,20 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
                 }
                 child.measure(childWidthSpec, childHeightSpec);
                 if (child.getVisibility() == GONE) continue;
-                width = Math.max(width, child.getMeasuredWidth() + params.leftMargin + params.rightMargin);
-                height = Math.max(height, child.getMeasuredHeight() + params.topMargin + params.bottomMargin);
+                int childWidth = child.getMeasuredWidth();
+                int childHeight = child.getMeasuredHeight();
+                if (child instanceof ScaledMenuHost) {
+                    // The host measures its scale itself: its *visible* width is measured,
+                    // and the child is laid out wider. Using the child's box here would
+                    // inflate the root and swallow more of the table than the panel covers.
+                    View scaled = ((ViewGroup) child).getChildAt(0);
+                    if (scaled != null) {
+                        childWidth = Math.min(childWidth, scaled.getMeasuredWidth());
+                        childHeight = Math.min(childHeight, scaled.getMeasuredHeight());
+                    }
+                }
+                width = Math.max(width, childWidth + params.leftMargin + params.rightMargin);
+                height = Math.max(height, childHeight + params.topMargin + params.bottomMargin);
             }
             if (maxW > 0) width = Math.min(width, maxW);
             if (maxH > 0) height = Math.min(height, maxH);
@@ -706,9 +951,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    /** A compact menu with matching visual, layout and touch bounds. */
+    /** A menu host with matching visual, layout and touch bounds. */
     private static final class ScaledMenuHost extends FrameLayout {
-        private static final float SCALE = .75f;
+        float SCALE = .75f;
         ScaledMenuHost(Context context) { super(context); }
 
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
@@ -722,10 +967,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             int availableHeight = MeasureSpec.getSize(heightSpec);
             int visualHeight = Math.round(screenHeight * .60f);
             if (availableHeight > 0) visualHeight = Math.min(visualHeight, availableHeight);
+            // The child gets the pre-scale size of the *visible* box (648 / .75 = 864), not
+            // the rounded pixels scaled back: the panel is capped to exactly what the finger
+            // sees, so no chip of it can slide under the bottom edge.
+            int height = Math.round(visualHeight / SCALE);
             child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
-                MeasureSpec.makeMeasureSpec(Math.round(visualHeight / SCALE), MeasureSpec.EXACTLY));
-            setMeasuredDimension(Math.round(child.getMeasuredWidth() * SCALE),
-                Math.round(child.getMeasuredHeight() * SCALE));
+                MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY));
+            // Report the visible box itself. Rounding the already-rounded child size
+            // (864 * .75 -> 648) only agrees when the two roundings cancel, and a 1px
+            // disagreement inside the stage root shows up as a clipped bottom edge.
+            setMeasuredDimension(visualWidth, visualHeight);
         }
 
         @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
@@ -738,58 +989,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    /** Top-clipped capsule: visible and touchable bounds use the reference proportions. */
-    private static final class TabView extends View {
-        private final Drawable background;
-
-        TabView(Context context, GradientDrawable pill) {
-            super(context);
-            background = pill;
-            setFocusable(false);
-            setFocusableInTouchMode(false);
-            setClickable(true);
-        }
-
-        @Override protected void onMeasure(int widthSpec, int heightSpec) {
-            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-            int availableWidth = metrics.widthPixels;
-            int availableHeight = metrics.heightPixels;
-            if (getRootView().getWidth() > 0) availableWidth = getRootView().getWidth();
-            if (getRootView().getHeight() > 0) availableHeight = getRootView().getHeight();
-            int width = Math.max(GameTopUi.dp(getContext(), 28), Math.round(availableWidth * .0445f));
-            int height = Math.max(GameTopUi.dp(getContext(), 12), Math.round(availableHeight * .054f));
-            height = Math.min(height, GameTopUi.dp(getContext(), 28));
-            setMeasuredDimension(resolveSize(width, widthSpec), resolveSize(height, heightSpec));
-        }
-
-        @Override protected void onDraw(Canvas canvas) {
-            // A full rounded capsule extends off-screen, matching the reference's
-            // shallow lower arc rather than a detached floating rectangle.
-            int fullHeight = Math.max(getHeight() * 3, GameTopUi.dp(getContext(), 48));
-            background.setBounds(0, getHeight() - fullHeight, getWidth(), getHeight());
-            background.draw(canvas);
-            android.graphics.Paint mark = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
-            mark.setColor(0xFFE3EAF0);
-            mark.setStyle(android.graphics.Paint.Style.STROKE);
-            mark.setStrokeWidth(Math.max(2f, getHeight() * .045f));
-            mark.setStrokeCap(android.graphics.Paint.Cap.ROUND);
-            android.graphics.Path chevron = new android.graphics.Path();
-            chevron.moveTo(getWidth() * .44f, getHeight() * .58f);
-            chevron.lineTo(getWidth() * .50f, getHeight() * .78f);
-            chevron.lineTo(getWidth() * .56f, getHeight() * .58f);
-            canvas.drawPath(chevron, mark);
-        }
-
-        @Override public void setPressed(boolean pressed) {
-            super.setPressed(pressed);
-            setAlpha(pressed ? .65f : 1f);
-        }
-    }
-
     /**
      * Vertical LinearLayout capped to a maximum height. Used for the expanded panel so
      * it can never grow past the window in landscape; the inner pages are measured
-     * against the cap, and the top of the panel (header, sidebar) stays reachable.
+     * against the cap, and the top of the panel (header, tab) stays reachable.
      */
     private static final class CappedColumn extends LinearLayout {
         private final int marginReserve;
@@ -818,28 +1021,50 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
             boolean bounded = MeasureSpec.getMode(heightSpec) != MeasureSpec.UNSPECIFIED;
-            int limit = bounded
-                ? Math.min(MeasureSpec.getSize(heightSpec), maxHeight)
-                : maxHeight;
-            if (maxHeight > 0) {
-                heightSpec = MeasureSpec.makeMeasureSpec(limit,
-                    MeasureSpec.getMode(heightSpec) == MeasureSpec.EXACTLY
-                        ? MeasureSpec.EXACTLY : MeasureSpec.AT_MOST);
+            if (maxHeight > 0 && bounded) {
+                // The host already capped the height, so the panel takes exactly that much:
+                // a definite height is what lets the scrolling body (weight 1) fill the
+                // space the compact chrome leaves instead of wrapping to content. The old
+                // wrap-measure-then-clip left the body at its content height and pushed the
+                // pinned divider/collapse row up over the cards.
+                int exact = MeasureSpec.makeMeasureSpec(maxHeight, MeasureSpec.EXACTLY);
+                super.onMeasure(widthSpec, exact);
+                setMeasuredDimension(getMeasuredWidth(), maxHeight);
+                return;
             }
             super.onMeasure(widthSpec, heightSpec);
-            int measured = getMeasuredHeight();
-            if (maxHeight > 0 && measured > limit) {
-                setMeasuredDimension(getMeasuredWidth(), limit);
-            }
         }
     }
-    /** The expanded panel: white rounded surface, sidebar, two pages. */
+
+    /**
+     * The expanded panel: deep-blue surface, compact header, two-part tab, two pages.
+     *
+     * <p>Vertical budget, in the pre-scale coordinates the panel is laid out in, for the
+     * reporter's 2376x1080 @ 2.75 device (density 2.75, the 648px the finger sees = 864
+     * pre-scale px at {@link ScaledMenuHost#SCALE} .75):
+     *
+     * <pre>
+     *   panel padding         5dp          14px        11px visible
+     *   header               28dp          77px        58px visible
+     *   gutter                4dp          11px         8px visible
+     *   tab                  22dp          61px        46px visible
+     *   gutter                4dp          11px         8px visible
+     *   body (weight 1)                 848px       507px visible = 78% of the menu
+     *   panel padding         5dp          14px        11px visible
+     *   ---- total                     1036px       648px visible
+     * </pre>
+     *
+     * <p>Nothing is pinned below the scroll band any more: the 1dp divider and the 135px
+     * "收起面板" row are gone (the header chevron and the outside tap both collapse), so the
+     * band keeps every pixel the chrome does not need.
+     */
     private LinearLayout buildMenu(Activity activity) {
         int maxHeight = Math.round(activity.getResources().getDisplayMetrics().heightPixels
             - GameTopUi.density(activity) * (TOP_GAP_DP + 8));
         LinearLayout panelView = new CappedColumn(activity, maxHeight);
         panelView.setBackground(GameTopUi.panel(activity));
-        panelView.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 18));
+        int pad = dp(activity, PANEL_PAD_DP);
+        panelView.setPadding(pad, pad, pad, pad);
         panelView.setElevation(dp(activity, 12));
         // Width is capped so a narrow portrait screen never pushes the panel off-screen;
         // the status page scrolls instead of growing past the window height.
@@ -847,36 +1072,26 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             Math.max(dp(activity, 232), Math.round(screenWidthDp(activity) * 0.84f)));
         panelView.setMinimumWidth(width);
 
-
-        panelView.addView(buildHeader(activity));
-        panelView.addView(GameTopUi.divider(activity));
+        panelView.addView(buildHeader(activity),
+            new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(activity, HEADER_DP)));
+        panelView.addView(spacer(activity, CHROME_GAP_DP));
+        panelView.addView(buildTabs(activity),
+            new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(activity, TAB_DP)));
+        panelView.addView(spacer(activity, CHROME_GAP_DP));
 
         LinearLayout body = new LinearLayout(activity);
-        body.setOrientation(LinearLayout.HORIZONTAL);
-        body.setGravity(Gravity.TOP);
+        body.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         panelView.addView(body, bodyParams);
 
-        LinearLayout sidebar = new LinearLayout(activity);
-        sidebar.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams sidebarParams = new LinearLayout.LayoutParams(
-            dp(activity, 66), ViewGroup.LayoutParams.WRAP_CONTENT);
-        sidebarParams.rightMargin = dp(activity, 10);
-        body.addView(sidebar, sidebarParams);
-
-        tabControl = sidebarTab(activity, t("控制"), () -> selectTab(TAB_CONTROL));
-        tabControlLabel = (TextView) tabControl.getChildAt(0);
-        sidebar.addView(tabControl);
-        sidebar.addView(spacer(activity, 6));
-        tabStatus = sidebarTab(activity, t("状态"), () -> selectTab(TAB_STATUS));
-        tabStatusLabel = (TextView) tabStatus.getChildAt(0);
-        sidebar.addView(tabStatus);
-
         android.widget.ScrollView pageScroll = new android.widget.ScrollView(activity);
         pageScroll.setFillViewport(true);
+        pageScroll.setVerticalScrollBarEnabled(false);
         body.addView(pageScroll, new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         FrameLayout pages = new FrameLayout(activity);
         pageScroll.addView(pages, new android.widget.ScrollView.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -888,46 +1103,105 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         pageStatus = buildStatusPage(activity);
         pages.addView(pageStatus, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        panelView.addView(GameTopUi.divider(activity));
-        collapseRow = actionRow(activity, t("收起面板"), GameTopUi.INK_MUTED, null);
-        collapseRow.setOnClickListener(view -> {
-            // A tap on the collapse row is an explicit user request: no idle wait.
-            collapse();
-        });
-        panelView.addView(collapseRow);
         return panelView;
     }
 
+    /**
+     * Header: live state dot, the name, the run-state pill and the collapse arrow, all in
+     * one 28dp row (77px visible at 2.75).
+     *
+     * <p>The chevron keeps a 24x26dp box of its own instead of the 60dp
+     * {@link #TARGET_DP}: 60dp is taller than the whole header and would drag it back to
+     * the old 165px, whose only purpose was reach. Reach costs content here, and the header
+     * is the user's explicit way out of the menu — the outside tap and the idle window both
+     * still collapse it.
+     */
     private LinearLayout buildHeader(Activity activity) {
         LinearLayout header = new LinearLayout(activity);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(activity, 2), 0, dp(activity, 2), 0);
+        header.setPadding(dp(activity, 2), 0, 0, 0);
 
         titleDot = GameTopUi.dot(activity, GameTopUi.INK_FAINT);
         header.addView(titleDot);
 
-        title = GameTopUi.text(activity, 16, GameTopUi.INK, true);
+        title = GameTopUi.text(activity, 15, GameTopUi.INK, true);
         title.setText(t("雀魂助手"));
         header.addView(title, new LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        statePill = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, true);
+        statePill.setGravity(Gravity.CENTER);
+        // 1dp vertical padding: the row is only 28dp tall, so the pill must not add air.
+        statePill.setPadding(dp(activity, 8), dp(activity, 1), dp(activity, 8), dp(activity, 1));
+        statePill.setBackground(GameTopUi.statePill(activity));
+        LinearLayout.LayoutParams pillParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pillParams.leftMargin = dp(activity, 6);
+        header.addView(statePill, pillParams);
+
+        // Collapse arrow: a chevron-up path in a 24x26dp target, right of the pill. The
+        // header is 28dp tall, so the box is the tallest thing that still fits it.
+        FrameLayout arrowBox = new FrameLayout(activity);
+        arrowBox.setContentDescription(t("收起面板"));
+        GameTopUi.Glyph arrow = new GameTopUi.Glyph(activity, GameTopUi.ICON_CHEVRON_UP,
+            GameTopUi.INK_MUTED, 16, 1.8f);
+        FrameLayout.LayoutParams arrowParams = new FrameLayout.LayoutParams(
+            dp(activity, 16), dp(activity, 16), Gravity.CENTER);
+        arrowBox.addView(arrow, arrowParams);
+        ripple(arrowBox, GameTopUi.round(activity, 10, 0x00000000, 0, 0));
+        arrowBox.setOnClickListener(view -> collapse());
+        LinearLayout.LayoutParams boxParams = new LinearLayout.LayoutParams(
+            dp(activity, 24), dp(activity, 26));
+        header.addView(arrowBox, boxParams);
+        collapseButton = arrowBox;
         return header;
     }
 
-    private LinearLayout sidebarTab(Activity activity, String label, Runnable action) {
-        LinearLayout tabView = new LinearLayout(activity);
-        tabView.setOrientation(LinearLayout.VERTICAL);
-        tabView.setGravity(Gravity.CENTER);
-        tabView.setPadding(dp(activity, 6), dp(activity, 8), dp(activity, 6), dp(activity, 8));
-        tabView.setMinimumHeight(dp(activity, 52));
-        TextView text = GameTopUi.text(activity, 15, GameTopUi.INK_MUTED, true);
-        text.setText(label);
-        text.setGravity(Gravity.CENTER);
-        tabView.addView(text);
-        tabView.setOnClickListener(view -> action.run());
-        tabView.setBackground(GameTopUi.quietPill(activity));
-        return tabView;
+    /**
+     * The two-part tab above the cards: one gold capsule for the selected section, a
+     * quiet card for the other. Both sides share the row's half width, so the hit target
+     * is the full half rather than only the drawn text.
+     */
+    private LinearLayout buildTabs(Activity activity) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setBackground(GameTopUi.round(activity, 11, 0x14000000, 0, 0));
+        // 1dp inset: the tab capsule is the whole 22dp band, the row only a hairline frame.
+        row.setPadding(dp(activity, 1), dp(activity, 1), dp(activity, 1), dp(activity, 1));
+        bindTab(activity, controlTab, TAB_CONTROL);
+        bindTab(activity, statusTab, TAB_STATUS);
+        row.addView(controlTab.shell, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        LinearLayout.LayoutParams right = new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+        right.leftMargin = dp(activity, 2);
+        row.addView(statusTab.shell, right);
+        return row;
+    }
+
+    /**
+     * Builds one tab part and binds its click listener exactly once. Rebuilding the menu
+     * on a language switch drops the old shell together with its listener; the new shell
+     * gets a fresh one, so nothing can accumulate on a listener list.
+     */
+    private void bindTab(Activity activity, TabView view, int id) {
+        LinearLayout shell = new LinearLayout(activity);
+        shell.setOrientation(LinearLayout.HORIZONTAL);
+        shell.setGravity(Gravity.CENTER);
+        // 6dp side padding is still ~106px of half-row to hit; the 60dp minimum is gone
+        // so the two-part tab fits the 22dp band instead of owning a 135px row.
+        shell.setPadding(dp(activity, 6), 0, dp(activity, 6), 0);
+        TextView label = GameTopUi.text(activity, 15, GameTopUi.INK_MUTED, true);
+        label.setText(id == TAB_CONTROL ? t("控制") : t("状态"));
+        label.setGravity(Gravity.CENTER);
+        InGameLocalizer.layout(label, 1, InGameLocalizer.Align.CENTER);
+        shell.addView(label, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        shell.setOnClickListener(clicked -> selectTab(id));
+        view.shell = shell;
+        view.label = label;
     }
 
     private static View spacer(Context context, int heightDp) {
@@ -955,22 +1229,36 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         unattendedNote = (TextView) unattendedCard.getTag(TAG_NOTE);
         unattendedSwitch = (GameTopUi.Switch) unattendedCard.getTag(TAG_SWITCH);
 
-        page.addView(spacer(activity, 6));
+        page.addView(spacer(activity, 4));
 
-        rematchCard = switchCard(activity, page, t("自动下一局"),
+        // Card 2 is the only card with a ⓘ: it is handed to the card builder so the
+        // button really exists in the tree before anyone wires it up or reads it back.
+        GameTopUi.Glyph info = new GameTopUi.Glyph(activity, GameTopUi.ICON_INFO,
+            GameTopUi.INK_MUTED, 18, 1.6f);
+        rematchCard = switchCard(activity, page, t("自动续打"),
             t("整场牌局结束后自动继续"),
-            () -> onRematchToggle());
+            () -> onRematchToggle(), info);
         rematchTitle = (TextView) rematchCard.getTag(TAG_TITLE);
         rematchState = (TextView) rematchCard.getTag(TAG_STATE);
         rematchNote = (TextView) rematchCard.getTag(TAG_NOTE);
         rematchSwitch = (GameTopUi.Switch) rematchCard.getTag(TAG_SWITCH);
+        rematchInfo = rematchCard.getTag(TAG_INFO) instanceof GameTopUi.Glyph
+            ? (GameTopUi.Glyph) rematchCard.getTag(TAG_INFO) : info;
+        addRematchDetail(activity);
+        // Unconditional on the freshly built button: it exists by construction, and the
+        // listener is what makes the explanation reachable at all.
+        rematchInfo.setOnClickListener(view -> {
+            rematchDetailOpen = !rematchDetailOpen;
+            applyState();
+            restartIdleTimer();
+        });
 
-        page.addView(spacer(activity, 6));
+        page.addView(spacer(activity, 4));
 
         // Click-through fixed panel content: recommendation / honour points. Its own
         // switch, live via `panelSet`; it never closes any other feature.
         panelCard = switchCard(activity, page, t("推荐与番点"),
-            t("点击穿透固定面板上的推荐与番点"),
+            t("穿透固定面板上的推荐与番点"),
             () -> onPanelToggle());
         panelTitle = (TextView) panelCard.getTag(TAG_TITLE);
         panelState = (TextView) panelCard.getTag(TAG_STATE);
@@ -980,80 +1268,139 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     /**
+     * Long explanation of the auto-next-game card, only visible while its ⓘ is open.
+     * It is built together with the card (so a language switch rebuilds it too) and is
+     * hidden by {@link #paintSwitches()}, which owns the expanded flag.
+     */
+    private void addRematchDetail(Activity activity) {
+        if (rematchCard == null) return;
+        rematchDetail = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        rematchDetail.setText(t("只调用游戏的“下一局”原按钮，不伪造请求；未开启时不排队"));
+        rematchDetail.setPadding(dp(activity, 2), dp(activity, 4), dp(activity, 2), 0);
+        InGameLocalizer.layout(rematchDetail, 3);
+        rematchDetail.setBackground(GameTopUi.round(activity, 8, 0x14121A2A, 0, 0));
+        rematchDetail.setVisibility(View.GONE);
+        rematchCard.setTag(TAG_DETAIL, rematchDetail);
+        rematchCard.addView(rematchDetail);
+    }
+
+    /**
      * One switch card: title, live state, switch on the right, and a note line that
      * explains why an enabled switch is not acting yet. The state is only ever painted
      * from the latest provider reply ({@link #applyReply}); taps go through the same
-     * callbacks the old rows used.
+     * callbacks the old rows used. Padding, type and the switch are a step larger than
+     * the old sidebar layout so the card is comfortable to hit.
      */
     private LinearLayout switchCard(Activity activity, LinearLayout page, String titleText,
                                     String subtitle, Runnable action) {
+        return switchCard(activity, page, titleText, subtitle, action, null);
+    }
+
+    /**
+     * Same card with an optional ⓘ button placed left of the switch. The button is built
+     * here and handed back through {@link #TAG_INFO}, so the caller can never read a slot
+     * that was never written (the crash this overload fixes).
+     */
+    private LinearLayout switchCard(Activity activity, LinearLayout page, String titleText,
+                                    String subtitle, Runnable action, GameTopUi.Glyph info) {
         LinearLayout card = vertical(activity);
-        card.setPadding(dp(activity, 10), dp(activity, 8), dp(activity, 10), dp(activity, 8));
+        card.setPadding(dp(activity, 8), dp(activity, 3), dp(activity, 8), dp(activity, 3));
+        // 34dp pre-scale = ~94px visible on the reporter's device: title + state + one note
+        // line, with the whole card width as the tap target. The old 60dp minimum made
+        // every card 135px tall and pushed two of the three switches out of the first
+        // screenful; the 8dp side padding still gives a wide, comfortable row.
+        card.setMinimumHeight(dp(activity, ROW_DP));
         ripple(card, GameTopUi.card(activity));
         card.setClickable(true);
         card.setContentDescription(titleText);
-        card.setOnClickListener(view -> action.run());
+        // Card labels never toggle a setting; only the right-hand switch does.
 
         LinearLayout top = new LinearLayout(activity);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
 
         LinearLayout labels = vertical(activity);
-        TextView titleView = GameTopUi.text(activity, 16, GameTopUi.INK, true);
+        // 15sp title / 12sp state: one notch down from 16/13 so the state line fits the
+        // 34dp card without touching the note, and still comfortably readable at 2.75.
+        TextView titleView = GameTopUi.text(activity, 15, GameTopUi.INK, true);
         titleView.setText(titleText);
         labels.addView(titleView);
-        TextView stateView = GameTopUi.text(activity, 14, GameTopUi.INK_FAINT, false);
+        TextView stateView = GameTopUi.text(activity, 12, GameTopUi.INK_MUTED, false);
         stateView.setText(subtitle);
-        stateView.setPadding(0, dp(activity, 2), 0, 0);
+        stateView.setPadding(0, dp(activity, 1), 0, 0);
         labels.addView(stateView);
         top.addView(labels, new LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        if (info != null) {
+            // The ⓘ sits inside the card but is not part of the card's tap target: it
+            // only opens the explanation, it never flips the switch. 16dp keeps it inside
+            // the 34dp card row.
+            info.setContentDescription(titleText + "说明");
+            LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(
+                dp(activity, 22), dp(activity, 26));
+            infoParams.gravity = Gravity.CENTER_VERTICAL;
+            infoParams.leftMargin = dp(activity, 4);
+            top.addView(info, infoParams);
+        }
+
         GameTopUi.Switch toggle = new GameTopUi.Switch(activity);
         toggle.setContentDescription(titleText + "开关");
+        toggle.setOnClickListener(view -> action.run());
         LinearLayout.LayoutParams switchParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         switchParams.leftMargin = dp(activity, 8);
         top.addView(toggle, switchParams);
         card.addView(top);
 
-        TextView note = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
-        note.setPadding(0, dp(activity, 6), 0, 0);
-        // Translated copy may be longer than the Chinese source; it wraps inside the
-        // card's existing width instead of widening it (no size or padding is touched).
-        InGameLocalizer.layout(titleView, 2);
-        InGameLocalizer.layout(stateView, 2);
-        InGameLocalizer.layout(note, 3);
+        // One short note line, capped at a single line with an ellipsis: the idle copy
+        // answers "what does a tap do", and a failure notice is what the card has to say
+        // right now. Two lines with 13sp+12sp in a 34dp card would overflow it.
+        TextView note = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        note.setPadding(0, dp(activity, 2), 0, 0);
+        InGameLocalizer.layout(titleView, 1);
+        InGameLocalizer.layout(stateView, 1);
+        InGameLocalizer.layout(note, 1);
         card.addView(note);
 
         // Filled by buildControlPage right after this call; no resource ids involved.
+        // `info` is null for the cards that have no ⓘ; the tag is only written when the
+        // button exists, and buildControlPage never touches a slot it did not get.
         card.setTag(TAG_TITLE, titleView);
         card.setTag(TAG_STATE, stateView);
         card.setTag(TAG_NOTE, note);
         card.setTag(TAG_SWITCH, toggle);
+        if (info != null) card.setTag(TAG_INFO, info);
         page.addView(card);
         return card;
     }
 
-    /** Page 2: runtime facts plus the manual / start-stop actions. */
+    /**
+     * Page 2: the name row with its state dot over the detail rows, then the manual and
+     * start / stop actions. The details are one short line each; anything longer is the
+     * card's note or the notice, which the control page already shows.
+     */
     private LinearLayout buildStatusPage(Activity activity) {
         LinearLayout page = vertical(activity);
 
         LinearLayout card = vertical(activity);
-        card.setPadding(dp(activity, 10), dp(activity, 8), dp(activity, 10), dp(activity, 8));
+        card.setPadding(dp(activity, 8), dp(activity, 4), dp(activity, 8), dp(activity, 4));
         card.setBackground(GameTopUi.card(activity));
+        statusCard = card;
 
-        statusMode = GameTopUi.text(activity, 15, GameTopUi.INK, true);
-        card.addView(statusMode);
-        statusDetail = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
-        statusDetail.setPadding(0, dp(activity, 4), 0, 0);
-        card.addView(statusDetail);
-        statusService = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
-        statusService.setPadding(0, dp(activity, 4), 0, 0);
-        card.addView(statusService);
-        statusRematch = GameTopUi.text(activity, 14, GameTopUi.INK_MUTED, false);
-        statusRematch.setPadding(0, dp(activity, 4), 0, 0);
-        card.addView(statusRematch);
+        LinearLayout nameRow = new LinearLayout(activity);
+        nameRow.setOrientation(LinearLayout.HORIZONTAL);
+        nameRow.setGravity(Gravity.CENTER_VERTICAL);
+        statusDot = GameTopUi.dot(activity, GameTopUi.INK_FAINT);
+        nameRow.addView(statusDot);
+        statusMode = GameTopUi.text(activity, 14, GameTopUi.INK, true);
+        nameRow.addView(statusMode, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(nameRow);
+
+        statusDetail = statusLine(activity, card);
+        statusService = statusLine(activity, card);
+        statusRematch = statusLine(activity, card);
         InGameLocalizer.layout(statusMode, 3);
         InGameLocalizer.layout(statusDetail, 3);
         InGameLocalizer.layout(statusService, 2);
@@ -1062,31 +1409,46 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
         page.addView(spacer(activity, 8));
 
-        startStop = cell(activity, 12, Color.WHITE, true);
-        startStop.setMinHeight(dp(activity, 40));
-        ripple(startStop, GameTopUi.round(activity, 12, GameTopUi.ACCENT, 0, 0));
+        startStop = cell(activity, 14, GameTopUi.INK_ON_GOLD, true);
+        startStop.setMinHeight(dp(activity, TARGET_DP));
+        ripple(startStop, GameTopUi.round(activity, 12, GameTopUi.GOLD, 0, 0));
         startStop.setOnClickListener(view -> onToggle());
-        InGameLocalizer.layout(startStop, 2);
+        InGameLocalizer.layout(startStop, 2, InGameLocalizer.Align.CENTER);
         page.addView(startStop, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        manualRow = actionRow(activity, t("打开管理应用"), GameTopUi.ACCENT, null);
+        page.addView(spacer(activity, 8));
+
+        manualRow = actionRow(activity, t("打开管理应用"), GameTopUi.GOLD, null);
         manualRow.setOnClickListener(view -> openManager());
         page.addView(manualRow);
         return page;
+    }
+
+    /** One secondary row of the status card (dot-indented copy, one or two lines). */
+    private TextView statusLine(Activity activity, LinearLayout card) {
+        TextView line = GameTopUi.text(activity, 12, GameTopUi.INK_MUTED, false);
+        line.setPadding(0, dp(activity, 3), 0, 0);
+        card.addView(line);
+        return line;
     }
 
     private LinearLayout actionRow(Activity activity, String label, int color, String description) {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER);
-        row.setMinimumHeight(dp(activity, 36));
-        row.setPadding(dp(activity, 8), dp(activity, 6), dp(activity, 8), dp(activity, 6));
-        TextView text = GameTopUi.text(activity, 15, color, true);
+        // Status-page actions are the primary targets of that page, so they keep the full
+        // 60dp (= 45dp under the finger) instead of the compact card height.
+        row.setMinimumHeight(dp(activity, TARGET_DP));
+        row.setPadding(dp(activity, 10), dp(activity, 6), dp(activity, 10), dp(activity, 6));
+        TextView text = GameTopUi.text(activity, 14, color, true);
         text.setText(label);
-        row.addView(text);
+        text.setGravity(Gravity.CENTER);
+        InGameLocalizer.layout(text, 2, InGameLocalizer.Align.CENTER);
+        row.addView(text, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         if (description != null) row.setContentDescription(description);
-        ripple(row, GameTopUi.round(activity, 12, GameTopUi.CARD, 0x262F6FE4, 1));
+        ripple(row, GameTopUi.round(activity, 12, GameTopUi.CARD, GameTopUi.CARD_BORDER, 1));
         return row;
     }
 
@@ -1108,6 +1470,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             // this neither stacks views nor adds listeners; the geometry is identical.
             languageStale = false;
             rebuildStage();
+            if (panel == null) return;
         }
         // Repaint every static label first (a language switch has to reach them too);
         // the dynamic painters below then overwrite the values they own, so one pass is
@@ -1127,15 +1490,30 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             stage = STAGE_HANDLE;
             show(handleTab, false);
             show(capsule, false);
-            show(menu, false);
+            if (menu != null && menu.getParent() instanceof View) show((View) menu.getParent(), false);
+            resolveOutsideClick();
             return;
         }
         boolean menuShown = stage == STAGE_MENU;
-        show(menu, menuShown);
+        if (menu != null && menu.getParent() instanceof View) {
+            show((View) menu.getParent(), menuShown);
+        } else {
+            show(menu, menuShown);
+        }
         show(capsule, stage == STAGE_CAPSULE);
         show(handleTab, stage == STAGE_HANDLE);
-        if (stage == STAGE_CAPSULE) setText(capsule, t("雀魂助手") + " · " + shortState() + "  ▸");
+        // The root only accepts an outside tap while the menu is open (see StageRoot).
+        resolveOutsideClick();
+        // Handle and capsule carry the same live dot; paint them even when hidden so the
+        // next reveal is already correct instead of flashing the previous colour.
+        int state = stateColor();
+        if (handleTab != null) handleTab.setStateColor(state);
+        if (capsule != null) {
+            capsule.setStateColor(state);
+            capsule.setPhrase(capsuleText());
+        }
         if (menuShown) {
+            paintHeader();
             paintTab();
             paintSwitches();
             paintStatusPage();
@@ -1144,6 +1522,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         // Polling repaints arrive here every few seconds and deliberately never touch
         // the idle window: only a real interaction (restartIdleTimer) re-arms it, and the
         // capsule / menu are only entered through those interaction paths.
+    }
+
+    /** The root is clickable exactly while the open menu is on screen. */
+    private void resolveOutsideClick() {
+        if (panel == null) return;
+        boolean wanted = stage == STAGE_MENU && inGameVisible();
+        if (panel.isClickable() == wanted) return;
+        panel.setClickable(wanted);
+        panel.setFocusable(false);
+        // One listener, installed once per root (a new root is built on attach and on a
+        // language switch): assigning it again would stack duplicates on the same view.
+        if (wanted && !panel.hasOnClickListeners()) panel.setOnClickListener(view -> collapse());
     }
 
     private static void show(View view, boolean visible) {
@@ -1166,59 +1556,89 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private void selectTab(int wanted) {
         if (tab == wanted) return;
         tab = wanted;
+        restartIdleTimer();
         applyState();
     }
 
-    /** Blue capsule for the active sidebar entry, white capsule for the other one. */
+    /** Gold capsule for the active tab, quiet card for the other one. */
     private void paintTab() {
         boolean control = tab == TAB_CONTROL;
-        styleTab(tabControl, tabControlLabel, control);
-        styleTab(tabStatus, tabStatusLabel, !control);
+        styleTab(controlTab, control);
+        styleTab(statusTab, !control);
         show(pageControl, control);
         show(pageStatus, !control);
     }
 
-    private static void styleTab(View pill, TextView label, boolean selected) {
-        if (pill == null || label == null) return;
-        Context context = pill.getContext();
-        pill.setBackground(selected ? GameTopUi.accentPill(context) : GameTopUi.quietPill(context));
-        int color = selected ? Color.WHITE : GameTopUi.INK_MUTED;
-        if (label.getCurrentTextColor() != color) label.setTextColor(color);
+    private static void styleTab(TabView view, boolean selected) {
+        if (!view.bound()) return;
+        view.shell.setBackground(selected ? GameTopUi.accentPill(view.shell.getContext())
+            : GameTopUi.quietPill(view.shell.getContext()));
+        int color = selected ? GameTopUi.INK_ON_GOLD : GameTopUi.INK_MUTED;
+        if (view.label.getCurrentTextColor() != color) view.label.setTextColor(color);
     }
 
-    /** Live header: a coloured dot plus the current mode in one short phrase. */
-    private void paintSwitches() {
-        if (title == null) return;
-        setText(title, t("雀魂助手") + " · " + headerState());
-        int dotColor = starting ? GameTopUi.INK_FAINT
-            : enabled ? GameTopUi.ACCENT
-            : available ? 0xFF43B581
-            : demo ? 0xFFE2A93B
-            : unreachable ? GameTopUi.DANGER
-            : GameTopUi.INK_FAINT;
-        Drawable dot = titleDot == null ? null : titleDot.getBackground();
-        if (dot instanceof GradientDrawable) {
-            ((GradientDrawable) dot).setColor(dotColor);
-        }
+    /** Live state colour shared by the handle, the capsule and the header. */
+    private int stateColor() {
+        if (starting) return GameTopUi.STATE_AMBER;
+        if (enabled) return GameTopUi.STATE_GREEN;
+        if (available) return GameTopUi.STATE_AMBER;
+        if (demo) return GameTopUi.STATE_AMBER;
+        if (unreachable) return GameTopUi.DANGER;
+        return GameTopUi.STATE_AMBER;
+    }
 
+    /**
+     * True when the assistant is really running: the manager says unattended mode is on,
+     * or its service answered but the mode is off. A start sequence is not "running" yet —
+     * the capsule says "starting" for that.
+     */
+    private boolean runningNow() {
+        // A running service that still reports a self-test is not "running" for the user:
+        // the same caveat that keeps the unattended card from switching on.
+        return enabled || (available && !demo && !starting);
+    }
+
+    /** The short phrase of the capsule; never truncated, the capsule grows instead. */
+    private String capsuleText() {
+        if (starting) return t("启动中");
+        if (enabled && !available) return t("启动中");
+        if (runningNow()) return t("助手运行中");
+        return t("助手未开启");
+    }
+
+    /** Header: the state dot and the run-state pill (the name is static copy). */
+    private void paintHeader() {
+        GameTopUi.setDotColor(titleDot, stateColor());
+        String pill;
+        if (starting) pill = t("启动中");
+        else if (enabled) pill = t("无人值守中");
+        else if (available && !demo) pill = t("待机");
+        else if (demo) pill = t("自检中");
+        else if (unreachable) pill = t("服务未连接");
+        else pill = t("未开启");
+        setText(statePill, pill);
+        if (statePill != null) {
+            boolean gold = !starting && enabled;
+            statePill.setTextColor(gold ? GameTopUi.GOLD : GameTopUi.INK_MUTED);
+            statePill.setBackground(GameTopUi.statePill(statePill.getContext()));
+        }
+        InGameLocalizer.layout(statePill, 1, InGameLocalizer.Align.CENTER);
+    }
+
+    /** Live card values: state words, switches, notes and the ⓘ of card 2. */
+    private void paintSwitches() {
         // Card 1 is a pure view of the mode: enabled only when the manager says so,
         // and never editable while a start sequence or another action is in flight.
         if (unattendedSwitch != null) {
             unattendedSwitch.setOn(enabled, true);
             unattendedSwitch.setBusy(starting || actionBusy.get());
         }
-        String unattendedStateText = unattendedStateText();
-        setCardText(unattendedCard, TAG_STATE, unattendedState, unattendedStateText);
-        if (unattendedState != null) {
-            // The first line doubles as subtitle until the first reply arrives, so it
-            // always says what the card does or what it is doing right now.
-            unattendedState.setTextColor(available || starting || unreachable
-                ? GameTopUi.INK_MUTED : GameTopUi.INK_FAINT);
-        }
+        setCardText(unattendedCard, TAG_STATE, unattendedState, unattendedStateText());
         setText(unattendedNote, unattendedNoteText());
         int unattendedTone = noticeFailed && noticeRefersToUnattended()
             ? GameTopUi.DANGER : GameTopUi.INK_MUTED;
         if (unattendedNote != null) unattendedNote.setTextColor(unattendedTone);
+        if (unattendedInfo != null) show(unattendedInfo, false);
 
         // Card 2 mirrors the stored rematch opt-in; it stays tappable while unattended
         // mode is off, exactly like the old single row did.
@@ -1228,14 +1648,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
         setCardText(rematchCard, TAG_STATE, rematchState, rematch ? t("已开启") : t("已关闭"));
         if (rematchState != null) {
-            rematchState.setTextColor(rematchActive ? GameTopUi.ACCENT
-                : rematch ? 0xFFC08A1E : GameTopUi.INK_FAINT);
+            rematchState.setTextColor(rematchActive ? GameTopUi.GOLD
+                : rematch ? GameTopUi.INK : GameTopUi.INK_FAINT);
         }
         setText(rematchNote, rematchNoteText());
         if (rematchNote != null) {
             rematchNote.setTextColor(panelNoticeFailed()
                 ? GameTopUi.DANGER : GameTopUi.INK_MUTED);
         }
+        if (rematchInfo != null) {
+            rematchInfo.setColor(rematchDetailOpen ? GameTopUi.GOLD : GameTopUi.INK_MUTED);
+        }
+        if (rematchDetail != null) show(rematchDetail, rematchDetailOpen);
 
         // Card 3 mirrors the persisted "recommendation / honour-points panel" opt-in.
         // It stays tappable whatever the other two cards say: it only controls the
@@ -1247,7 +1671,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         setCardText(panelCard, TAG_STATE, panelState,
             recommendationPanel ? t("已开启") : t("已关闭"));
         if (panelState != null) {
-            panelState.setTextColor(recommendationPanel ? GameTopUi.ACCENT : GameTopUi.INK_FAINT);
+            panelState.setTextColor(recommendationPanel ? GameTopUi.GOLD : GameTopUi.INK_FAINT);
         }
         setText(panelNote, panelNoteText());
         if (panelNote != null) {
@@ -1267,6 +1691,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     private void paintStatusPage() {
         if (statusMode == null) return;
+        GameTopUi.setDotColor(statusDot, stateColor());
         setText(statusMode, modeText());
         if (statusMode != null) {
             statusMode.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.INK);
@@ -1275,7 +1700,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         setText(statusService, serviceText());
         setText(statusRematch, rematchText());
         if (statusRematch != null) {
-            statusRematch.setTextColor(rematchActive ? GameTopUi.ACCENT : GameTopUi.INK_MUTED);
+            statusRematch.setTextColor(rematchActive ? GameTopUi.GOLD : GameTopUi.INK_MUTED);
         }
     }
 
@@ -1283,6 +1708,8 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (startStop != null) {
             setText(startStop, toggleText());
             startStop.setAlpha(starting ? .55f : 1f);
+            startStop.setBackground(GameTopUi.round(startStop.getContext(), 12,
+                starting ? 0xFF8A6A32 : GameTopUi.GOLD, 0, 0));
         }
         String manualText = manualText();
         if (manualRow != null) {
@@ -1291,19 +1718,10 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             if (manualRow.getChildCount() > 0 && manualRow.getChildAt(0) instanceof TextView) {
                 TextView label = (TextView) manualRow.getChildAt(0);
                 setText(label, manualText == null ? t("打开管理应用") : manualText);
-                label.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.ACCENT);
+                label.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.GOLD);
             }
         }
-    }
-
-    private String headerState() {
-        if (!display.isDecided()) return t("读取显示模式");
-        if (starting) return t("启动中");
-        if (enabled) return t("无人值守开");
-        if (available) return t("待机");
-        if (demo) return t("自检中");
-        if (unreachable) return t("未连接");
-        return t("未启动");
+        if (collapseButton != null) setDescription(collapseButton, t("收起面板"));
     }
 
     private String unattendedStateText() {
@@ -1315,9 +1733,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     /**
-     * Why an "on" switch is not acting yet, or what a tap will do. Kept short: the
-     * card is narrow, so the line may wrap to a second line inside it but never grows
-     * the card's width.
+     * Why an "on" switch is not acting yet, or what a tap will do. Kept short: the card
+     * is narrow, so the line may wrap to a second line inside it but never grows the
+     * card's width.
      */
     private String unattendedNoteText() {
         if (!notice.isEmpty() && noticeRefersToUnattended()) return notice;
@@ -1332,14 +1750,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (demo && rematch) return t("自检中不生效");
         if (rematch && !rematchActive) return t("待条件满足");
         if (rematch) return t("仅按下一局原按钮");
-        return t("牌局结束后自动继续，与上项独立");
+        return t("牌局结束后自动继续");
     }
 
     /** Note line of card 3: why it does or does not draw, in one short phrase. */
     private String panelNoteText() {
         if (panelNoticeFailed()) return notice;
-        if (recommendationPanel) return t("固定面板显示建议牌与番点 · 不影响其他功能");
-        return t("已隐藏建议牌与番点 · 其他功能不受影响");
+        if (recommendationPanel) return t("固定面板显示建议牌与番点");
+        return t("已隐藏建议牌与番点");
     }
 
     private String serviceText() {
@@ -1347,15 +1765,6 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (!available && demo) return t("前台服务 · 自检中");
         if (!available) return t("前台服务 · 未运行");
         return t("前台服务 · 运行中") + (remoteMessage.isEmpty() ? "" : " · " + clip(remoteMessageText(), 14));
-    }
-
-    /** One-phrase state for the collapsed capsule. */
-    private String shortState() {
-        if (starting) return t("启动中");
-        if (enabled) return t("无人值守 开");
-        if (available) return t("已就绪");
-        if (demo) return t("自检中");
-        return t("未启动");
     }
 
     private String modeText() {
@@ -1421,7 +1830,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * Only the view tree is rebuilt: the stage, tab, language, mode and every value
      * polled from the manager are carried over, and the new tree is inserted with the
      * same layout params the old one had. Used when the copy language changes, so no
-     * label can keep a string from the previous language.
+     * label can keep a string from the previous language. Every view is created here,
+     * so each listener is created once with its view — nothing is re-bound on an
+     * existing view and no listener list can grow.
      */
     private void rebuildStage() {
         Activity activity = active.get();
@@ -1440,41 +1851,49 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         menu = null;
         title = null;
         titleDot = null;
-        tabControl = tabStatus = null;
-        tabControlLabel = tabStatusLabel = null;
+        statePill = null;
+        collapseButton = null;
+        controlTab.unbind();
+        statusTab.unbind();
         pageControl = pageStatus = null;
         unattendedCard = null;
         unattendedTitle = unattendedState = unattendedNote = null;
         unattendedSwitch = null;
+        unattendedInfo = null;
         rematchCard = null;
         rematchTitle = rematchState = rematchNote = null;
         rematchSwitch = null;
+        rematchInfo = null;
+        rematchDetail = null;
         panelCard = null;
         panelTitle = panelState = panelNote = null;
         panelSwitch = null;
+        statusCard = null;
+        statusDot = null;
         statusMode = statusDetail = statusService = statusRematch = null;
         startStop = null;
-        manualRow = collapseRow = null;
+        manualRow = null;
 
-        panel = build(activity);
-        parent.addView(panel, panelParams);
-        this.stage = stage;
-        this.tab = tab;
-        if (hooks == null) {
-            hooks = new SizeWatcher(activity);
-            parent.addOnLayoutChangeListener(hooks);
+        // A rebuild (language switch) is the second place the whole tree is created, so it
+        // carries the same boundary as attach(): a failure leaves nothing half-built
+        // instead of killing the game process, and the next attach rebuilds cleanly.
+        try {
+            panel = build(activity);
+            parent.addView(panel, panelParams);
+            this.stage = stage;
+            this.tab = tab;
+            applyState();
+            if (hooks == null) {
+                hooks = new SizeWatcher(activity);
+                parent.addOnLayoutChangeListener(hooks);
+            }
+        } catch (RuntimeException | LinkageError failure) {
+            recordSurfaceFailure(activity, "REBUILD", failure);
+            panel = null;
         }
     }
 
     /* ------------------------------------------------------------------- copy */
-
-    /**
-     * The language was just re-seeded or switched. The next [applyState] rebuilds the
-     * views of the current stage (same stage, same geometry) so every label is painted
-     * from scratch in the new language — including the ones that are only written at
-     * build time. Nothing accumulates: the stage root is reused, not added to.
-     */
-    private boolean languageStale;
 
     /** The language the surface draws in; never null. */
     private ManagerLanguage lang() {
@@ -1528,43 +1947,53 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /**
      * Repaints every label that is not part of the polled value set: tab names, the
-     * three card titles, the collapse row and the hand-off row.
+     * three card titles, the header name, the hand-off row and the long explanation of
+     * card 2. (The pinned collapse row these labels used to include is gone: the header
+     * chevron, the outside tap and the idle window all collapse the menu.)
      *
      * Called from [applyState] on every pass, so a language switch reaches the *static*
      * labels too and not only the values that were already dynamic. Nothing here adds a
      * listener or a view, which is what keeps repeated replies from stacking anything.
      */
     private void paintStatic() {
-        if (tabControlLabel != null && !TextUtils.equals(tabControlLabel.getText(), t("控制"))) {
-            setText(tabControlLabel, t("控制"));
+        if (controlTab.bound()) {
+            setText(controlTab.label, t("控制"));
+            InGameLocalizer.layout(controlTab.label, 1, InGameLocalizer.Align.CENTER);
+            setDescription(controlTab.shell, t("控制"));
         }
-        if (tabStatusLabel != null && !TextUtils.equals(tabStatusLabel.getText(), t("状态"))) {
-            setText(tabStatusLabel, t("状态"));
+        if (statusTab.bound()) {
+            setText(statusTab.label, t("状态"));
+            InGameLocalizer.layout(statusTab.label, 1, InGameLocalizer.Align.CENTER);
+            setDescription(statusTab.shell, t("状态"));
         }
-        if (tabControl != null) setDescription(tabControl, t("控制"));
-        if (tabStatus != null) setDescription(tabStatus, t("状态"));
-        InGameLocalizer.layout(tabControlLabel, 1);
-        InGameLocalizer.layout(tabStatusLabel, 1);
 
         setStaticCard(unattendedCard, "无人值守", "助手服务自动分析并出牌", true);
-        setStaticCard(rematchCard, "自动下一局", "整场牌局结束后自动继续", false);
-        setStaticCard(panelCard, "推荐与番点", "点击穿透固定面板上的推荐与番点", false);
+        setStaticCard(rematchCard, "自动续打", "整场牌局结束后自动继续", false);
+        setStaticCard(panelCard, "推荐与番点", "穿透固定面板上的推荐与番点", false);
 
-        paintActionRow(collapseRow, "收起面板");
+        setText(title, t("雀魂助手"));
+        InGameLocalizer.layout(title, 1);
+        if (collapseButton != null) setDescription(collapseButton, t("收起面板"));
+
         // The hand-off row only names its static label while it has no live label of its
         // own; [paintActions] owns it otherwise.
         if (manualRow == null || manualText() == null) paintActionRow(manualRow, "打开管理应用");
 
-        InGameLocalizer.layout(title, 1);
-        InGameLocalizer.layout(capsule, 1);
-        InGameLocalizer.layout(unattendedNote, 3);
-        InGameLocalizer.layout(rematchNote, 3);
-        InGameLocalizer.layout(panelNote, 3);
+        setText(rematchDetail, t("只调用游戏的“下一局”原按钮，不伪造请求；未开启时不排队"));
+        InGameLocalizer.layout(rematchDetail, 4);
+
+        if (handleTab != null) setDescription(handleTab, t("展开雀魂助手"));
+        if (capsule != null) setDescription(capsule, t("打开雀魂助手菜单"));
+
+        InGameLocalizer.layout(unattendedNote, 1);
+        InGameLocalizer.layout(rematchNote, 1);
+        InGameLocalizer.layout(panelNote, 1);
         InGameLocalizer.layout(statusMode, 3);
         InGameLocalizer.layout(statusDetail, 3);
         InGameLocalizer.layout(statusService, 2);
         InGameLocalizer.layout(statusRematch, 2);
-        InGameLocalizer.layout(startStop, 2);
+        InGameLocalizer.layout(startStop, 2, InGameLocalizer.Align.CENTER);
+        InGameLocalizer.layout(statePill, 1, InGameLocalizer.Align.CENTER);
     }
 
     /**
@@ -1590,9 +2019,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         setDescription(card, t(titleZh));
         View toggle = card.getTag(TAG_SWITCH) instanceof View ? (View) card.getTag(TAG_SWITCH) : null;
         if (toggle != null) setDescription(toggle, t(titleZh) + t("开关"));
-        InGameLocalizer.layout(titleView, 2);
-        InGameLocalizer.layout(stateView, 2);
-        InGameLocalizer.layout(noteView, 3);
+        // The compact card keeps every line single-row (see switchCard): a 34dp card
+        // cannot hold two lines of title/state plus a note.
+        InGameLocalizer.layout(titleView, 1);
+        InGameLocalizer.layout(stateView, 1);
+        InGameLocalizer.layout(noteView, 1);
     }
 
     /** True while the state line still shows its card's static subtitle. */
@@ -1608,7 +2039,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (row.getChildCount() > 0 && row.getChildAt(0) instanceof TextView) {
             TextView text = (TextView) row.getChildAt(0);
             setText(text, label);
-            InGameLocalizer.layout(text, 2);
+            InGameLocalizer.layout(text, 2, InGameLocalizer.Align.CENTER);
         }
     }
 

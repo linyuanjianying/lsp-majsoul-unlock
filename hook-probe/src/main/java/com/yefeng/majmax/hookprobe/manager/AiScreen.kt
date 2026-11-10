@@ -1,5 +1,8 @@
 package com.yefeng.majmax.hookprobe.manager
 
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.RangeSlider
+import androidx.compose.foundation.layout.padding
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
@@ -11,7 +14,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -57,6 +59,7 @@ import kotlin.math.roundToInt
  * sent to the game and the floating window and stay Chinese at the source; only the manager's
  * own shapes are translated, anything else is shown verbatim.
  */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 internal fun AiScreen(padding: PaddingValues) {
     val context = LocalContext.current
@@ -148,6 +151,7 @@ internal fun AiScreen(padding: PaddingValues) {
                 else language.tr("助手未开启", "Assistant is off", "アシストは停止中です"),
                 style = MaterialTheme.typography.titleMedium,
             )
+            ManagerBadge(if (status.running) language.tr("运行中", "Running", "実行中") else language.tr("未运行", "Not running", "停止中"), warning = !status.running)
             Text(localizedTrimmed(status.message))
             Text(language.tr("启动助手后进入雀魂，点击屏幕顶部的把手打开控制菜单。",
                     "Start the assistant, then open Majsoul and tap the handle at the top of the screen to open the control menu.",
@@ -169,16 +173,7 @@ internal fun AiScreen(padding: PaddingValues) {
                     }
                 },
             )
-            if (language != ManagerLanguage.SIMPLIFIED) {
-                // Deliberately limited claim: the manager UI is translated, the in-game menu,
-                // the hint text drawn on the tiles and some engine messages are not.
-                Text(language.tr(
-                        "游戏内菜单、说明牌上的提示和部分引擎消息仍保留原文；本应用只切换管理界面的语言。",
-                        "The in-game menu, the hints drawn on the tiles and some engine messages stay in their original language; only this manager UI switches language.",
-                        "ゲーム内メニュー、牌に表示されるヒント、一部のエンジンメッセージは元の言語のままです。本アプリでは管理画面の表示言語のみを切り替えます。"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+
         }
         ManagerCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -192,30 +187,24 @@ internal fun AiScreen(padding: PaddingValues) {
                     "Move delay: ${localizedDelayLabel(autoDelay, language)}",
                     "打牌ディレイ：${localizedDelayLabel(autoDelay, language)}"),
                 style = MaterialTheme.typography.bodyMedium)
-            Text(language.tr("最小延迟 ${autoDelay.seconds(autoDelay.minTenths)} 秒",
-                    "Minimum delay ${autoDelay.seconds(autoDelay.minTenths)} s",
-                    "最小ディレイ ${autoDelay.seconds(autoDelay.minTenths)} 秒"),
-                style = MaterialTheme.typography.bodySmall)
-            Slider(value = autoDelay.minTenths.toFloat(),
-                onValueChange = { autoDelay = autoDelay.withMinimum(it.roundToInt()) },
+            ManagerBadge("${autoDelay.seconds(autoDelay.minTenths)} – ${autoDelay.seconds(autoDelay.maxTenths)} " + language.tr("秒", "s", "秒"))
+            RangeSlider(
+                value = autoDelay.minTenths.toFloat()..autoDelay.maxTenths.toFloat(),
+                onValueChange = { range ->
+                    val low = range.start.roundToInt().coerceIn(0, 50)
+                    val high = range.endInclusive.roundToInt().coerceIn(low, 50)
+                    autoDelay = autoDelay.withMinimum(low).withMaximum(high)
+                },
                 onValueChangeFinished = { AutoDelaySettings.save(context, autoDelay) },
                 valueRange = 0f..50f, steps = 49,
-                modifier = Modifier.semantics {
-                    contentDescription = language.tr("最小操作延迟", "Minimum move delay",
-                        "最小ディレイ")
+                modifier = Modifier.fillMaxWidth().semantics {
+                    contentDescription = language.tr("操作延迟范围", "Move delay range", "打牌ディレイの範囲")
                 })
-            Text(language.tr("最大延迟 ${autoDelay.seconds(autoDelay.maxTenths)} 秒",
-                    "Maximum delay ${autoDelay.seconds(autoDelay.maxTenths)} s",
-                    "最大ディレイ ${autoDelay.seconds(autoDelay.maxTenths)} 秒"),
-                style = MaterialTheme.typography.bodySmall)
-            Slider(value = autoDelay.maxTenths.toFloat(),
-                onValueChange = { autoDelay = autoDelay.withMaximum(it.roundToInt()) },
-                onValueChangeFinished = { AutoDelaySettings.save(context, autoDelay) },
-                valueRange = 0f..50f, steps = 49,
-                modifier = Modifier.semantics {
-                    contentDescription = language.tr("最大操作延迟", "Maximum move delay",
-                        "最大ディレイ")
-                })
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(language.tr("最小 ", "Min ", "最小 ") + autoDelay.seconds(autoDelay.minTenths), style = MaterialTheme.typography.bodySmall)
+                Text(language.tr("最大 ", "Max ", "最大 ") + autoDelay.seconds(autoDelay.maxTenths), style = MaterialTheme.typography.bodySmall)
+            }
+            ManagerDisclosure(language.tr("规则说明", "How it works", "動作ルール")) {
             Text(language.tr(
                     "范围 0–5 秒，步进 0.1 秒；两端相同时为固定延迟。默认 2–5 秒，设置自动保存，下次操作生效，当前倒计时不变。出牌、立直、鸣牌、和牌、跳过和结算继续共用此设置。",
                     "Range 0–5 s in steps of 0.1 s; equal ends mean a fixed delay. Defaults to 2–5 s. Changes are saved automatically and apply from the next action; a countdown already running is unchanged. Discard, riichi, calls, win, skip and settlement all share this setting.",
@@ -231,6 +220,9 @@ internal fun AiScreen(padding: PaddingValues) {
                     "With the mode off you can exit the game normally. You can also turn it off from the in-game top menu; that never stops this app's service. Whether to keep matching after the whole game ends is a separate switch below.",
                     "モードをオフにすれば通常どおりゲームを終了できます。ゲーム内の上部メニューからもオフにでき、その場合も本アプリのサービスは停止しません。対局終了後に続けてマッチングするかは、下の独立したスイッチで設定します。"),
                 style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        ManagerCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(language.tr("整场结束后自动匹配（实验性）",
                         "Auto-match after the game ends (experimental)",
@@ -254,16 +246,22 @@ internal fun AiScreen(padding: PaddingValues) {
                     "On. Independent of the unattended switch.",
                     "オンです。放置モードのスイッチとは独立しています。"),
                 style = MaterialTheme.typography.bodySmall)
+            ManagerDisclosure(language.tr("详细说明", "Details", "詳しい説明")) {
             Text(language.tr(
                     "默认关闭。与无人值守开关独立；手动打牌也可自动续局，模型自检时不生效。只调用游戏已有的结算、收益和下一局原按钮，不新增或伪造请求；遇到未知界面、对局中断或手动操作时暂停并等待。本场自动匹配失败或手动取消后不再重试；未知收益弹窗可能需要手动处理。",
                     "Off by default and independent of the unattended switch. It also works when you play manually, but not during a model self-check. It only presses the game's own settlement, reward and next-game buttons; no new or forged requests. It pauses and waits on unknown screens, interrupted games or manual input. It does not retry after a failed or manually cancelled match, and an unknown reward dialog may need to be handled by hand.",
                     "初期状態はオフで、放置モードのスイッチとは独立しています。手動で打つ場合も自動で次局へ進みますが、モデル自己診断中は動作しません。ゲーム本来の精算・報酬・次局のボタンを押すだけで、新たな要求や偽の要求は送りません。未知の画面、対局の中断、手動操作を検知すると一時停止して待機します。この対局で失敗した、または手動でキャンセルした後は再試行しません。未知の報酬ダイアログは手動での対応が必要な場合があります。"),
                 style = MaterialTheme.typography.bodySmall)
         }
+        }
+        androidx.compose.material3.Surface(color = androidx.compose.ui.graphics.Color(0xFFFBECC9),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp)) {
         Text(language.tr("实验性 Mortal v4 支持四麻和三麻，可手动开启无人值守；特征含近似计算，尚未完成与上游的完整一致性验证。",
                 "Experimental Mortal v4 supports four-player and three-player games and can be used with unattended mode. Its features include approximations and have not yet been fully validated against upstream.",
                 "試験的な Mortal v4 は四人打ち・三人打ちに対応し、放置モードも手動で有効にできます。特徴量には近似計算が含まれ、上流との完全な一致検証はまだ完了していません。"),
-            style = MaterialTheme.typography.bodySmall)
+            modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall,
+            color = androidx.compose.ui.graphics.Color(0xFF80580A))
+        }
         Text(language.tr("策略模型", "Policy models", "戦略モデル"),
             style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
         PolicyModelCard(
@@ -337,8 +335,8 @@ internal fun AiScreen(padding: PaddingValues) {
             val modeLocked = status.running
             ManagerActions(
                 first = {
-                    ManagerOutlinedButton(onClick = {
-                        if (modeLocked) return@ManagerOutlinedButton
+                    ManagerModeButton(selected = displayMode == AssistantDisplayMode.HOOK, onClick = {
+                        if (modeLocked) return@ManagerModeButton
                         displayMode = AssistantDisplayMode.HOOK
                         AssistantDisplayModeSettings.save(context, displayMode)
                     }, modifier = it, enabled = !modeLocked) {
@@ -350,8 +348,8 @@ internal fun AiScreen(padding: PaddingValues) {
                     }
                 },
                 second = {
-                    ManagerOutlinedButton(onClick = {
-                        if (modeLocked) return@ManagerOutlinedButton
+                    ManagerModeButton(selected = displayMode == AssistantDisplayMode.OVERLAY, onClick = {
+                        if (modeLocked) return@ManagerModeButton
                         displayMode = AssistantDisplayMode.OVERLAY
                         AssistantDisplayModeSettings.save(context, displayMode)
                     }, modifier = it, enabled = !modeLocked) {
@@ -374,6 +372,7 @@ internal fun AiScreen(padding: PaddingValues) {
                         "現在の選択は、次にアシストを起動したとき（およびその後に起動したゲーム）から反映されます。"),
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            ManagerDisclosure(language.tr("两种模式的区别与权限", "Modes and permissions", "モードの違いと権限")) {
             when (displayMode) {
                 AssistantDisplayMode.HOOK -> {
                     Text(language.tr(
@@ -409,6 +408,7 @@ internal fun AiScreen(padding: PaddingValues) {
                     "In Majsoul, tap the handle at the top of the screen to expand the capsule, then tap the capsule to open the menu, where you can turn unattended mode on or off. Turning it off never stops this app; the foreground notification stays.",
                     "雀魂では画面上部のハンドルをタップしてカプセルを開き、さらにカプセルをタップするとメニューが開きます。メニューから放置モードを直接オン・オフできます。オフにしても本アプリは停止せず、常駐通知も残ります。"),
                 style = MaterialTheme.typography.bodySmall)
+            }
             Text(language.tr(
                     "可直接进入雀魂，在游戏内开启助手；更新模块后请重启游戏。中途开启或丢失消息时，可能需要重新进入牌局恢复完整状态。",
                     "You can open Majsoul first and start the assistant from inside the game; restart the game after updating the module. If you start it mid-match or messages were lost, you may need to re-enter the match to restore the full state.",
@@ -419,13 +419,13 @@ internal fun AiScreen(padding: PaddingValues) {
             }) { Text(language.tr("打开雀魂", "Open Majsoul", "雀魂を開く")) }
         }
         ManagerCard {
-            Text(language.tr("如何理解这些指标", "How to read these numbers", "これらの数値の見方"),
-                style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            ManagerDisclosure(language.tr("如何理解这些指标", "How to read these numbers", "これらの数値の見方")) {
             Text(language.tr("和牌率仅在听牌时显示；未听牌时显示向听数和进张。放铳风险指数包含打点权重，越低越好，并非实际放铳概率。分析只使用己方手牌与公开牌面。", "Win rate is shown only in tenpai. Otherwise, you’ll see shanten and tile acceptance. The deal-in risk score also factors in hand value: lower is better, but it is not a deal-in probability. Analysis uses only your hand and visible tiles.", "和了率はテンパイ時のみ表示されます。テンパイ前はシャンテン数と受け入れを表示します。放銃リスク指数は打点も加味した目安で、低いほど安全ですが、実際の放銃率ではありません。分析には自分の手牌と公開情報のみを使います。"))
             Text(language.tr(
                     "使用 Akagi 的本地轻量模型，支持普通四麻和三麻。自检使用内置样例，窗口会明确标记“非当前牌局”。",
                     "Uses Akagi's lightweight local models for standard four-player and three-player games. The self-check runs on a built-in sample and the window is clearly marked as not being your current match.",
                     "Akagi の軽量ローカルモデルを使用し、通常の四人打ちと三人打ちに対応します。自己診断は内蔵サンプルで実行され、ウィンドウには「現在の対局ではない」ことが明示されます。"))
+            }
             ManagerTextButton(onClick = { showLicense = true }) {
                 Text(language.tr("助手开源许可", "Open-source licenses", "オープンソースライセンス"))
             }
@@ -631,6 +631,8 @@ private fun PolicyModelCard(
     val language = managerLanguage()
     val builtIn = language.tr("内置 Akagi", "built-in Akagi", "内蔵 Akagi")
     ManagerCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
         Text(
             if (players == 4) language.tr("四麻模型", "Four-player model", "四人打ちモデル")
             else language.tr("三麻模型", "Three-player model", "三人打ちモデル"),
@@ -643,6 +645,13 @@ private fun PolicyModelCard(
                 "現在：${if (selectedCustom && model != null) model.format else builtIn}",
             ),
         )
+        }
+        androidx.compose.material3.OutlinedButton(onClick = onImport) {
+            Text(language.tr("导入", "Import", "読み込む"))
+        }
+        }
+        Text(language.tr("支持 .onnx / .pth / .pt", "Supports .onnx / .pth / .pt", ".onnx / .pth / .pt に対応"), style = MaterialTheme.typography.bodySmall)
+        ManagerDisclosure(language.tr("模型选项、格式与限制", "Model options and limits", "モデル設定・形式と制限")) {
         if (model != null) {
             Text("${model.name} · ${"%.1f".format(model.bytes / (1024f * 1024f))} MiB · SHA-256 ${model.sha256.take(12)}",
                 style = MaterialTheme.typography.bodySmall)
@@ -674,8 +683,7 @@ private fun PolicyModelCard(
                 },
             )
         }
-        ManagerButton(onClick = onImport) {
-            Text(language.tr("导入 .onnx / .pth", "Import .onnx / .pth", ".onnx / .pth を読み込む"))
+        Text(language.tr("单文件上限 ${OnnxModelStore.MAX_MODEL_MIB} MiB；模型仅保存在本机。", "Up to ${OnnxModelStore.MAX_MODEL_MIB} MiB per file. Models stay on this device.", "1ファイル最大 ${OnnxModelStore.MAX_MODEL_MIB} MiB。モデルは端末内にのみ保存されます。"), style = MaterialTheme.typography.bodySmall)
         }
     }
 }

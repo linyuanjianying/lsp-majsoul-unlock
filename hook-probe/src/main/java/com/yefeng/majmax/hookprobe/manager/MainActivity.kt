@@ -1,5 +1,6 @@
 package com.yefeng.majmax.hookprobe.manager
 
+import androidx.compose.material.icons.filled.Delete
 import android.content.Context
 import android.content.Intent
 import android.content.ClipData
@@ -282,7 +283,7 @@ private fun HookManagerApp(exportScope: CoroutineScope) {
                 )
             },
             bottomBar = {
-                NavigationBar {
+                NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     Destination.entries.forEachIndexed { index, item ->
                         NavigationBarItem(
                             selected = selectedIndex == index,
@@ -433,12 +434,12 @@ private fun StatusCard(status: ModuleStatus, onRefresh: () -> Unit) {
     val installed = runCatching {
         context.packageManager.getLaunchIntentForPackage("com.soulgamechst.majsoul") != null
     }.getOrDefault(false)
-    ManagerCard {
+    ManagerCard(colors = CardDefaults.cardColors(containerColor = Color(0xFF0B6B4A), contentColor = Color.White)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
-                if (status.diagnosticAvailable) Icons.Default.CheckCircle else Icons.Default.Warning,
+                if (status.diagnosticAvailable) Icons.Default.Info else Icons.Default.Warning,
                 contentDescription = null,
-                tint = if (status.diagnosticAvailable) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
+                tint = Color(0xFFF2C46B),
                 modifier = Modifier.size(28.dp),
             )
             Spacer(Modifier.width(10.dp))
@@ -458,26 +459,29 @@ private fun StatusCard(status: ModuleStatus, onRefresh: () -> Unit) {
                         ?: language.tr("启动游戏并在 LSPosed 中启用模块后可产生记录",
                             "Start the game with the module enabled in LSPosed to produce records",
                             "LSPosed でモジュールを有効にしてゲームを起動すると記録が残ります"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    color = Color(0xFFE8F5EE),
                 )
             }
         }
         HorizontalDivider()
         InfoRow(language.tr("目标游戏", "Target game", "対象ゲーム"),
             if (installed) language.tr("已安装", "Installed", "インストール済み")
-            else language.tr("未检测到", "Not found", "見つかりません"))
+            else language.tr("未检测到", "Not found", "見つかりません"), labelColor = Color(0xFFE1F2E9))
+        ManagerDisclosure(language.tr("日志来源", "Log source", "ログの取得元"), labelColor = Color(0xFFFFDF98)) {
         InfoRow(language.tr("日志来源", "Log source", "ログの取得元"),
             language.tr("Hook 事件通过游戏 UID 校验通道提交；不读取全局 logcat",
                 "Hook events arrive over a UID-checked channel; global logcat is never read",
-                "Hook イベントはゲーム UID を検証した経路で届きます。全体の logcat は読みません"))
+                "Hook イベントはゲーム UID を検証した経路で届きます。全体の logcat は読みません"), labelColor = Color(0xFFE1F2E9))
+        }
         ManagerActions(first = { modifier ->
-            ManagerButton(modifier = modifier, onClick = {
+            androidx.compose.material3.Button(modifier = modifier, colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color(0xFFF2C46B), contentColor = Color(0xFF3C331B)), onClick = {
                 ManagerDiagnostics.append(context, "INFO", "ui", "启动目标游戏")
                 context.packageManager.getLaunchIntentForPackage("com.soulgamechst.majsoul")?.let { context.startActivity(it) }
             }, enabled = installed) { Text(language.tr("打开雀魂", "Open Majsoul", "雀魂を開く")) }
         }, second = { modifier ->
-            ManagerOutlinedButton(modifier = modifier, onClick = {
+            androidx.compose.material3.OutlinedButton(modifier = modifier, colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(contentColor = Color.White), onClick = {
                 ManagerDiagnostics.append(context, "INFO", "ui", "刷新诊断状态")
                 onRefresh()
             }) {
@@ -540,7 +544,7 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
                         clearError = null
                         showClear = true
                     }, enabled = hookLines.isNotEmpty() || assistantLines.isNotEmpty()) {
-                        Text(language.tr("清理日志", "Clear", "ログを消去"))
+                        Icon(Icons.Default.Delete, contentDescription = language.tr("清理日志", "Clear logs", "ログを消去"))
                     }
                     IconButton(onClick = ::refresh) {
                         Icon(Icons.Default.Refresh, language.tr("刷新", "Refresh", "更新"))
@@ -618,7 +622,7 @@ private fun LogsScreen(padding: PaddingValues, exportScope: CoroutineScope) {
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(log.displayTime, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(log.level, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                ManagerBadge(log.level, warning = log.level == "WARN")
                                 Text(log.component, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                             }
                             // The record itself (summary, code, session, fields) is service or
@@ -918,8 +922,6 @@ private fun UpdatesScreen(
         Text(language.tr("更新", "Updates", "更新"),
             style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         // Shared cards: their own text stays as it is for now (owned by another component).
-        GitHubConnectionCard()
-        UnlockCatalogCard()
         ManagerCard {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Image(painterResource(R.drawable.app_icon), contentDescription = null, Modifier.size(52.dp))
@@ -962,8 +964,12 @@ private fun UpdatesScreen(
                     }
                     // The message explains a check that failed; translated only when the
                     // manager wrote it itself, otherwise (network errors, HTTP status) verbatim.
-                    is UpdateState.Error -> Text(localizedUpdateFailure(state.message, language),
-                        color = MaterialTheme.colorScheme.error)
+                    is UpdateState.Error -> androidx.compose.material3.Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)) {
+                        Text(localizedUpdateFailure(state.message, language), Modifier.padding(14.dp),
+                            color = MaterialTheme.colorScheme.onErrorContainer)
+                    }
                     else -> Unit
                 }
             } else {
@@ -976,6 +982,8 @@ private fun UpdatesScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
+        UnlockCatalogCard()
+        GitHubConnectionCard()
         Text(language.tr("安装新模块后需重启游戏，才能载入新的 Hook 版本。",
                 "After installing the new module, restart the game to load the new hook version.",
                 "新しいモジュールをインストールした後、ゲームを再起動すると新しい Hook が読み込まれます。"),
@@ -1093,21 +1101,34 @@ private fun EmptyState(title: String, message: String) {
 }
 
 @Composable
-private fun InfoRow(label: String, value: String) {
+private fun InfoRow(label: String, value: String, labelColor: Color = MaterialTheme.colorScheme.onSurfaceVariant) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium, color = labelColor)
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
     }
 }
 
 @Composable
 private fun HookManagerTheme(content: @Composable () -> Unit) {
-    val colors = if (androidx.compose.foundation.isSystemInDarkTheme()) {
-        darkColorScheme(primary = Color(0xFF78D8A4), onPrimary = Color(0xFF003920), background = Color(0xFF101813), surface = Color(0xFF1B261F))
-    } else {
-        lightColorScheme(primary = Green, background = Cream, surface = Color(0xFFFFFEF8), primaryContainer = Color(0xFFD8F0DF))
-    }
-    MaterialTheme(colorScheme = colors, content = content)
+    val colors = lightColorScheme(
+        primary = Color(0xFF0B6B4A), onPrimary = Color.White,
+        primaryContainer = Color(0xFFDDEFE5), onPrimaryContainer = Color(0xFF0B6B4A),
+        secondary = Color(0xFF0B6B4A), secondaryContainer = Color(0xFFDDEFE5),
+        onSecondaryContainer = Color(0xFF0B6B4A),
+        tertiary = Color(0xFF926515), tertiaryContainer = Color(0xFFFBECC9),
+        background = Color(0xFFF4F1E8), onBackground = Color(0xFF1D2B27),
+        surface = Color.White, onSurface = Color(0xFF1D2B27),
+        surfaceVariant = Color(0xFFE9E5D7), onSurfaceVariant = Color(0xFF4E6058),
+        outline = Color(0xFFB8B9AB), outlineVariant = Color(0xFFE4E0D4),
+        error = Color(0xFFAE2924), errorContainer = Color(0xFFFBE0DD), onErrorContainer = Color(0xFF80211D))
+    val base = androidx.compose.material3.Typography()
+    val typography = androidx.compose.material3.Typography(
+        bodyLarge = base.bodyLarge.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Default, fontSize = 14.sp, lineHeight = 21.sp),
+        bodyMedium = base.bodyMedium.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Default, fontSize = 14.sp, lineHeight = 21.sp),
+        bodySmall = base.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Default, fontSize = 12.sp, lineHeight = 18.sp),
+        titleMedium = base.titleMedium.copy(fontSize = 17.sp),
+        headlineSmall = base.headlineSmall.copy(fontSize = 23.sp))
+    MaterialTheme(colorScheme = colors, typography = typography, content = content)
 }
 
 private fun readStatus(context: Context): ModuleStatus {

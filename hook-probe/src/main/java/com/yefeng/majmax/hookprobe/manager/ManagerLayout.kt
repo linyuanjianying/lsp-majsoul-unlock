@@ -1,5 +1,12 @@
 package com.yefeng.majmax.hookprobe.manager
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.material3.Text
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Surface
+import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -41,8 +48,8 @@ internal object ManagerLayout {
     val contentGap = 12.dp
     val actionGap = 8.dp
     val maxContentWidth = 640.dp
-    val cardShape = RoundedCornerShape(16.dp)
-    val buttonShape = RoundedCornerShape(12.dp)
+    val cardShape = RoundedCornerShape(22.dp)
+    val buttonShape = RoundedCornerShape(16.dp)
 }
 
 /** Shared page width keeps cards aligned on phones and readable in landscape. */
@@ -76,10 +83,10 @@ internal fun ManagerCard(
             verticalArrangement = Arrangement.spacedBy(ManagerLayout.contentGap), content = content)
     }
     if (onClick == null) {
-        Card(modifier.fillMaxWidth(), shape = ManagerLayout.cardShape, colors = colors) { body() }
+        Card(modifier.fillMaxWidth(), shape = ManagerLayout.cardShape, colors = colors, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) { body() }
     } else {
         Card(onClick = onClick, modifier = modifier.fillMaxWidth(), shape = ManagerLayout.cardShape,
-            colors = colors) { body() }
+            colors = colors, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) { body() }
     }
 }
 
@@ -137,4 +144,36 @@ internal fun ManagerTextButton(
         shape = ManagerLayout.buttonShape, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
         ProvideTextStyle(MaterialTheme.typography.labelLarge.copy(textAlign = TextAlign.Center)) { content() }
     }
+}
+
+/** Details remain available without overwhelming the default page. */
+@Composable
+internal fun ManagerDisclosure(title: String, labelColor: Color = MaterialTheme.colorScheme.primary, content: @Composable ColumnScope.() -> Unit) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth()) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        TextButton(onClick = { expanded = !expanded }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+            Text(title, Modifier.weight(1f), color = labelColor, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
+            Text(if (expanded) "⌃" else "⌄", color = labelColor)
+        }
+        androidx.compose.animation.AnimatedVisibility(expanded) {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
+        }
+    }
+}
+
+@Composable
+internal fun ManagerBadge(text: String, warning: Boolean = false) {
+    Surface(shape = RoundedCornerShape(50),
+        color = if (warning) Color(0xFFFBECC9) else MaterialTheme.colorScheme.primaryContainer,
+        contentColor = if (warning) Color(0xFF80580A) else MaterialTheme.colorScheme.onPrimaryContainer) {
+        Text(text, Modifier.padding(horizontal = 12.dp, vertical = 5.dp), style = MaterialTheme.typography.labelMedium)
+    }
+}
+
+@Composable
+internal fun ManagerModeButton(selected: Boolean, onClick: () -> Unit,
+    modifier: Modifier = Modifier, enabled: Boolean = true, content: @Composable RowScope.() -> Unit) {
+    if (selected) ManagerButton(onClick, modifier, enabled, content)
+    else ManagerOutlinedButton(onClick, modifier, enabled, content)
 }

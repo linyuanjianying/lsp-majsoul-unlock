@@ -40,11 +40,21 @@ internal object GameMenuText {
         put("助手", "Assistant", "アシスト")
         put("设置", "Settings", "設定")
 
+        // ---- top handle and assistant capsule ---------------------------------
+        put("助手运行中", "Assistant running", "アシスト実行中")
+        put("助手未开启", "Assistant off", "アシスト未起動")
+        put("无人值守中", "Unattended", "放置モード中")
+        put("服务未连接", "No service", "サービス未接続")
+        put("未开启", "Off", "オフ")
+        put("读取显示模式", "Reading mode", "表示モードを読み込み中")
+        put("无人值守开", "Unattended on", "放置モード オン")
+
         // ---- switch cards ----------------------------------------------------
         put("无人值守", "Unattended", "放置モード")
         put("自动控制", "Automation", "自動操作")
         put("助手服务自动分析并出牌", "The assistant analyses and plays for you",
             "アシストが自動で分析して打牌します")
+        put("自动续打", "Auto next game", "自動連戦")
         put("自动下一局", "Auto next game", "自動で次局へ")
         put("整场牌局结束后自动继续", "Continues after the whole match ends",
             "対局が終わると自動で続けます")
@@ -67,6 +77,7 @@ internal object GameMenuText {
         put("自检中 · 暂不可开", "Self-test · unavailable", "自己診断中 · オン不可")
         put("自检中", "Self-test", "自己診断中")
         put("未启动", "Not started", "未起動")
+        put("待机", "Standby", "待機")
         put("点按关闭 · 助手服务继续运行", "Tap to turn off · the service keeps running",
             "タップでオフ · サービスは継続")
         put("模型自检中，结束后可开启", "Model self-test running; you can turn it on afterwards",
@@ -83,9 +94,18 @@ internal object GameMenuText {
             "ゲームの「次局」ボタンのみを押します")
         put("牌局结束后自动继续，与上项独立", "Continues after the game; independent of the item above",
             "対局後に自動で続行。上の項目とは独立です")
+        put("牌局结束后自动继续", "Continues when the game ends", "対局が終わると自動で続行")
+        put("只调用游戏的“下一局”原按钮，不伪造请求；未开启时不排队",
+            "Only presses the game's own “next game” button; nothing is forged and nothing queues while it is off",
+            "ゲーム本来の「次局」ボタンのみを押します。リクエストの偽造や、オフ時の待機はしません")
         put("点按开启", "Tap to turn on", "タップでオン")
 
         // ---- discards & points card -----------------------------------------
+        put("穿透固定面板上的推荐与番点", "Discards & points on the pass-through panel",
+            "クリック透過パネルの打牌推奨と点数")
+        put("固定面板显示建议牌与番点", "The fixed panel shows discards and hand values",
+            "固定パネルに打牌推奨と点数を表示")
+        put("已隐藏建议牌与番点", "Discards and hand values are hidden", "打牌推奨と点数を非表示")
         put("固定面板显示建议牌与番点 · 不影响其他功能",
             "The fixed panel shows discards and hand values · other features unaffected",
             "固定パネルに打牌推奨と点数を表示 · 他の機能に影響なし")
@@ -215,11 +235,11 @@ internal object GameMenuText {
             "Once on, the AI plays its top pick; you can stop anytime",
             "オンにすると AI の第一候補で自動打牌。いつでも停止できます")
         put("整场结束后调用游戏的结算与“下一局”，不新建或伪造请求",
-            "After the match the game's own settlement and \u201cnext game\u201d are used; no requests are forged",
+            "After the match the game's own settlement and “next game” are used; no requests are forged",
             "対局後にゲーム本来の精算と「次局」を呼び出します。リクエストの偽造はしません")
         put("模型自检中不会自动匹配", "No auto next game during the self-test", "自己診断中は自動次局を行いません")
         put("仅调用游戏的“下一局”原按钮；可随时在此关闭",
-            "Only presses the game's own \u201cnext game\u201d button; turn it off here anytime",
+            "Only presses the game's own “next game” button; turn it off here anytime",
             "ゲーム本来の「次局」ボタンのみを押します。いつでもここでオフにできます")
         put("默认关闭。与无人值守独立，开启后自动续局",
             "Off by default. Independent of unattended mode; continues automatically when on",
