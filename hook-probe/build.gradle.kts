@@ -56,8 +56,8 @@ android {
         applicationId = "com.yefeng.majmax.hookprobe"
         minSdk = 29
         targetSdk = 35
-        versionCode = 57
-        versionName = "0.15.3"
+        versionCode = 56
+        versionName = "0.15.2"
         testInstrumentationRunner = "com.yefeng.majmax.hookprobe.manager.AutoDiscardInstrumentation"
         buildConfigField("String", "UPDATE_OWNER", "\"${updateOwner.replace("\"", "\\\"")}\"")
         buildConfigField("String", "UPDATE_REPO", "\"${updateRepo.replace("\"", "\\\"")}\"")
@@ -112,7 +112,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
-    // Material 3 already brings Material icons core; only the nine icons in manager/icons are vendored.
+    implementation("androidx.compose.material:material-icons-extended")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

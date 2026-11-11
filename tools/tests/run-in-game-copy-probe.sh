@@ -78,7 +78,7 @@ mkdir -p "$OUT/ml" "$OUT/sources" "$OUT/panel" "$OUT/state"
 
 # 1. ManagerLanguage.kt + UiLanguage.kt, the shared vocabulary and the public API the
 #    provider answers with (needs the Compose runtime artifact).
-compile "$OUT/ml" "" "$SRC/manager/ManagerLanguage.kt" "$SRC/manager/UiLanguage.kt" "$SRC/manager/TraditionalChinese.kt" "$SRC/manager/TraditionalChinese.kt"
+compile "$OUT/ml" "" "$SRC/manager/ManagerLanguage.kt" "$SRC/manager/UiLanguage.kt"
 FRIENDS="$FRIENDS,$OUT/ml"
 
 # 2. This change's helpers.
