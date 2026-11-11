@@ -59,17 +59,30 @@ jobs:
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
 
-      - name: Install protobuf compiler and Lua test runtime
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler lua5.1
-
-      - name: Test Android emoji compatibility
-        run: lua5.1 tools/tests/test_emoji_compat.lua
-
-      - name: Test automatic operation safeguards
-        run: lua5.1 tools/tests/test_auto_discard.lua
-
-      - name: Test independent automatic rematch
-        run: lua5.1 tools/tests/test_auto_rematch.lua
+      - name: Run Lua checks from the verified Lua 5.1 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lua-deb/root"
+          url='https://deb.debian.org/debian/pool/main/l/lua5.1/lua5.1_5.1.5-9_amd64.deb'
+          expected='2abaa116e03f4aaf34de634b447e7fa11569e27b33de342e93bbcf0857694015'
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 \
+                "$url" -o "$RUNNER_TEMP/lua-deb/lua5.1.deb"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then exit 1; fi
+            sleep $((attempt * 10))
+          done
+          echo "$expected  $RUNNER_TEMP/lua-deb/lua5.1.deb" | sha256sum --check
+          test "$(dpkg-deb -f "$RUNNER_TEMP/lua-deb/lua5.1.deb" Architecture)" = amd64
+          test "$(dpkg-deb -f "$RUNNER_TEMP/lua-deb/lua5.1.deb" Package)" = lua5.1
+          dpkg-deb -x "$RUNNER_TEMP/lua-deb/lua5.1.deb" "$RUNNER_TEMP/lua-deb/root"
+          LUA="$RUNNER_TEMP/lua-deb/root/usr/bin/lua5.1"
+          "$LUA" -v
+          "$LUA" tools/tests/test_emoji_compat.lua
+          "$LUA" tools/tests/test_auto_discard.lua
+          "$LUA" tools/tests/test_auto_rematch.lua
 
       - name: Verify versioned unlock catalog
         run: python3 tools/update_unlock_catalog.py --check
