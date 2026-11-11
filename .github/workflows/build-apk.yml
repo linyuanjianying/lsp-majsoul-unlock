@@ -59,6 +59,27 @@ jobs:
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
 
+      - name: Install protoc without apt repository resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/protoc"
+          url='https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip'
+          expected='0ad949f04a6a174da83cdcbdb36dee0a4925272a5b6d83f79a6bf9852076d53f'
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 \\
+                "$url" -o "$RUNNER_TEMP/protoc/protoc.zip"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then exit 1; fi
+            sleep $((attempt * 10))
+          done
+          echo "$expected  $RUNNER_TEMP/protoc/protoc.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/protoc/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          chmod +x "$RUNNER_TEMP/protoc/bin/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/protoc/bin/protoc" --version
+
       - name: Run Lua checks from the verified Lua 5.1 package
         shell: bash
         run: |
