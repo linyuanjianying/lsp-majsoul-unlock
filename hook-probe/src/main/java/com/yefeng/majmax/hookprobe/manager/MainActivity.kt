@@ -1,6 +1,15 @@
 package com.yefeng.majmax.hookprobe.manager
 
-import androidx.compose.material.icons.filled.Delete
+import com.yefeng.majmax.hookprobe.manager.icons.Article
+import com.yefeng.majmax.hookprobe.manager.icons.Delete
+import com.yefeng.majmax.hookprobe.manager.icons.Home
+import com.yefeng.majmax.hookprobe.manager.icons.Icons
+import com.yefeng.majmax.hookprobe.manager.icons.Info
+import com.yefeng.majmax.hookprobe.manager.icons.Refresh
+import com.yefeng.majmax.hookprobe.manager.icons.Share
+import com.yefeng.majmax.hookprobe.manager.icons.SmartToy
+import com.yefeng.majmax.hookprobe.manager.icons.SystemUpdate
+import com.yefeng.majmax.hookprobe.manager.icons.Warning
 import android.content.Context
 import android.content.Intent
 import android.content.ClipData
@@ -29,16 +38,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Article
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.SystemUpdate
-import androidx.compose.material.icons.filled.SmartToy
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
