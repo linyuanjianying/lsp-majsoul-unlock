@@ -239,8 +239,15 @@ class GameHintLayer {
         main.post(tick)
     }
 
+    /**
+     * The tag this layer sends to the overlays it owns.
+     *
+     * The enum's stored tag is used, so `zh-Hant` reaches the recommendation panel and the tile
+     * hint surface as a real value and the copy follows a Traditional selection.
+     */
     private fun languageTagOf(language: ManagerLanguage): String = when (language) {
         ManagerLanguage.SIMPLIFIED -> "zh-Hans"
+        ManagerLanguage.TRADITIONAL -> "zh-Hant"
         ManagerLanguage.ENGLISH -> "en"
         ManagerLanguage.JAPANESE -> "ja"
     }

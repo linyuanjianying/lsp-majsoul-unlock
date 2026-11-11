@@ -67,7 +67,8 @@ import kotlin.math.roundToInt
  *    preference keys and the FLAG_NOT_TOUCH_MODAL contract, so touches outside the
  *    window still reach the game.
  *
- * All new copy goes through [UiLanguage.text] (zh, en, ja) so the three renderings can
+ * All new copy goes through [UiLanguage.text] (zh, en, ja) so every rendering (including the
+ * Traditional Chinese one derived from the Chinese text) can
  * never drift apart; every interactive surface is at least 44 dp.
  */
 internal class AiFloatingWindow(private val context: Context, private val stop: () -> Unit,
@@ -286,7 +287,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         ManagerLanguageSettings.readChoice(context).effective(ManagerSystemLanguage.current())
     }.getOrDefault(ManagerLanguage.SIMPLIFIED)
 
-    /** One string in the three shipped renderings; the language decides which one. */
+    /** One string as (Chinese, English, Japanese); the language picks, Traditional deriving
+     * its copy from the Chinese text. */
     private fun t(zh: String, en: String = zh, ja: String = zh): String = language.tr(zh, en, ja)
 
     /** The exact string [UiLanguage.text] would return for a service-side caller. */
@@ -728,7 +730,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         // Weight 1 + minWidth 0: the title is the only elastic child, so it shrinks and
         // ellipsizes first and can never push the pill or the two buttons out of the row.
         // The title text is "雀魂助手" once the pill carries the state, so it is short in
-        // all three languages and does not have to be shrunk to 8 sp on a narrow panel.
+        // every language and does not have to be shrunk to 8 sp on a narrow panel.
         val heading = style.text(assistantTitle(), 13.5f, style.ink, true).apply {
             maxLines = 1
             isSingleLine = true
@@ -1498,7 +1500,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * Caption row (name + gold value tag) above the slider.
      *
      * The tag, not the caption, carries the number: the caption keeps the label so a
-     * long three-language label wraps on two lines instead of pushing the value off the
+     * long translated label wraps on two lines instead of pushing the value off the
      * right edge. Returns the value tag so a language switch can re-apply the copy.
      */
     private fun addSlider(parent: LinearLayout, name: String, min: Int, max: Int, value: Int,
@@ -1798,6 +1800,10 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         val text = when (language) {
             ManagerLanguage.SIMPLIFIED ->
                 round.replace("E", "东").replace("S", "南").replace("W", "西").replace("N", "北")
+            // Same seat letters as Simplified, spelled the Traditional way; the round number that
+            // follows them is copied exactly as received.
+            ManagerLanguage.TRADITIONAL ->
+                round.replace("E", "東").replace("S", "南").replace("W", "西").replace("N", "北")
             ManagerLanguage.ENGLISH -> round
             ManagerLanguage.JAPANESE ->
                 round.replace("E", "東").replace("S", "南").replace("W", "西").replace("N", "北")
@@ -1817,6 +1823,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
 
     private fun suitName(suit: Int, rank: Char): String = when (language) {
         ManagerLanguage.SIMPLIFIED -> rank + when (suit) { 0 -> "万"; 1 -> "筒"; else -> "索" }
+        // The rank character is data and stays as-is; only the suit word is Traditional.
+        ManagerLanguage.TRADITIONAL -> rank + when (suit) { 0 -> "萬"; 1 -> "筒"; else -> "索" }
         ManagerLanguage.ENGLISH -> rank + when (suit) { 0 -> "m"; 1 -> "p"; else -> "s" }
         ManagerLanguage.JAPANESE -> "$rank" + when (suit) { 0 -> "萬"; 1 -> "筒"; else -> "索" } + "子"
     }
@@ -1824,6 +1832,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private fun honorName(index: Int, tile: String): String = when (language) {
         ManagerLanguage.SIMPLIFIED ->
             listOf("东", "南", "西", "北", "白", "发", "中")[index]
+        ManagerLanguage.TRADITIONAL ->
+            listOf("東", "南", "西", "北", "白", "發", "中")[index]
         ManagerLanguage.ENGLISH -> tile
         ManagerLanguage.JAPANESE ->
             listOf("東", "南", "西", "北", "白", "發", "中")[index]

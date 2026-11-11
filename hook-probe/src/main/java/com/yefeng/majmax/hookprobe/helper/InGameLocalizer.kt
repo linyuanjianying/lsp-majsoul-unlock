@@ -56,6 +56,9 @@ internal object InGameLocalizer {
     /**
      * The language the manager page currently shows.
      *
+     * A Traditional selection resolves to [ManagerLanguage.TRADITIONAL], so the tag the provider
+     * sends to the game is `zh-Hant` and every in-game surface follows it.
+     *
      * The stored *choice* with "follow the system" resolved, i.e. exactly the value the
      * manager renders in. Read-only: a failure keeps Chinese, and the manager process
      * itself is the writer.

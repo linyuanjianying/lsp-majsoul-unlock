@@ -18,8 +18,8 @@ import kotlinx.coroutines.flow.asStateFlow
  * as what is actually rendered:
  *
  * - [ManagerLanguageChoice] is what the user picked and what is stored: `SYSTEM`, `SIMPLIFIED`,
- *   `ENGLISH`, `JAPANESE`. `SYSTEM` is the default for a fresh install and nobody is migrated
- *   onto it; an explicit language written by an earlier build stays exactly as it is.
+ *   `TRADITIONAL`, `ENGLISH`, `JAPANESE`. `SYSTEM` is the default for a fresh install and nobody
+ *   is migrated onto it; an explicit language written by an earlier build stays exactly as it is.
  * - [ManagerLanguage] is the language that is *effective* right now, and it never contains
  *   `SYSTEM`: [ManagerLanguageChoice.effective] resolves it against the device locales.
  *
@@ -37,13 +37,14 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * Stored selection: the user's explicit choice, or [SYSTEM] meaning "follow the device".
  *
- * [tag] is the value written to preferences (`system`, `zh-Hans`, `en`, `ja`). [label] is
- * intentionally not localised: an endonym is the one label a user can always recognise, even
- * when the current UI language is one they did not expect.
+ * [tag] is the value written to preferences (`system`, `zh-Hans`, `zh-Hant`, `en`, `ja`).
+ * [label] is intentionally not localised: an endonym is the one label a user can always
+ * recognise, even when the current UI language is one they did not expect.
  */
 internal enum class ManagerLanguageChoice(val tag: String, val label: String) {
     SYSTEM("system", "跟随系统"),
     SIMPLIFIED("zh-Hans", "简体中文"),
+    TRADITIONAL("zh-Hant", "繁體中文"),
     ENGLISH("en", "English"),
     JAPANESE("ja", "日本語"),
     ;
@@ -52,6 +53,7 @@ internal enum class ManagerLanguageChoice(val tag: String, val label: String) {
     fun explicitOrNull(): ManagerLanguage? = when (this) {
         SYSTEM -> null
         SIMPLIFIED -> ManagerLanguage.SIMPLIFIED
+        TRADITIONAL -> ManagerLanguage.TRADITIONAL
         ENGLISH -> ManagerLanguage.ENGLISH
         JAPANESE -> ManagerLanguage.JAPANESE
     }
@@ -64,10 +66,13 @@ internal enum class ManagerLanguageChoice(val tag: String, val label: String) {
          * Stored value or resource tag to enum. Missing or unknown values are [SYSTEM] (the
          * shipped default).
          *
-         * A tag is matched on its language subtag with the region/script ignored: `zh`,
-         * `zh-Hans`, `zh-CN` and `zh-TW` all mean simplified Chinese (the manager has one
-         * Chinese build and must not claim a traditional variant it cannot draw), `en-US` is
+         * Chinese is resolved on script first and on region second (see [zhChoiceOf]):
+         * `zh-Hant`, `zh-TW`, `zh-HK`, `zh-MO` and any other Traditional region mean
+         * traditional Chinese; `zh-Hans`, `zh-CN`, `zh-SG` and a bare `zh` mean simplified
+         * Chinese. An explicit `Hans` subtag always wins over a Traditional region, so
+         * `zh-Hans-TW` is still simplified, and `zh-Hant-CN` is still traditional. `en-US` is
          * English, `ja-JP` is Japanese. `system` is the stored "follow the device" value.
+         *
          * This is the single definition used by the preferences reader and by
          * [UiLanguage.applyTag], so the two can never disagree.
          */
@@ -76,12 +81,31 @@ internal enum class ManagerLanguageChoice(val tag: String, val label: String) {
             if (value.isEmpty()) return SYSTEM
             if (value == SYSTEM.tag) return SYSTEM
             return when (value.substringBefore('-')) {
-                "zh" -> SIMPLIFIED
+                "zh" -> zhChoiceOf(value)
                 "en" -> ENGLISH
                 "ja" -> JAPANESE
                 else -> SYSTEM
             }
         }
+
+        /**
+         * The Chinese variant a `zh` tag names: script subtag first (`hant` -> traditional,
+         * `hans` -> simplified), then the region (`TW`, `HK`, `MO` -> traditional), then plain
+         * `zh` -> simplified. Every subtag is looked at, so `zh-TW-Hant` and `zh-Hant-TW` agree
+         * and an explicit `Hans` is never overridden by a Traditional region.
+         */
+        private fun zhChoiceOf(value: String): ManagerLanguageChoice {
+            val subtags = value.split('-')
+            if (subtags.any { it == "hant" }) return TRADITIONAL
+            if (subtags.any { it == "hans" }) return SIMPLIFIED
+            return when (subtags.getOrNull(1)) {
+                "tw", "hk", "mo" -> TRADITIONAL
+                else -> SIMPLIFIED
+            }
+        }
+
+        /** `true` when [raw] names traditional Chinese in any of its usual spellings. */
+        fun isTraditionalTag(raw: String?): Boolean = fromTag(raw) == TRADITIONAL
 
         /** Preferences value to enum. Same rules as [fromTag]; kept as the reading entry point. */
         fun fromStored(raw: String?): ManagerLanguageChoice = fromTag(raw)
@@ -89,6 +113,7 @@ internal enum class ManagerLanguageChoice(val tag: String, val label: String) {
         /** The menu entry for an effective language, e.g. for the top bar's current tag. */
         fun of(language: ManagerLanguage): ManagerLanguageChoice = when (language) {
             ManagerLanguage.SIMPLIFIED -> SIMPLIFIED
+            ManagerLanguage.TRADITIONAL -> TRADITIONAL
             ManagerLanguage.ENGLISH -> ENGLISH
             ManagerLanguage.JAPANESE -> JAPANESE
         }
@@ -98,6 +123,7 @@ internal enum class ManagerLanguageChoice(val tag: String, val label: String) {
 /** A language the manager can actually render. Never `SYSTEM`. */
 internal enum class ManagerLanguage(val tag: String, val label: String) {
     SIMPLIFIED("zh-Hans", "简体中文"),
+    TRADITIONAL("zh-Hant", "繁體中文"),
     ENGLISH("en", "English"),
     JAPANESE("ja", "日本語"),
     ;
@@ -112,16 +138,23 @@ internal enum class ManagerLanguage(val tag: String, val label: String) {
 /**
  * Device-locale resolution: which [ManagerLanguage] a `SYSTEM` choice should render as.
  *
- * Ordered exactly as the product requires: Japanese first, Chinese second, anything else
- * English. Only the primary locale decides, and only its language code is looked at, so
- * `zh-TW`, `zh-Hant` and `zh-HK` all select simplified Chinese: the manager ships one Chinese
- * build and must not claim a traditional variant it cannot draw.
+ * Ordered exactly as the product requires: Japanese first, Chinese second (with its script and
+ * region deciding simplified vs traditional), anything else English. Only the primary locale
+ * decides. The Chinese answer comes from [ManagerLanguageChoice.fromTag] on the locale's script
+ * and region, so `zh-TW`, `zh-HK`, `zh-MO` and `zh-Hant` select traditional Chinese while `zh`,
+ * `zh-CN`, `zh-SG` and `zh-Hans` select simplified — the same rules the stored preference and
+ * the `uiLanguage` tag use, so a device and a menu entry can never disagree.
  */
 internal object ManagerSystemLanguage {
-    fun resolve(locale: java.util.Locale?): ManagerLanguage = when (locale?.language?.lowercase()) {
-        "ja" -> ManagerLanguage.JAPANESE
-        "zh" -> ManagerLanguage.SIMPLIFIED
-        else -> ManagerLanguage.ENGLISH
+    fun resolve(locale: java.util.Locale?): ManagerLanguage {
+        if (locale == null) return ManagerLanguage.ENGLISH
+        return when (locale.language?.lowercase()) {
+            "ja" -> ManagerLanguage.JAPANESE
+            // A locale with neither script nor region ("zh") stays plain simplified.
+            "zh" -> ManagerLanguageChoice.fromTag(locale.toLanguageTag()).explicitOrNull()
+                ?: ManagerLanguage.SIMPLIFIED
+            else -> ManagerLanguage.ENGLISH
+        }
     }
 
     /**
@@ -264,11 +297,16 @@ internal object ManagerLanguageState {
 /** The one helper every call site uses: `language.tr(chinese, english, japanese)`. */
 internal fun ManagerLanguage.tr(zh: String, en: String, ja: String): String = when (this) {
     ManagerLanguage.SIMPLIFIED -> zh
+    // Traditional is derived from the *Chinese* argument, never from the English or Japanese one:
+    // the compiled table either returns the exact Traditional wording or falls back to the
+    // Simplified source, so a Traditional user never sees English or an empty label where the
+    // app has its own Chinese copy.
+    ManagerLanguage.TRADITIONAL -> TraditionalChinese.text(zh)
     ManagerLanguage.ENGLISH -> en
     ManagerLanguage.JAPANESE -> ja
 }
 
-/** The same three-way pick for a stored selection, resolved against the device first. */
+/** The same pick for a stored selection, resolved against the device first. */
 internal fun ManagerLanguageChoice.tr(zh: String, en: String, ja: String): String =
     effective(ManagerSystemLanguage.current()).tr(zh, en, ja)
 
@@ -310,6 +348,10 @@ internal fun localizedKnown(raw: String, language: ManagerLanguage = managerLang
  */
 internal fun localizedUpdateFailure(raw: String, language: ManagerLanguage): String {
     if (language == ManagerLanguage.SIMPLIFIED) return raw
+    // Traditional is still a Chinese rendering: it goes through [ManagerLanguageText], which
+    // converts the Chinese source and leaves an unknown failure verbatim. The English/Japanese
+    // pairs below are reachable for those two languages only.
+    if (language == ManagerLanguage.TRADITIONAL) return ManagerLanguageText.trim(raw, language)
     val text = raw.trim()
     val copy = when {
         text == "更新源配置无效。" ->
@@ -346,17 +388,22 @@ internal object ManagerLanguageText {
         val text = normalize(raw)
         if (text.isEmpty()) return raw
         pattern(text, language)?.let { return it }
+        // Unknown diagnostics (engine errors, tool output, game text) are not keys here, so they
+        // come back verbatim in every language, Traditional included.
         val exact = EXACT[text] ?: return raw
+        // Every branch converts the *Chinese* source: `tr` is never handed an empty or an
+        // English string to turn into Traditional Chinese.
         return language.tr(exact.zh, exact.en, exact.ja)
     }
 
     private fun pattern(text: String, language: ManagerLanguage): String? {
-        // "随机等待 2.3 秒 · 可随时关闭"
+        // "随机等待 2.3 秒 · 可随时关闭" — the seconds keep their exact digits in every language.
         Regex("^随机等待 ([0-9.]+) 秒 · 可随时关闭$").matchEntire(text)?.let {
             val seconds = it.groupValues[1]
             return when (language) {
                 ManagerLanguage.ENGLISH -> "Waiting $seconds s · you can stop it anytime"
                 ManagerLanguage.JAPANESE -> "$seconds 秒待機中 · いつでも停止できます"
+                ManagerLanguage.TRADITIONAL -> "隨機等候 $seconds 秒 · 可隨時關閉"
                 ManagerLanguage.SIMPLIFIED -> null
             }
         }
@@ -366,6 +413,8 @@ internal object ManagerLanguageText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "${reason.en}, waiting for a full game state"
                 ManagerLanguage.JAPANESE -> "${reason.ja}。対局状態の完全な再同期を待っています"
+                // The Chinese reason converted, not the English or the Japanese one.
+                ManagerLanguage.TRADITIONAL -> "${reason.zh}，等待新的完整牌局狀態"
                 ManagerLanguage.SIMPLIFIED -> null
             }
         }
@@ -512,6 +561,7 @@ internal fun localizedDelayLabel(range: AutoDelayRange, language: ManagerLanguag
     val fixed = range.minTenths == range.maxTenths
     return when (language) {
         ManagerLanguage.SIMPLIFIED -> range.label
+        ManagerLanguage.TRADITIONAL -> if (fixed) "$min 秒（固定）" else "$min–$max 秒（隨機）"
         ManagerLanguage.ENGLISH -> if (fixed) "$min s (fixed)" else "$min–$max s (random)"
         ManagerLanguage.JAPANESE -> if (fixed) "$min 秒（固定）" else "$min–$max 秒（ランダム）"
     }
@@ -544,10 +594,12 @@ internal fun topBarLanguageTag(choice: ManagerLanguageChoice, language: ManagerL
     when (choice) {
         // Explicit languages show their own tag, even when the device is set to something else.
         ManagerLanguageChoice.SIMPLIFIED -> "中文"
+        ManagerLanguageChoice.TRADITIONAL -> "繁體"
         ManagerLanguageChoice.ENGLISH -> "EN"
         ManagerLanguageChoice.JAPANESE -> "日本語"
         ManagerLanguageChoice.SYSTEM -> when (language) {
             ManagerLanguage.SIMPLIFIED -> "中文"
+            ManagerLanguage.TRADITIONAL -> "繁體"
             ManagerLanguage.ENGLISH -> "EN"
             ManagerLanguage.JAPANESE -> "日本語"
         }
@@ -556,7 +608,10 @@ internal fun topBarLanguageTag(choice: ManagerLanguageChoice, language: ManagerL
 /** Label of one stored choice, for the radio rows and the "current:" lines. */
 internal fun ManagerLanguageChoice.label(language: ManagerLanguage): String = when (this) {
     ManagerLanguageChoice.SYSTEM -> language.tr("跟随系统", "Follow system", "システムに従う")
+    // Endonyms: every language name is shown in its own script in every UI language, so the new
+    // entry reads 繁體中文 no matter what is currently selected.
     ManagerLanguageChoice.SIMPLIFIED -> "简体中文"
+    ManagerLanguageChoice.TRADITIONAL -> "繁體中文"
     ManagerLanguageChoice.ENGLISH -> "English"
     ManagerLanguageChoice.JAPANESE -> "日本語"
 }
@@ -567,10 +622,14 @@ internal fun ManagerLanguageChoice.label(language: ManagerLanguage): String = wh
  */
 internal fun ManagerLanguageChoice.describe(language: ManagerLanguage): String = when (this) {
     ManagerLanguageChoice.SYSTEM ->
-        language.tr(
-            "跟随系统（${language.label}）",
-            "Follow system (${language.label})",
-            "システムに従う（${language.label}）",
-        )
+        // The resolved language is interpolated, so the wrapper (and the name inside it) is
+        // translated per language instead of through a table lookup: the name is already the
+        // final endonym and must not be converted again.
+        when (language) {
+            ManagerLanguage.SIMPLIFIED -> "跟随系统（${language.label}）"
+            ManagerLanguage.TRADITIONAL -> "跟隨系統（${language.label}）"
+            ManagerLanguage.ENGLISH -> "Follow system (${language.label})"
+            ManagerLanguage.JAPANESE -> "システムに従う（${language.label}）"
+        }
     else -> label(language)
 }

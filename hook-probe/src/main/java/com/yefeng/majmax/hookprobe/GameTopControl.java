@@ -139,11 +139,17 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      */
     private static final int HEADER_DP = 28;
     /**
-     * Two-part tab band, pre-scale dp. 22dp is ~60px visible (target 55..65px): a 14sp
-     * label with 1dp of padding and 6dp of capsule margin still hits ~106px of width, and
-     * the whole row is one tap wide per half.
+     * Two-part tab band, pre-scale dp. 34dp is ~94px visible at 2.75 (the user asked for a
+     * slightly larger control/status group: 34 or 36), and it holds a 16sp label with room
+     * to breathe. The band is still one half row wide per tab, so the whole half — not only
+     * the drawn glyph — is the tap target, and it stays far cheaper than the old 60dp row:
+     * the numbers in the header comment of {@link #buildMenu} show the content band still
+     * keeping ~76% of the menu height, which is why the bigger tab does not squeeze the
+     * switch cards off the first screenful.
      */
-    private static final int TAB_DP = 28;
+    private static final int TAB_DP = 34;
+    /** Tab label size, sp. One notch above the old 15sp so the group reads as a group. */
+    private static final float TAB_TEXT_SP = 16f;
     /**
      * Height of a switch card, pre-scale dp. 34dp is ~94px visible: title row (16sp + 13sp
      * state) plus one 12sp note line, which is what the card actually needs. Cards stay the
@@ -856,41 +862,17 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * handle and the capsule are GONE), so the game's hand tiles and buttons outside it
      * are untouched. While the handle or the capsule is showing the root is wrap-content
      * around that small view and never clickable at all.
+     *
+     * <p>No gesture of its own: the root deliberately overrides neither
+     * {@code onInterceptTouchEvent} nor {@code onTouchEvent}. There is no horizontal
+     * swipe-to-switch-tab any more — a side swipe used to swallow the gesture and throw the
+     * user into the other page mid-scroll / mid-drag. The two pages are switched only by
+     * their own tab shells, the switches only by the right-hand {@link GameTopUi.Switch},
+     * and the only touch behaviour left inside the panel is the ScrollView's normal
+     * vertical scrolling.
      */
     private final class StageRoot extends FrameLayout {
-        private float downX, downY;
-        private boolean swiping, moved;
         StageRoot(Context context) { super(context); }
-        @Override public boolean onInterceptTouchEvent(MotionEvent e) {
-            if (stage != STAGE_MENU) return false;
-            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                downX = e.getX(); downY = e.getY(); swiping = false; moved = false;
-            } else if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
-                float dx = e.getX() - downX, dy = e.getY() - downY;
-                int slop = android.view.ViewConfiguration.get(getContext()).getScaledTouchSlop();
-                if (Math.abs(dx) > slop || Math.abs(dy) > slop) moved = true;
-                if (Math.abs(dx) > slop * 2 && Math.abs(dx) > Math.abs(dy) * 1.5f) {
-                    swiping = true; return true;
-                }
-            }
-            return false;
-        }
-        @Override public boolean onTouchEvent(MotionEvent e) {
-            if (stage != STAGE_MENU) return false;
-            if (e.getActionMasked() == MotionEvent.ACTION_UP) {
-                if (swiping) {
-                    int next = e.getX() < downX ? TAB_STATUS : TAB_CONTROL;
-                    selectTab(next);
-                    View page = next == TAB_CONTROL ? pageControl : pageStatus;
-                    if (page != null) {
-                        page.setTranslationX(dp(getContext(), next == TAB_STATUS ? 18 : -18));
-                        page.setAlpha(.5f);
-                        page.animate().translationX(0).alpha(1f).setDuration(160).start();
-                    }
-                } // Internal blank taps never collapse the menu.
-            }
-            return true;
-        }
         @Override public boolean dispatchTouchEvent(MotionEvent event) {
             noteMenuTouch(event);
             return super.dispatchTouchEvent(event);
@@ -1047,12 +1029,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      *   panel padding         5dp          14px        11px visible
      *   header               28dp          77px        58px visible
      *   gutter                4dp          11px         8px visible
-     *   tab                  22dp          61px        46px visible
+     *   tab                  34dp          94px        70px visible
      *   gutter                4dp          11px         8px visible
-     *   body (weight 1)                 848px       507px visible = 78% of the menu
+     *   body (weight 1)                 781px       472px visible = 73% of the menu
      *   panel padding         5dp          14px        11px visible
      *   ---- total                     1036px       648px visible
      * </pre>
+     *
+     * <p>The tab band is 34dp since the control/status group was enlarged (it was 22dp / 61px
+     * for ~2 builds): the band costs 24px visible more and the body keeps 472px = 73% of the
+     * menu, i.e. still over the 65% / 420px budget the layout probe enforces, and still enough
+     * for two full switch cards plus most of the third in the first screenful. The body is a
+     * ScrollView, so nothing is ever clipped away — the chrome simply never eats the panel.
      *
      * <p>Nothing is pinned below the scroll band any more: the 1dp divider and the 135px
      * "收起面板" row are gone (the header chevron and the outside tap both collapse), so the
@@ -1162,13 +1150,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * The two-part tab above the cards: one gold capsule for the selected section, a
      * quiet card for the other. Both sides share the row's half width, so the hit target
      * is the full half rather than only the drawn text.
+     *
+     * <p>This row is the ONLY way to switch page: no root-level gesture, no swipe. Each
+     * half is a clickable shell with its own listener (see {@link #bindTab}).
      */
     private LinearLayout buildTabs(Activity activity) {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setBackground(GameTopUi.round(activity, 11, 0x14000000, 0, 0));
-        // 1dp inset: the tab capsule is the whole 22dp band, the row only a hairline frame.
+        // 1dp inset: the tab capsule is the whole band, the row only a hairline frame.
         row.setPadding(dp(activity, 1), dp(activity, 1), dp(activity, 1), dp(activity, 1));
         bindTab(activity, controlTab, TAB_CONTROL);
         bindTab(activity, statusTab, TAB_STATUS);
@@ -1185,15 +1176,19 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * Builds one tab part and binds its click listener exactly once. Rebuilding the menu
      * on a language switch drops the old shell together with its listener; the new shell
      * gets a fresh one, so nothing can accumulate on a listener list.
+     *
+     * <p>The shell — not the label, not the root — is the tap target: {@code selectTab}
+     * is reached from here and from nowhere else on the touch path, so a swipe, a scroll or
+     * a tap on the cards can never change page.
      */
     private void bindTab(Activity activity, TabView view, int id) {
         LinearLayout shell = new LinearLayout(activity);
         shell.setOrientation(LinearLayout.HORIZONTAL);
         shell.setGravity(Gravity.CENTER);
-        // 6dp side padding is still ~106px of half-row to hit; the 60dp minimum is gone
-        // so the two-part tab fits the 22dp band instead of owning a 135px row.
-        shell.setPadding(dp(activity, 6), 0, dp(activity, 6), 0);
-        TextView label = GameTopUi.text(activity, 15, GameTopUi.INK_MUTED, true);
+        // 8dp side padding keeps ~110px of half-row to hit; the 60dp minimum is gone
+        // so the two-part tab fits its own band instead of owning a 135px row.
+        shell.setPadding(dp(activity, 8), 0, dp(activity, 8), 0);
+        TextView label = GameTopUi.text(activity, TAB_TEXT_SP, GameTopUi.INK_MUTED, true);
         label.setText(id == TAB_CONTROL ? t("控制") : t("状态"));
         label.setGravity(Gravity.CENTER);
         InGameLocalizer.layout(label, 1, InGameLocalizer.Align.CENTER);

@@ -16,7 +16,7 @@ import java.security.MessageDigest
 import java.util.UUID
 
 /**
- * Reply field carrying the manager's UI language ("zh-Hans" / "en" / "ja").
+ * Reply field carrying the manager's UI language ("zh-Hans" / "zh-Hant" / "en" / "ja").
  *
  * Every reply the in-game surfaces read is stamped with it through [putUiLanguage], so
  * the menu, the recommendation window and the hint snapshot all follow the same value

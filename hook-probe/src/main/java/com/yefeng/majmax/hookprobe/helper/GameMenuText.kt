@@ -1,6 +1,8 @@
 package com.yefeng.majmax.hookprobe.helper
 
 import com.yefeng.majmax.hookprobe.manager.ManagerLanguage
+import com.yefeng.majmax.hookprobe.manager.ManagerLanguageChoice
+import com.yefeng.majmax.hookprobe.manager.TraditionalChinese
 import org.json.JSONObject
 
 /**
@@ -12,7 +14,9 @@ import org.json.JSONObject
  * contracts that matter here:
  *
  *  - Chinese is the source of truth, so a missing translation can only ever fall back to
- *    the original string.
+ *    the original string. Traditional Chinese is produced from that Chinese source through the
+ *    compiled [com.yefeng.majmax.hookprobe.manager.TraditionalChinese] table, never from the
+ *    English or the Japanese copy.
  *  - Text produced by the engine, the game or an unknown diagnostic is *not* in these
  *    tables and is therefore kept verbatim (`GameTopControl` only hands it strings it
  *    wrote itself, so an unknown diagnostic can never be rewritten).
@@ -327,7 +331,14 @@ internal object GameMenuText {
         "切" to Copy("切", "Discard ", "打 "),
     )
 
-    /** Translates one known manager string; everything else comes back untranslated. *\/ */
+    /**
+     * Translates one known manager string; everything else comes back untranslated.
+     *
+     * For [ManagerLanguage.TRADITIONAL] every branch below converts the **Chinese** source —
+     * the exact row, the Chinese prefix or the Chinese template — through the compiled table.
+     * A string the table does not know (an engine error, a game message, an unknown
+     * diagnostic) is returned verbatim, exactly as the Simplified UI would show it.
+     */
     fun text(zh: String, language: ManagerLanguage): String {
         if (language == ManagerLanguage.SIMPLIFIED || zh.isEmpty()) return zh
         EXACT[zh]?.let { return pick(it, language) }
@@ -340,6 +351,9 @@ internal object GameMenuText {
 
     private fun pick(copy: Copy, language: ManagerLanguage): String = when (language) {
         ManagerLanguage.SIMPLIFIED -> copy.zh
+        // The Chinese source of the same row, converted: an untranslated row falls back to the
+        // Simplified wording instead of leaking the English or the Japanese rendering.
+        ManagerLanguage.TRADITIONAL -> TraditionalChinese.text(copy.zh)
         ManagerLanguage.ENGLISH -> copy.en
         ManagerLanguage.JAPANESE -> copy.ja
     }
@@ -351,6 +365,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "$n-shanten · hand value shown at tenpai"
                 ManagerLanguage.JAPANESE -> "$n シャンテン · テンパイ後に点数を表示"
+                ManagerLanguage.TRADITIONAL -> "$n 向聽 · 聽牌後顯示番點"
                 else -> null
             }
         }
@@ -361,6 +376,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "Ron $ron · Tsumo $tsumo"
                 ManagerLanguage.JAPANESE -> "ロン $ron · ツモ $tsumo"
+                ManagerLanguage.TRADITIONAL -> "榮和 $ron · 自摸 $tsumo"
                 else -> null
             }
         }
@@ -371,6 +387,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "Riichi · ron $ron · tsumo $tsumo"
                 ManagerLanguage.JAPANESE -> "リーチ ロン$ron · ツモ$tsumo"
+                ManagerLanguage.TRADITIONAL -> "立直 榮$ron · 摸$tsumo"
                 else -> null
             }
         }
@@ -382,6 +399,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "Kita x$n: counted in the 3-player hand value"
                 ManagerLanguage.JAPANESE -> "北抜き ×$n：三麻の点数に反映済み"
+                ManagerLanguage.TRADITIONAL -> "拔北 ×$n：已計入三麻番數"
                 else -> null
             }
         }
@@ -391,6 +409,8 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "Win rate $rate%"
                 ManagerLanguage.JAPANESE -> "和了率 $rate%"
+                ManagerLanguage.TRADITIONAL ->
+                    (if (text.startsWith("估计")) "估計" else "") + "和率 $rate%"
                 else -> null
             }
         }
@@ -400,6 +420,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "$n winning tiles"
                 ManagerLanguage.JAPANESE -> "有効牌 $n 枚"
+                ManagerLanguage.TRADITIONAL -> "進張 $n 枚"
                 else -> null
             }
         }
@@ -409,6 +430,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "Deal-in risk index $n"
                 ManagerLanguage.JAPANESE -> "放銃リスク指数 $n"
+                ManagerLanguage.TRADITIONAL -> "放銃風險指數 $n"
                 else -> null
             }
         }
@@ -418,6 +440,7 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "$n players"
                 ManagerLanguage.JAPANESE -> "${n}人"
+                ManagerLanguage.TRADITIONAL -> "${n}人"
                 else -> null
             }
         }
@@ -436,7 +459,9 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "$han han $fu fu, $points pts"
                 ManagerLanguage.JAPANESE -> "${han}翻 ${fu}符 ${points}点"
-                else -> zh
+                // Chinese either way: the Traditional row for this exact shape, digits untouched.
+                ManagerLanguage.TRADITIONAL -> TraditionalChinese.text(zh)
+                ManagerLanguage.SIMPLIFIED -> zh
             }
         }
         YAKUMAN.matchEntire(zh)?.let {
@@ -444,7 +469,8 @@ internal object GameMenuText {
             return when (language) {
                 ManagerLanguage.ENGLISH -> "yakuman, $points pts"
                 ManagerLanguage.JAPANESE -> "役満 ${points}点"
-                else -> zh
+                ManagerLanguage.TRADITIONAL -> TraditionalChinese.text(zh)
+                ManagerLanguage.SIMPLIFIED -> zh
             }
         }
         return zh
@@ -482,6 +508,12 @@ internal object GameMenuText {
         val face = if (red) null else rank.toString()
         return when (language) {
             ManagerLanguage.SIMPLIFIED -> if (red) "赤5" + text(suitZh, language) else face + text(suitZh, language)
+            // Same shape as the Simplified face, with the suit and the red five converted; the
+            // rank character and the tile code itself are copied, never converted.
+            ManagerLanguage.TRADITIONAL -> {
+                val suit = TraditionalChinese.text(suitZh)
+                if (red) TraditionalChinese.text("赤5") + suit else face + suit
+            }
             ManagerLanguage.ENGLISH -> if (red) "Red 5" + text(suitZh, language) else face + text(suitZh, language)
             ManagerLanguage.JAPANESE -> if (red) "赤" + text(suitZh, language) else face + text(suitZh, language)
         }
@@ -497,6 +529,9 @@ internal object GameMenuText {
             ManagerLanguage.ENGLISH -> listOf("E" to "East ", "S" to "South ", "W" to "West ", "N" to "North ")
             ManagerLanguage.JAPANESE -> listOf("E" to "東", "S" to "南", "W" to "西", "N" to "北")
             ManagerLanguage.SIMPLIFIED -> listOf("E" to "东", "S" to "南", "W" to "西", "N" to "北")
+            // The seat letters are the engine's own notation; only the letter is spelled out, the
+            // round number that follows it stays exactly as received.
+            ManagerLanguage.TRADITIONAL -> listOf("E" to "東", "S" to "南", "W" to "西", "N" to "北")
         }
         var text = round
         for ((letter, word) in upper) text = text.replace(letter, word)
@@ -513,7 +548,12 @@ internal object GameMenuText {
         if (raw.isEmpty()) return current
         val lower = raw.lowercase()
         return when {
-            lower == "zh" || lower.startsWith("zh-") || lower.startsWith("zh_") -> ManagerLanguage.SIMPLIFIED
+            // Chinese is split by script and region, using the same resolver as the manager's
+            // preference: zh-Hant / zh-TW / zh-HK / zh-MO select traditional Chinese, while
+            // zh-Hans / zh-CN / zh-SG / plain zh stay simplified, and an explicit Hans wins over
+            // a Traditional region. An unknown Chinese shape keeps [current] instead of guessing.
+            lower == "zh" || lower.startsWith("zh-") || lower.startsWith("zh_") ->
+                ManagerLanguageChoice.fromTag(raw).explicitOrNull() ?: current
             lower == "en" || lower.startsWith("en-") || lower.startsWith("en_") -> ManagerLanguage.ENGLISH
             lower == "ja" || lower.startsWith("ja-") || lower.startsWith("ja_") -> ManagerLanguage.JAPANESE
             else -> current

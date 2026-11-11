@@ -79,11 +79,14 @@ rm -rf "$OUT/classes"
   -d "$OUT/classes" \
   "$SRC/ManagerLanguage.kt" \
   "$SRC/UiLanguage.kt" \
+  "$SRC/TraditionalChinese.kt" \
   "$PROJ/tools/tests/jvm-shims/OnnxModelStoreShim.kt" \
   "$PROJ/tools/tests/jvm-shims/AiNativeShim.kt" \
   "$PROJ/tools/tests/ManagerLanguageProbe.kt"
 
-set +e
+# AiScreen.kt carries the model status line (`modelMessageText`), which is part of the copy
+# contract but needs the Compose classpath. Its pure part is loaded from the last build instead;
+# when that class is missing the probe reports it instead of silently skipping the assertions.
 "$JAVA" -cp "$OUT/classes:$PROBE_CP" ManagerLanguageProbeKt
 STATUS=$?
 set -e

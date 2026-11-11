@@ -33,10 +33,12 @@ import android.content.Context
  */
 object UiLanguage {
     /**
-     * Picks one of the three pre-translated strings for the language in force right now.
+     * Picks the rendering for the language in force right now.
      *
-     * Chinese is the source text, so it is returned whenever the effective language is Chinese
-     * — including when a "follow system" resolution lands on Chinese.
+     * Chinese is the source text, so the Simplified branch returns it verbatim and the
+     * Traditional branch converts **it** through the compiled `TraditionalChinese` table —
+     * never the English or the Japanese string — so an unknown phrase degrades to the Simplified
+     * wording instead of English, an empty label or a half-conversion.
      */
     @JvmStatic
     fun text(zh: String, en: String, ja: String): String =
@@ -45,12 +47,14 @@ object UiLanguage {
     /**
      * Sets the effective language of this process from a BCP-47-ish tag.
      *
-     * Accepts `zh-Hans`, `zh`, `zh-CN`, `zh-TW`, `zh-Hant`, `en`, `en-US`, `ja`, `ja-JP`
-     * (case-insensitive). A region or script suffix is ignored: the manager has exactly three
-     * renderings, and simplified Chinese is the only Chinese it can draw.
+     * Accepts `zh-Hans`, `zh`, `zh-CN`, `zh-SG`, `zh-TW`, `zh-Hant`, `zh-HK`, `zh-MO`, `en`,
+     * `en-US`, `ja`, `ja-JP` (case-insensitive) and resolves them with the same rules as the
+     * stored preference: `zh-Hant` / `zh-TW` / `zh-HK` / `zh-MO` select traditional Chinese,
+     * `zh-Hans` / `zh-CN` / `zh-SG` / plain `zh` select simplified, and an explicit `Hans`
+     * subtag wins over a Traditional region.
      *
      * An unrecognised tag is not a language switch — it is more likely a platform other than
-     * the three supported ones — so the current value is kept rather than silently falling
+     * the four supported ones — so the current value is kept rather than silently falling
      * back to Chinese. Preferences are never written; the stored user choice is untouched, and
      * the next [refresh] (or the next manager start) restores it.
      */
@@ -61,7 +65,9 @@ object UiLanguage {
     }
 
     /**
-     * The effective language of this process as a resource tag: `zh-Hans`, `en` or `ja`.
+     * The effective language of this process as a resource tag: `zh-Hans`, `zh-Hant`, `en` or
+     * `ja`. This is the value a provider puts into `uiLanguage`, so it is also what the game
+     * process sees — `zh-Hant` is a real value now and the menu follows it.
      *
      * Never `system`: the answer is always something that can actually be rendered.
      */

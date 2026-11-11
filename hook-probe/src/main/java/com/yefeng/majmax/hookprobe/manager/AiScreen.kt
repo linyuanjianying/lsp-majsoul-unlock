@@ -460,8 +460,8 @@ internal fun AiScreen(padding: PaddingValues) {
                         "Affects this manager app's UI only. Assistant behaviour, service switches, display mode and the in-game menu are unchanged. The choice applies immediately and is saved automatically.",
                         "この管理アプリの表示のみに影響します。アシストの動作、サービスのオン・オフ、表示モード、ゲーム内メニューは変わりません。切り替えるとすぐに反映され、自動保存されます。"))
                     Text(language.tr(
-                        "默认“跟随系统”，按系统语言自动选择：日语 → 日文，中文 → 简体中文，其他语言 → 英文。也可以手动固定为某一种语言，固定后不再跟随系统变化。",
-                        "The default is “Follow system”: Japanese → Japanese, Chinese → Simplified Chinese, anything else → English. You can also pin one language; a pinned language stops following the system.",
+                        "默认“跟随系统”，按系统语言自动选择：日语 → 日文，中文 → 简体或繁体中文（繁体地区用繁体），其他语言 → 英文。也可以手动固定为某一种语言，固定后不再跟随系统变化。",
+                        "The default is “Follow system”: Japanese → Japanese, Chinese → Simplified or Traditional (Traditional for Traditional regions), anything else → English. You can also pin one language; a pinned language stops following the system.",
                         "初期値は「システムに従う」で、システム言語に応じて自動で選ばれます：日本語 → 日本語、中国語 → 簡体字中国語、その他 → 英語。特定の言語に固定することもでき、固定後はシステムの変更に従いません。"),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -489,7 +489,7 @@ internal fun AiScreen(padding: PaddingValues) {
 /**
  * The language switch at the very top of the assistant page.
  *
- * One full-width button opens a dropdown with the three languages: nothing wraps, nothing
+ * One full-width button opens a dropdown with every language: nothing wraps, nothing
  * scrolls sideways, and the row stays inside the card width at any font scale. The trailing
  * text button opens the short explanation dialog.
  */
@@ -513,7 +513,9 @@ private fun LanguageBar(
         }
         Box(Modifier.fillMaxWidth()) {
             ManagerOutlinedButton(onClick = { onExpandedChange(true) }) {
-                // "跟随系统（简体中文）" when following, the language's own name otherwise.
+                // "Follow system (Simplified Chinese or Traditional Chinese)" when following,
+                // the language's own name otherwise; the Traditional entry reads 繁體中文 in
+                // every UI language.
                 Text(choice.describe(language))
             }
             DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
@@ -528,14 +530,34 @@ private fun LanguageBar(
         }
         if (choice == ManagerLanguageChoice.SYSTEM) {
             Text(language.tr(
-                    "当前跟随系统：日语 → 日文，中文 → 简体中文，其他语言 → 英文。系统语言变化时会自动切换。",
-                    "Following the system: Japanese → Japanese, Chinese → Simplified Chinese, anything else → English. It switches as soon as the system language changes.",
+                    "当前跟随系统：日语 → 日文，中文 → 简体或繁体中文（繁体地区用繁体），其他语言 → 英文。系统语言变化时会自动切换。",
+                    "Following the system: Japanese → Japanese, Chinese → Simplified or Traditional (Traditional for Traditional regions), anything else → English. It switches as soon as the system language changes.",
                     "システムに従います：日本語 → 日本語、中国語 → 簡体字中国語、その他 → 英語。システム言語の変更にすぐ追従します。",
                 ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
+}
+
+/**
+ * The Traditional Chinese rendering of a model status line.
+ *
+ * Built from the *Chinese* source, never from the English or the Japanese copy: the exact
+ * sentences this screen writes are matched, their Chinese text is converted through the
+ * compiled table, and everything else — an engine error with a status code, a tool result, an
+ * unknown diagnostic — is returned exactly as it arrived.
+ */
+internal fun traditionalModelMessage(raw: String): String {
+    val text = raw.trim()
+    when (text) {
+        "正在复制并检查模型…",
+        "模型导入失败，继续使用内置模型。",
+        "无法启用模型",
+        "自检失败",
+        -> if (TraditionalChinese.knows(text)) return TraditionalChinese.text(text)
+    }
+    return raw
 }
 
 /** What the manager's model status line can say, so translation never guesses. */
@@ -551,9 +573,15 @@ private enum class ModelMessageShape(val en: String, val ja: String) {
  *
  * Only messages this screen produced are mapped; tool and engine output keeps its original
  * wording, which is why an unknown string is returned unchanged.
+ *
+ * Traditional Chinese is a Chinese rendering, so it is *not* built from the English or the
+ * Japanese copy: every known message is first mapped back to its Chinese source, that source is
+ * converted through the compiled table, and a message the screen did not write is returned
+ * verbatim. The numbers inside the self-check lines (`4`, `812 ms`) are copied unchanged.
  */
 internal fun modelMessageText(raw: String, language: ManagerLanguage): String {
     if (language == ManagerLanguage.SIMPLIFIED) return raw
+    if (language == ManagerLanguage.TRADITIONAL) return traditionalModelMessage(raw)
     val text = raw.trim()
     fun copy(en: String, ja: String) = language.tr("", en, ja)
     fun shape(value: ModelMessageShape) = copy(value.en, value.ja)
@@ -566,6 +594,14 @@ internal fun modelMessageText(raw: String, language: ManagerLanguage): String {
     }
 
     Regex("^支持 Akagi ONNX").find(text)?.let {
+        if (language == ManagerLanguage.TRADITIONAL) {
+            // Same Chinese source, converted: the MiB limit inside it is a number and stays as-is.
+            return TraditionalChinese.text(
+                "支持 Akagi ONNX，以及实验性四麻/三麻 Mortal v4（ONNX/PTH/PT，单文件上限 " +
+                    "${OnnxModelStore.MAX_MODEL_MIB} MiB）。" +
+                    "自动识别人数并保存到对应槽位；兼容的自定义模型仍需手动开启无人值守。模型仅保存在本机。"
+            )
+        }
         return copy(
             "Supports Akagi ONNX and the experimental four-/three-player Mortal v4 (ONNX/PTH/PT, " +
                 "up to ${OnnxModelStore.MAX_MODEL_MIB} MiB per file). The player count is detected and saved to the " +
@@ -579,18 +615,29 @@ internal fun modelMessageText(raw: String, language: ManagerLanguage): String {
 
     Regex("^([0-9]+) 人模型已校验并暂存；下一次完整牌局同步时生效。$").matchEntire(text)?.let {
         val players = it.groupValues[1]
+        // The player count is a number: it is copied, only the sentence is converted.
+        if (language == ManagerLanguage.TRADITIONAL) {
+            return "$players 人模型已校驗並暫存；下一次完整牌局同步時生效。"
+        }
         return copy("$players-player model verified and staged; it applies at the next full game sync.",
             "$players 人用モデルを検証して保存しました。次回の対局状態の完全同期から適用されます。")
     }
 
     Regex("^([0-9]+)人 (.+) 加载与推理自检通过（实验性）· ([0-9]+) ms$").matchEntire(text)?.let {
         val (players, kind, ms) = it.destructured
+        if (language == ManagerLanguage.TRADITIONAL) {
+            // Player count, model kind and milliseconds are data: copied verbatim.
+            return "$players 人 $kind 載入與推理自檢通過（實驗性）· $ms ms"
+        }
         return copy("$players-player $kind loaded and passed the self-check (experimental) · $ms ms",
             "$players 人用 $kind の読み込みと推論の自己診断に成功しました（試験的）· $ms ms")
     }
 
     Regex("^([0-9]+)人 (.+) 模型可用 · ([0-9]+) ms$").matchEntire(text)?.let {
         val (players, kind, ms) = it.destructured
+        if (language == ManagerLanguage.TRADITIONAL) {
+            return "$players 人 $kind 模型可用 · $ms ms"
+        }
         return copy("$players-player $kind model is ready · $ms ms",
             "$players 人用 $kind モデルが使用できます · $ms ms")
     }
@@ -598,6 +645,12 @@ internal fun modelMessageText(raw: String, language: ManagerLanguage): String {
     Regex("^(四麻|三麻)(.+)$").matchEntire(text)?.let {
         val seatEn = if (it.groupValues[1] == "四麻") "Four-player" else "Three-player"
         val seatJa = if (it.groupValues[1] == "四麻") "四人打ち" else "三人打ち"
+        if (language == ManagerLanguage.TRADITIONAL) {
+            // The seat word is converted, the tail sentence too; nothing here is English or
+            // Japanese copy.
+            val seat = TraditionalChinese.text(it.groupValues[1])
+            return seat + TraditionalChinese.text(it.groupValues[2])
+        }
         when (it.groupValues[2]) {
             "已选择内置策略；当前牌局保持原模型，下一次完整牌局同步时生效。" ->
                 return copy(

@@ -268,6 +268,7 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
          */
         internal fun displayLines(data: JSONObject, language: ManagerLanguage?): List<DisplayLine> {
             val lang = language ?: ManagerLanguage.SIMPLIFIED
+            // Chinese is drawn exactly as stored, in either script.
             val zh = lang == ManagerLanguage.SIMPLIFIED
             fun t(text: String): String = if (zh) text else GameMenuText.text(text, lang)
             fun face(tile: String): String = if (zh) tileName(tile) else GameMenuText.tileName(tile, lang)
@@ -281,10 +282,10 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                 val row = rows.getJSONObject(i)
                 val probability = row.optDouble("probabilityPercent", Double.NaN)
                 val percent = if (probability.isFinite()) String.format(Locale.ROOT, "%.1f%%", probability) else "—"
-                val cut = if (zh) "切" else when (lang) {
+                val cut = when (lang) {
                     ManagerLanguage.ENGLISH -> "Discard "
                     ManagerLanguage.JAPANESE -> "打 "
-                    ManagerLanguage.SIMPLIFIED -> "切"
+                    ManagerLanguage.SIMPLIFIED, ManagerLanguage.TRADITIONAL -> "切"
                 }
                 line("$cut${face(row.optString("tile"))}    $percent", i == 0)
             }
@@ -296,10 +297,10 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                 for (i in 0 until scores.length()) {
                     val score = scores.getJSONObject(i)
                     val win = face(score.optString("tile"))
-                    val won = if (zh) "和$win" else when (lang) {
+                    val won = when (lang) {
                         ManagerLanguage.ENGLISH -> "Win $win"
                         ManagerLanguage.JAPANESE -> "和了 $win"
-                        ManagerLanguage.SIMPLIFIED -> "和$win"
+                        ManagerLanguage.SIMPLIFIED, ManagerLanguage.TRADITIONAL -> "和$win"
                     }
                     line(won, true, true)
                     fun scoreText(key: String): String {
@@ -319,9 +320,16 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                     if (zh) {
                         line("荣和 $ron / 自摸 $tsumo", small = true)
                     } else {
+                        // The scores come out of [scoreValue] already rendered for this
+                        // language, so only the labels around them are translated here: a
+                        // Chinese-shape line for Traditional, English/Japanese wording otherwise.
                         when (lang) {
                             ManagerLanguage.ENGLISH -> line("Ron $ron · Tsumo $tsumo", small = true)
                             ManagerLanguage.JAPANESE -> line("ロン $ron · ツモ $tsumo", small = true)
+                            // Traditional keeps the Chinese line shape with converted wording;
+                            // the scores beside it are already Traditional from [scoreValue].
+                            ManagerLanguage.TRADITIONAL ->
+                                line("榮和 $ron / 自摸 $tsumo", small = true)
                             ManagerLanguage.SIMPLIFIED -> {}
                         }
                     }
@@ -334,6 +342,8 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                             when (lang) {
                                 ManagerLanguage.ENGLISH -> line("Riichi · ron $ronR · tsumo $tsumoR", small = true)
                                 ManagerLanguage.JAPANESE -> line("リーチ ロン$ronR · ツモ$tsumoR", small = true)
+                                ManagerLanguage.TRADITIONAL ->
+                                    line("立直 榮$ronR / 摸$tsumoR", small = true)
                                 ManagerLanguage.SIMPLIFIED -> {}
                             }
                         }
@@ -355,6 +365,8 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                 when (language) {
                     ManagerLanguage.ENGLISH -> "yakuman $points pts"
                     ManagerLanguage.JAPANESE -> "役満 ${points}点"
+                    // Chinese shape, Traditional wording; the point value is never converted.
+                    ManagerLanguage.TRADITIONAL -> "役滿 ${points}點"
                     ManagerLanguage.SIMPLIFIED -> "役满 ${points}点"
                 }
             } else {
@@ -363,6 +375,7 @@ internal class RecommendationPanelOverlay(private val context: Context, private 
                 when (language) {
                     ManagerLanguage.ENGLISH -> "$han han $fu fu, $points pts"
                     ManagerLanguage.JAPANESE -> "${han}翻 ${fu}符 ${points}点"
+                    ManagerLanguage.TRADITIONAL -> "${han}番${fu}符 ${points}點"
                     ManagerLanguage.SIMPLIFIED -> "${han}番${fu}符 ${points}点"
                 }
             }
