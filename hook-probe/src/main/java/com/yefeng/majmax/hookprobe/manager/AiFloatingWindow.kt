@@ -46,10 +46,10 @@ import kotlin.math.roundToInt
  *  - 设置: sliders whose value sits in a small gold tag at the right.
  *
  * Collapsed it walks the four-shape state machine of [FloatingShapeMachine]: a green-dot
- * status capsule (“助手运行中”), the full navy\/gold ball, the parked half-tucked ball at
+ * status capsule (“助手运行中”), the full navy\/gold ball, the dimmed idle ball at
  * 65 % alpha, and the expanded panel. The capsule never shows the four-cell icon; after
- * 3 s idle it becomes the full ball, after another 3 s the ball parks itself in the
- * nearest edge, a tap on the parked ball wakes it back to the capsule, the next tap opens
+ * 3 s idle it becomes the full ball, after another 3 s the ball dims at its saved
+ * position, a tap on the parked ball wakes it back to the capsule, the next tap opens
  * the panel. A drag goes straight back to the full ball and re-arms the timer.
  *
  * Behaviour contracts kept intact (see [AiOverlayService]):
@@ -202,9 +202,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * The overlay window itself.
      *
      * `FLAG_NOT_TOUCH_MODAL` keeps touches outside the bounds with the game, and nothing
-     * clamps the *window* to the display, so the parked ball may legitimately sit at a
-     * negative x (its half outside the screen is simply not drawn) and stays reachable by
-     * the visible half. `FLAG_NOT_FOCUSABLE` keeps the IME and the game's own focus intact.
+     * intercepts touches outside this window. Every shape stays within the display at
+     * its user-selected position. `FLAG_NOT_FOCUSABLE` keeps the IME and the game's own focus intact.
      */
     private val layout = WindowManager.LayoutParams(
         dp(width), WindowManager.LayoutParams.WRAP_CONTENT,
@@ -234,7 +233,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * Detaches the window and drops the idle callback. The *shape* is deliberately kept:
      * a close that is immediately followed by [show]/[configurationChanged] (rotation, a
      * language switch, the service rebuilding its overlay surface) must come back exactly
-     * where it was — a half-tucked parked ball stays parked, an open panel stays open.
+     * where it was — a dimmed parked ball stays parked, an open panel stays open.
      */
     fun close() {
         cancelIdle()
@@ -378,7 +377,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     /**
      * The capsule's single line of live state: “助手运行中” while unattended runs, the
      * self-test wording while demo data is shown, and a plain standby/offline word
-     * otherwise. Short by design — the capsule is only ~60 dp tall and lives on the edge
+     * otherwise. Short by design — the capsule is only ~60 dp tall and stays at the chosen position
      * of the table.
      */
     private fun capsuleLabel() = when {
@@ -506,18 +505,13 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             FloatingShape.CAPSULE -> WindowManager.LayoutParams.WRAP_CONTENT
             FloatingShape.BUBBLE, FloatingShape.PARKED -> dp(52)
         }
-        // Every non-panel step is placed fresh: a capsule is never clipped, a full ball is
-        // whole on the side it is closest to, and a parked ball is exactly half outside.
-        snapIntoPlace(restore = current != FloatingShape.BUBBLE && current != FloatingShape.PARKED)
+        // Shape changes preserve the user's anchor; only keep the window on screen.
+        placeOnScreen()
         windows.addView(panel, layout)
-        // A WRAP_CONTENT capsule has no width before it is measured. A ball and a parked
-        // ball must keep their placed x (posting a second snap pass would re-toggle the
-        // half-hidden anchor), so only the panel and the capsule are re-clamped once the
-        // real size is known.
+        // Re-clamp once WRAP_CONTENT dimensions are available.
         panel.post {
             if (root !== panel || machine.shape != current) return@post
-            if (current == FloatingShape.PANEL || current == FloatingShape.CAPSULE)
-                snapIntoPlace(restore = false)
+            placeOnScreen()
             runCatching { windows.updateViewLayout(panel, layout) }
         }
         scheduleIdle()
@@ -554,7 +548,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     }
 
     /**
-     * One fold step: capsule → full ball, then full ball → parked (half tucked, 65 %).
+     * One fold step: capsule → full ball, then full ball → parked (dimmed in place, 65 %).
      *
      * The step is a no-op while the user is touching the window ([dragging]) or the window
      * is detached; whatever comes next re-arms the timer, so the fold never stalls.
@@ -568,7 +562,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         applyShapeChange()
     }
 
-    /** One user action through the machine; re-snaps only when the shape really changed. */
+    /** One user action through the machine; rebuild only when the shape really changes. */
     private fun dispatch(action: FloatingAction) {
         val before = machine.shape
         val after = machine.apply(action)
@@ -576,9 +570,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     }
 
     /**
-     * Rebuilds for [FloatingShapeMachine.shape]. The anchor is preserved (a parked ball
-     * wakes where it hangs, a capsule parks on the side it is closest to), and an opened
-     * panel is placed fully on screen.
+     * Rebuilds for [FloatingShapeMachine.shape], preserving the anchor within the display.
      */
     private fun applyShapeChange() {
         save()
@@ -597,8 +589,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * Both shapes are the same widget; [parked] only changes the painted alpha (65 %
      * instead of the slider value). The window keeps its 52 dp size, a tap walks the
      * machine (ball → panel, parked → capsule → panel), a long press keeps the original
-     * unattended toggle. A parked ball is half outside the screen, so its visible
-     * remainder is still a full touch target — see [snapIntoPlace]/[clampPosition].
+     * unattended toggle. All shapes remain fully visible at the user's chosen position.
      */
     private fun buildBubble(panel: LinearLayout, parked: Boolean) {
         // The one circle is drawn by the window root itself; the inner ball only hosts the
@@ -667,9 +658,9 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     }
 
     private fun bubbleDescription(parked: Boolean = false): String = if (parked)
-        t("雀魂助手已贴边收起，点击显示运行状态，再点开设置面板，长按切换无人值守，可拖动",
-            "Majsoul Assistant is parked on the edge. Tap to show the live state, tap again to open settings, long-press toggles unattended, drag to move",
-            "雀魂アシスタントは端に格納中。タップで状態表示、もう一度タップで設定を展開、長押しで無人運転切替、ドラッグで移動")
+        t("雀魂助手已原地淡化，点击显示运行状态，再点开设置面板，长按切换无人值守，可拖动",
+            "Majsoul Assistant is dimmed at its saved position. Tap to show the live state, tap again to open settings, long-press toggles unattended, drag to move",
+            "雀魂アシスタントはその場で減光中。タップで状態表示、もう一度タップで設定を展開、長押しで無人運転切替、ドラッグで移動")
     else t(
         "雀魂助手，运行状态；点击展开面板，长按切换无人值守，可拖动",
         "Majsoul Assistant, live status. Tap to open, long-press to toggle unattended, drag to move",
@@ -1530,9 +1521,9 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
             "Only controls the contents of the click-through panel: suggested tiles, yaku and the defence hint. Turning it off leaves everything else running; the cat hint and the top control are separate.",
             "クリック透過の固定パネルの内容（候補牌・翻・防守参考）だけを制御します。オフでも他の機能は動作し、猫のヒントと上部コントロールは独立しています。")))
         parent.addView(helpBlock(t("浮标与停止", "Ball & stopping", "ボールと停止"), t(
-            "点“–”把面板收成状态胶囊（绿点 + 运行状态）；点胶囊打开面板。停留 3 秒，胶囊会变成完整圆球，再停 3 秒会吸附到最近的屏幕边缘并半露（约 65% 不透明）。点一下半露的球先恢复胶囊状态，再点一下才打开面板。拖动圆球会移动窗口，松手后回到完整圆球。长按可直接切换无人值守。“停止助手”会关闭无人值守并隐藏悬浮窗。",
-            "“–” folds the panel into a status capsule (green dot + live state); tap it to open the panel. After 3 s the capsule becomes the full ball, after 3 s more the ball parks half-off the nearest edge at about 65 % opacity. A tap on the parked ball first shows the capsule again; the next tap opens the panel. Dragging moves the window and leaves the full ball behind. Long-press toggles unattended. “Stop assistant” turns unattended off and hides the window.",
-            "「–」でパネルを状態カプセル（緑の点＋実行状態）に折りたたみ、タップで再展開します。3 秒でカプセルが通常のボールになり、さらに 3 秒で最寄りの端に半分収まります（約 65% 不透明）。半収まりのボールは、1 回目のタップで状態表示に戻り、もう一度タップで設定が開きます。ドラッグで移動し、離すと通常のボールに戻ります。長押しで無人運転を切替。「アシスト停止」は無人運転を解除しウィンドウを隠します。")))
+            "点“–”把面板收成状态胶囊（绿点 + 运行状态）；点胶囊打开面板。停留 3 秒，胶囊会变成完整圆球，再停 3 秒会在原地淡化（约 65% 不透明），不会自动贴边。点一下淡化的球先恢复胶囊状态，再点一下才打开面板。拖动圆球会移动窗口，松手后停在当前位置。长按可直接切换无人值守。“停止助手”会关闭无人值守并隐藏悬浮窗。",
+            "“–” folds the panel into a status capsule (green dot + live state); tap it to open the panel. After 3 s the capsule becomes the full ball, after 3 s more the ball dims in place to about 65 % opacity without snapping to an edge. A tap on the parked ball first shows the capsule again; the next tap opens the panel. Dragging moves the window and keeps it at the drop position. Long-press toggles unattended. “Stop assistant” turns unattended off and hides the window.",
+            "「–」でパネルを状態カプセル（緑の点＋実行状態）に折りたたみ、タップで再展開します。3 秒でカプセルが通常のボールになり、さらに 3 秒でその場で減光します（約 65% 不透明）。端には吸着しません。減光したボールは、1 回目のタップで状態表示に戻り、もう一度タップで設定が開きます。ドラッグで移動し、離した位置に留まります。長押しで無人運転を切替。「アシスト停止」は無人運転を解除しウィンドウを隠します。")))
         parent.addView(style.spacer(10))
         val back = style.text(t("返回控制", "Back to controls", "操作に戻る"), 13f, style.onAccent, true).apply {
             gravity = Gravity.CENTER
@@ -1804,9 +1795,9 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         pane.addView(style.divider())
         pane.addView(style.section(t("助手操作", "Assistant", "アシスト")))
         pane.addView(style.text(t(
-            "拖动标题移动窗口；点“–”或“×”收起成状态胶囊，点胶囊打开面板；停留 3 秒变完整圆球，再 3 秒贴边半露，点一下显示状态、再点打开面板。停止助手会关闭无人值守并隐藏悬浮窗。",
-            "Drag the title to move the window; “–” or “×” folds it into the status capsule, tapping the capsule opens the panel. After 3 s it becomes the full ball, 3 s later it parks on the nearest edge; one tap shows the state, the next opens the panel. Stopping the assistant turns unattended off and hides the window.",
-            "タイトルをドラッグして移動。「–」または「×」で状態カプセルに折りたたみ、タップで展開します。3 秒で通常のボール、さらに 3 秒で端に半分収まります。1 回目のタップで状態、もう一度で設定が開きます。アシスト停止は無人運転を解除しウィンドウを隠します。"),
+            "拖动标题移动窗口；点“–”或“×”收起成状态胶囊，点胶囊打开面板；停留 3 秒变完整圆球，再 3 秒原地淡化，拖到哪里就停在哪里，点一下显示状态、再点打开面板。停止助手会关闭无人值守并隐藏悬浮窗。",
+            "Drag the title to move the window; “–” or “×” folds it into the status capsule, tapping the capsule opens the panel. After 3 s it becomes the full ball, 3 s later it dims in place; dragging keeps the drop position; one tap shows the state, the next opens the panel. Stopping the assistant turns unattended off and hides the window.",
+            "タイトルをドラッグして移動。「–」または「×」で状態カプセルに折りたたみ、タップで展開します。3 秒で通常のボール、さらに 3 秒でその場で減光し、ドラッグ後は離した位置に留まります。1 回目のタップで状態、もう一度で設定が開きます。アシスト停止は無人運転を解除しウィンドウを隠します。"),
             10.5f, style.faint).apply { maxLines = 5; setPadding(dp(2), 0, dp(2), dp(8)) })
         pane.addView(stopButton())
     }
@@ -1866,7 +1857,7 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         return tag
     }
 
-    // ---- drag / snapping ------------------------------------------------------
+    // ---- drag / positioning ------------------------------------------------------
     /**
      * Drag support shared by the ball and the panel title. Movement only starts past
      * [ViewConfiguration.getScaledTouchSlop], and a press that moved never counts as a
@@ -1926,55 +1917,24 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         }
     }
 
-    /**
-     * End of a drag. The window is dropped where the finger left it: a collapsed shape is
-     * shown as the *full* ball (never re-parked under the finger) and the idle timer
-     * restarts from zero, so “drag, release, wait 3 s + 3 s” re-parks it naturally.
-     */
+    /** Keep the drop position, wake an idle ball and persist even unchanged shapes. */
     private fun finishDrag() {
         if (root == null) return
-        if (machine.shape != FloatingShape.PANEL) {
-            dispatch(FloatingAction.DRAG)
+        val before = machine.shape
+        machine.apply(FloatingAction.DRAG)
+        if (machine.shape != before) {
+            applyShapeChange()
         } else {
-            save()
+            placeOnScreen()
             runCatching { windows.updateViewLayout(root ?: return, layout) }
+            scheduleIdle()
         }
     }
 
-    /**
-     * Places the window for the current shape.
-     *
-     *  - [FloatingShape.PANEL], [FloatingShape.BUBBLE] and an appearing
-     *    [FloatingShape.CAPSULE] are always whole on screen ([restore] marks the shapes
-     *    that are placed fresh rather than re-snapped).
-     *  - [FloatingShape.PARKED] is the only shape allowed a negative x: exactly half of the
-     *    52 dp ball sits outside the screen. The window already carries
-     *    `FLAG_NOT_TOUCH_MODAL` + `TYPE_APPLICATION_OVERLAY`, so it may legally be placed at
-     *    a negative x, and the remaining half stays a touch target that wakes it back.
-     *
-     * The parked side is decided from the current centre, and every path is clamped so a
-     * shape can be reached again from any previous position (a rotation can never strand
-     * it outside the display).
-     */
-    private fun snapIntoPlace(restore: Boolean) {
-        val display = context.resources.displayMetrics
-        val widthPx = layout.width.takeIf { it > 0 } ?: defaultWidthPx()
-        val heightPx = root?.height?.takeIf { it > 0 } ?: defaultHeightPx()
-        layout.y = layout.y.coerceIn(0, (display.heightPixels - heightPx - dp(32)).coerceAtLeast(0))
-        val right = layout.x + widthPx / 2 >= display.widthPixels / 2
-        // The drawable itself carries the opacity (an alpha multiplier on the fill), so the
-        // window-level alpha stays 1: a folded shape must never be a second, invisible
-        // surface on top of the real one.
+    /** Preserve the anchor for every shape, including the dimmed idle ball. */
+    private fun placeOnScreen() {
+        clampPosition()
         root?.alpha = 1f
-        val maxX = (display.widthPixels - widthPx).coerceAtLeast(0)
-        layout.x = when (machine.shape) {
-            FloatingShape.PANEL -> layout.x.coerceIn(0, maxX)
-            FloatingShape.CAPSULE -> if (restore) (if (right) maxX else 0)
-                else layout.x.coerceIn(0, maxX)
-            FloatingShape.BUBBLE -> if (right) maxX else 0
-            FloatingShape.PARKED -> if (right) display.widthPixels - widthPx / 2
-                else widthPx / 2 - widthPx
-        }
         save()
     }
 
@@ -1995,17 +1955,14 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
      * Keeps the window reachable while it is *being* dragged: the saved anchor survives
      * rotation and density changes in the preferences, but is always clamped to the current
      * display, so a window dragged to an edge in portrait cannot land off-screen in
-     * landscape. The drag loop and [snapIntoPlace] use the same bounds, so a parked ball can
-     * always be dragged back out: at most half of a collapsed shape may sit outside.
+     * landscape. The drag loop and [placeOnScreen] keep every shape fully on screen.
      */
     private fun clampPosition() {
         val display = context.resources.displayMetrics
         val widthPx = layout.width.takeIf { it > 0 } ?: defaultWidthPx()
         val height = root?.height?.takeIf { it > 0 } ?: defaultHeightPx()
-        val panel = machine.shape == FloatingShape.PANEL
-        val minX = if (panel) 0 else -widthPx / 2
-        val maxX = if (panel) display.widthPixels - widthPx else display.widthPixels - widthPx / 2
-        layout.x = layout.x.coerceIn(minX, maxX.coerceAtLeast(minX))
+        val maxX = (display.widthPixels - widthPx).coerceAtLeast(0)
+        layout.x = layout.x.coerceIn(0, maxX)
         layout.y = layout.y.coerceIn(0, (display.heightPixels - height - dp(32)).coerceAtLeast(0))
     }
 

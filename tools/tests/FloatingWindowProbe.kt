@@ -121,7 +121,7 @@ fun main() {
 
         check("full ball --idle--> parked", m.apply(FloatingAction.IDLE) == FloatingShape.PARKED)
         check("parked has no timer", !m.wantsIdleTimer && m.idleDelay == null)
-        check("parked is tucked into the edge", m.tucksIntoEdge)
+        check("idle ball does not tuck into the edge", !m.tucksIntoEdge)
 
         check("parked --idle--> stays parked", m.apply(FloatingAction.IDLE) == FloatingShape.PARKED)
 
@@ -191,10 +191,10 @@ fun main() {
     }
 
     run {
-        // Only PARKED may sit outside the display (the window needs a negative x).
-        check("only the parked shape is tucked",
+        // Idle transitions must never restore automatic edge docking.
+        check("no shape is tucked into the edge",
             FloatingShape.values().filter { FloatingShapeMachine(it).tucksIntoEdge } ==
-                listOf(FloatingShape.PARKED))
+                emptyList<FloatingShape>())
         check("panel and capsule never run the idle timer",
             listOf(FloatingShape.PANEL, FloatingShape.PARKED).all {
                 FloatingShapeMachine(it).idleDelay == null

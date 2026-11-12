@@ -285,7 +285,7 @@ internal fun compositeFloatingAlphaUnchecked(level: Int, base: Int): Int =
  *  - [BUBBLE]: the full 52 dp ball — deep navy disc, gold rim, green live dot, "雀".
  *  - [CAPSULE]: the status capsule — green dot + "助手运行中", no four-cell icon.
  *  - [PANEL]: the expanded settings panel.
- *  - [PARKED]: the idle ball, half tucked into the nearest edge at ~65 % alpha.
+ *  - [PARKED]: the idle ball, dimmed at its saved position at ~65 % alpha.
  */
 internal enum class FloatingShape { BUBBLE, CAPSULE, PANEL, PARKED }
 
@@ -301,7 +301,7 @@ internal enum class FloatingAction { IDLE, DRAG, TAP, LONG_PRESS, COLLAPSE }
  *  PANEL   --collapse-->     CAPSULE
  *  CAPSULE --tap-->          PANEL
  *  CAPSULE --idle 3 s-->     BUBBLE        (never crosses straight to PARKED)
- *  BUBBLE  --idle 3 s-->     PARKED        (half tucked, ~65 % alpha)
+ *  BUBBLE  --idle 3 s-->     PARKED        (same position, ~65 % alpha)
  *  BUBBLE  --drag-->         BUBBLE        (release = full ball, timer restarted)
  *  BUBBLE  --tap-->          PANEL
  *  PARKED  --tap (1st)-->    CAPSULE       (shows the live state, wakes the ball)
@@ -334,8 +334,8 @@ internal class FloatingShapeMachine(initial: FloatingShape = FloatingShape.CAPSU
             FloatingShape.PANEL, FloatingShape.PARKED -> null
         }
 
-    /** True only for the parked shape, the one allowed to hang over the screen edge. */
-    val tucksIntoEdge: Boolean get() = shape == FloatingShape.PARKED
+    /** All shapes retain their freely chosen position, including the idle ball. */
+    val tucksIntoEdge: Boolean get() = false
 
     /** True while the idle timer should be running. */
     val wantsIdleTimer: Boolean get() = idleDelay != null
@@ -358,7 +358,7 @@ internal class FloatingShapeMachine(initial: FloatingShape = FloatingShape.CAPSU
     }
 
     private fun onTap(current: FloatingShape): FloatingShape = when (current) {
-        // A half-hidden ball must not open a panel that covers the screen edge: the first
+        // An idle ball first shows the live state: the first
         // tap reveals the live state, the second one opens the panel.
         FloatingShape.PARKED -> if (tapArmed) FloatingShape.PANEL else FloatingShape.CAPSULE
         FloatingShape.CAPSULE, FloatingShape.BUBBLE -> FloatingShape.PANEL
