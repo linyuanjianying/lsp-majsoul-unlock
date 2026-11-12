@@ -87,11 +87,25 @@ function R.visible(o)
     return g and g.activeInHierarchy == true
 end
 function R.emit(state, reason)
-    ack('', 'rematch_' .. state, reason)
+    local code = ({
+        step = 'result_next_invoked', again = 'result_again_invoked',
+        confirmed = 'result_confirmed', failed = 'result_failed',
+        paused = 'result_paused',
+    })[state]
+    if code and type(__majmax_auto_ack) == 'function' and A.json then
+        __majmax_auto_ack(A.json.encode({id = '', state = code, reason = reason or ''}))
+    end
+    if type(__majmax_auto_ack) == 'function' and A.json then
+        ack('', 'rematch_' .. state, reason)
+    end
 end
--- Stopping is terminal for that settlement instance: a result page is shown once,
--- so the same page can never be driven again after it was stopped, including from
--- inside one of its own button callbacks.
+function R.trace(code, reason)
+    if type(__majmax_auto_ack) == 'function' and A.json then
+        __majmax_auto_ack(A.json.encode({id = '', state = code, reason = reason or ''}))
+    end
+end
+-- Stopping is terminal for that settlement session. UI_GameEnd.Inst is a reused
+-- singleton, though, so a later OnShow with a fresh result must clear its old stop.
 function R.stop(session)
     if not session then return end
     session.stopped = true; session.pending = nil
@@ -144,14 +158,12 @@ end
 -- and Btn_Next resolve through the same chain the game's own buttons use.
 function R.attachLive()
     local session = R.session
-    if session and not session.stopped then return session end
+    if session then return session.stopped and nil or session end
     local ui = g('UI_GameEnd') and g('UI_GameEnd').Inst
     if R.visible(ui) then return R.observe(ui, nil) end
     return nil
 end
 function R.observe(ui, data)
-    -- One show per result page; a stopped instance never becomes a session again.
-    if ui and R.stopped[ui] then R.session = nil; return nil end
     R.generation = R.generation + 1
     local value = data and data.game_end_result
     -- The hook may be installed after the page was already raised (a module that
@@ -161,10 +173,15 @@ function R.observe(ui, data)
         local ok, current = pcall(function() return ui.game_end_result end)
         if ok then value = current end
     end
-    local next = value and type(value.players) == 'table' and #value.players > 0
+    local nextSession = value and type(value.players) == 'table' and #value.players > 0
         and { ui = ui, generation = R.generation, seen = {} } or nil
-    if next and R.session and R.session.ui == ui and R.session.stopped then return R.session end
-    R.session = next
+    -- A genuine new result page reuses the same Lua UI object. Only its new OnShow
+    -- result (not popup reopen/confirmation ticks) creates the next action lease.
+    if nextSession then
+        R.stopped[ui] = nil
+        if A.revoked and A.revoked.ui == ui then A.revoked = nil end
+    end
+    R.session = nextSession
     return R.session
 end
 function R.installHooks()
@@ -173,8 +190,9 @@ function R.installHooks()
         c._majmaxRematchShow = true
         local original = c.OnShow
         function c:OnShow(callback, data, ...)
+            local previous = R.session
             local result = original(self, callback, data, ...)
-            if not (data and data.reopen) then R.observe(self, data) end
+            if not (data and data.reopen) and R.session == previous then R.observe(self, data) end
             return result
         end
     end
@@ -185,13 +203,17 @@ function R.installHooks()
         p._majmaxRematchHooks = true
         local cancel, confirm = p.Cancel, p.Confirm
         function p:Cancel(...)
+            R.trace('result_manual_cancel', 'manual_cancel')
             R.cancel('manual_cancel')
             return cancel(self, ...)
         end
         function p:Confirm(...)
             -- Confirming is terminal however it was started. A user confirm opts that
             -- settlement out; it never re-arms the walk on the same page.
-            if not R.executing then R.cancel('manual_confirm') end
+            if not R.executing then
+                R.trace('result_manual_confirm', 'manual_confirm')
+                R.cancel('manual_confirm')
+            end
             return confirm(self, ...)
         end
     end

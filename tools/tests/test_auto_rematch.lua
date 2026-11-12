@@ -317,6 +317,23 @@ test('a manual cancel is never re-opened or confirmed', function(s)
     assert(s.again == agains, 'a manual cancel must not re-open the popup')
 end)
 
+test('a reused settlement singleton can start a fresh rematch session', function(s)
+    prime(s)
+    command(s)
+    drive(s, 0, 3)
+    assert(s.again == 1 and s.confirmAttempts == 1, 'first settlement must complete')
+
+    -- The game reuses UI_GameEnd.Inst for a later match result.
+    s.popup.locking = false
+    s.gameEnd.step = 0
+    s.gameEnd.btn_again.activeInHierarchy = true
+    s.gameEnd.btn_next.activeInHierarchy = true
+    raise(s)
+    drive(s, 4, 3)
+    assert(s.again == 2, 'a new OnShow on the reused instance must get a fresh session')
+    assert(s.confirmAttempts == 2, 'the second result popup must be confirmed once')
+end)
+
 test('non ranked modes, reconnect and stopped time never press', function(s)
     prime(s)
     command(s)

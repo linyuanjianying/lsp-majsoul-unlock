@@ -613,8 +613,20 @@ class AiOverlayService : Service() {
             for (index in 0 until rows.length()) {
                 val row = rows.getJSONObject(index)
                 val state = row.optString("state")
-                if (!state.startsWith("rematch_")) continue
-                DiagnosticsStore.appendAssistant(this, "INFO", "assistant.rematch", state,
+                val safeCode = when (state) {
+                    "result_next_invoked" -> "RESULT_NEXT_INVOKED"
+                    "result_again_invoked" -> "RESULT_AGAIN_INVOKED"
+                    "result_confirmation_invoked" -> "RESULT_CONFIRMATION_INVOKED"
+                    "result_manual_cancel" -> "RESULT_MANUAL_CANCEL"
+                    "result_manual_confirm" -> "RESULT_MANUAL_CONFIRM"
+                    "result_paused" -> "RESULT_PAUSED"
+                    "result_failed" -> "RESULT_FAILED"
+                    "result_confirmed" -> "RESULT_CONFIRMED"
+                    "result_step_timeout" -> "RESULT_STEP_TIMEOUT"
+                    "result_confirmation_timeout" -> "RESULT_CONFIRMATION_TIMEOUT"
+                    else -> continue
+                }
+                DiagnosticsStore.appendAssistant(this, "INFO", "assistant.rematch", safeCode,
                     JSONObject().put("reason", row.optString("reason").take(120)))
             }
         }.onFailure { GeometryTrace.note("REMATCH_ACK", "reason=decode_failed") }
