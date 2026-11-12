@@ -11,8 +11,9 @@
 #        at GameTopControl.buildControlPage(GameTopControl.java:1065)
 #
 # No device, no Gradle, no aapt: javac + the Kotlin compiler against the app's own sources.
-# The Kotlin half (InGameLocalizer, plus reduced stand-ins for the manager's language and
-# copy tables) is compiled from source as well, so a Gradle build that is wiping
+# The Kotlin half (InGameLocalizer and the real manager/OpponentNaming model of the naming
+# card, plus reduced stand-ins for the manager's language and copy tables) is compiled from
+# source as well, so a Gradle build that is wiping
 # hook-probe/build at the same time cannot break this probe. Nothing is written under
 # hook-probe/build: the output goes to /tmp/top-control-build-probe (override with
 # TOP_BUILD_PROBE_OUT).
@@ -68,6 +69,7 @@ rm -rf "$OUT/kotlin" && mkdir -p "$OUT/kotlin"
   -no-stdlib -classpath "$OUT/shim:$STDLIB:$ANDROID_JAR${JSON:+:$JSON}" \
   -jvm-target 21 -nowarn -d "$OUT/kotlin" \
   "$SRC/helper/InGameLocalizer.kt" \
+  "$SRC/manager/OpponentNaming.kt" \
   "$PROJ/tools/tests/jvm-shims/support/com/yefeng/majmax/hookprobe/helper/GameMenuText.kt" \
   "$PROJ/tools/tests/jvm-shims/support/com/yefeng/majmax/hookprobe/manager/ManagerLanguage.kt" \
   "$PROJ/tools/tests/jvm-shims/support/com/yefeng/majmax/hookprobe/manager/AssistLaunch.kt" \
@@ -80,7 +82,7 @@ CLASSPATH_PROD="$OUT/kotlin:$OUT/shim:$STDLIB"
 [ -n "$JSON" ] && CLASSPATH_PROD="$CLASSPATH_PROD:$JSON"
 "$JAVAC" -nowarn -source 21 -target 21 -encoding UTF-8 -proc:none \
   -d "$OUT/classes" -cp "$CLASSPATH_PROD" \
-  "$SRC/GameTopControl.java" "$SRC/GameTopUi.java" \
+  "$SRC/GameTopControl.java" "$SRC/GameTopUi.java" "$SRC/GameTopDesign.java" \
   "$SRC/GameDisplayGate.java" "$SRC/HookDiagnostics.java"
 
 echo "== 4/5 probe =="

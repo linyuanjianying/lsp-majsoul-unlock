@@ -38,6 +38,8 @@ public class View {
     private int measuredWidth;
     private int measuredHeight;
     private int width;
+    /** Value of {@link #setRotation}; the panel chevron is the only user. */
+    private float rotation;
     private int height;
     private int leftPos;
     private int topPos;
@@ -87,6 +89,12 @@ public class View {
     public boolean isClickable() { return clickable; }
     public void setFocusable(boolean value) { focusable = value; }
     public boolean isFocusable() { return focusable; }
+    /**
+     * Focus is not simulated by the JVM shim; the in-game naming editors ask before they
+     * repaint (a focused field must never be overwritten by a poll). Always false here, so the
+     * build probe paints every field and asserts the wiring instead of the typing state.
+     */
+    public boolean hasFocus() { return false; }
     public void setEnabled(boolean value) {}
     public boolean isEnabled() { return true; }
     public void setAlpha(float value) { alpha = value; }
@@ -179,6 +187,20 @@ public class View {
     public void setParentInternal(ViewGroup value) { parent = value; }
     public boolean isAttachedToWindow() { return parent != null; }
     public void invalidate() {}
+    /**
+     * Rotation of a view around its pivot, in degrees. Only the chevron of the panel uses it
+     * (0 while expanded, 180 while collapsed); the stub records the value so a probe can
+     * assert the fold state of the header without a rasteriser.
+     */
+    public void setRotation(float value) { rotation = value; }
+    public float getRotation() { return rotation; }
+    /**
+     * The handler of the window this view is attached to, or null. A view that no window
+     * drives cannot run a frame animation, and the control asks exactly that before it
+     * starts one - so a headless JVM (no window, no choreographer) legitimately reports
+     * null and every probe measures final geometry instead of an animation frame.
+     */
+    public android.os.Handler getHandler() { return null; }
     public void requestLayout() {}
     public boolean post(Runnable action) { return true; }
     public boolean postDelayed(Runnable action, long delay) { return true; }

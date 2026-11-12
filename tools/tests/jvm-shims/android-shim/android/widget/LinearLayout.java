@@ -69,6 +69,10 @@ public class LinearLayout extends ViewGroup {
             if (params.weight > 0f) totalWeight += params.weight;
             if ((vertical ? ch : cw) == LayoutParams.MATCH_PARENT) matchCount++;
 
+            // A wrap-content child of an UNSPECIFIED axis is measured UNSPECIFIED, exactly
+            // like ViewGroup.getChildMeasureSpec: it is free to be as large as its content.
+            // Passing AT_MOST(0) there (the old stub) collapsed every row of the panel to
+            // zero height as soon as the pages were measured with an open height.
             int specW = cw == LayoutParams.MATCH_PARENT
                 ? MeasureSpec.makeMeasureSpec(Math.max(0, MeasureSpec.getSize(innerWidthSpec)
                     - params.leftMargin - params.rightMargin), MeasureSpec.EXACTLY)
@@ -76,15 +80,19 @@ public class LinearLayout extends ViewGroup {
                     ? MeasureSpec.makeMeasureSpec(0, MeasureSpec.EXACTLY)
                     : cw >= 0
                         ? MeasureSpec.makeMeasureSpec(cw, MeasureSpec.EXACTLY)
-                        : MeasureSpec.makeMeasureSpec(Math.max(0, MeasureSpec.getSize(innerWidthSpec)
-                            - params.leftMargin - params.rightMargin), MeasureSpec.AT_MOST);
+                        : MeasureSpec.getMode(innerWidthSpec) == MeasureSpec.UNSPECIFIED
+                            ? MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED)
+                            : MeasureSpec.makeMeasureSpec(Math.max(0, MeasureSpec.getSize(innerWidthSpec)
+                                - params.leftMargin - params.rightMargin), MeasureSpec.AT_MOST);
             int specH = ch == LayoutParams.MATCH_PARENT
                 ? MeasureSpec.makeMeasureSpec(Math.max(0, MeasureSpec.getSize(innerHeightSpec)
                     - params.topMargin - params.bottomMargin), MeasureSpec.EXACTLY)
                 : ch >= 0
                     ? MeasureSpec.makeMeasureSpec(ch, MeasureSpec.EXACTLY)
-                    : MeasureSpec.makeMeasureSpec(Math.max(0, MeasureSpec.getSize(innerHeightSpec)
-                        - params.topMargin - params.bottomMargin), MeasureSpec.AT_MOST);
+                    : MeasureSpec.getMode(innerHeightSpec) == MeasureSpec.UNSPECIFIED
+                        ? MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED)
+                        : MeasureSpec.makeMeasureSpec(Math.max(0, MeasureSpec.getSize(innerHeightSpec)
+                            - params.topMargin - params.bottomMargin), MeasureSpec.AT_MOST);
             child.measure(specW, specH);
 
             int childW = child.getMeasuredWidth() + params.leftMargin + params.rightMargin;
@@ -135,6 +143,12 @@ public class LinearLayout extends ViewGroup {
             }
         }
 
+        // The platform applies the view's own minimum after measuring its children
+        // (View.onMeasure / LinearLayout both do), which is what lets a row be
+        // "minimumHeight, wrap_content": an 84px design row is 84px even though its two text
+        // lines are shorter. The stub used to skip this, so such a row collapsed to its copy.
+        if (heightMode != MeasureSpec.EXACTLY) ownH = Math.max(ownH, getSuggestedMinimumHeight());
+        if (widthMode != MeasureSpec.EXACTLY) ownW = Math.max(ownW, getSuggestedMinimumWidth());
         int finalW = widthMode == MeasureSpec.UNSPECIFIED ? ownW : widthSize;
         int finalH = heightMode == MeasureSpec.UNSPECIFIED ? ownH : heightSize;
         if (heightMode == MeasureSpec.AT_MOST) finalH = Math.min(ownH, heightSize);

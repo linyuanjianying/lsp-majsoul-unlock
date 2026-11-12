@@ -12,12 +12,14 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.text.InputType;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -25,6 +27,8 @@ import android.widget.TextView;
 import com.yefeng.majmax.hookprobe.helper.InGameLocalizer;
 import com.yefeng.majmax.hookprobe.manager.AssistLaunch;
 import com.yefeng.majmax.hookprobe.manager.ManagerLanguage;
+import com.yefeng.majmax.hookprobe.manager.OpponentNaming;
+import com.yefeng.majmax.hookprobe.manager.OpponentNamingMode;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
@@ -120,48 +124,25 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * thread of the hooked game process the moment the control was attached.
      */
     private static final int TAG_INFO = 0x7E010006;
+    /**
+     * Card slot remembering whether a naming cell is painted as selected, so the 1 s poll does
+     * not rebuild a RippleDrawable for three cells on every pass. Unrelated to the four slots
+     * above; it is only ever read and written by {@link #paintNaming}.
+     */
+    private static final int TAG_NAMING_SELECTED = 0x7E010007;
 
     /**
-     * Touch target of a *primary action* (the start/stop cell and the hand-off row), in
-     * pre-scale dp. The menu is drawn at {@link ScaledMenuHost#SCALE} (.75), so 60dp inside
-     * is the ~45dp the finger gets. Deliberately NOT applied to the chrome: the reporter's
-     * device is 2376x1080 at 2.75, where 60dp becomes 135px of a ~648px menu, and the old
-     * build spent the header and the tab on exactly that budget, leaving one switch card
-     * visible. Content space wins there, so the header/tab/cards use their own compact
-     * constants below.
+     * Every size of the panel is a design value, taken from {@link GameTopDesign} — the
+     * hand-off's 2376x1080 stage in px (640 wide panel, 52 header, 58 tab, 84 setting row,
+     * 64 status row, 72 collapsed bar). There are deliberately no local dp constants any
+     * more: a second set of numbers is exactly how the previous build ended up with a
+     * 998x648 panel whose chrome ate a third of the height.
+     *
+     * <p>The only local geometry left is the touch padding of the handle (its own class,
+     * unchanged) and the top anchor of the panel, which comes from
+     * {@link GameTopDesign#ANCHOR_TOP}.
      */
-    private static final int TARGET_DP = 60;
-    /**
-     * Header band, pre-scale dp. 28dp is 77px visible on the reporter's 2.75 density (the
-     * visible target was 70..85px) and holds the 16sp title, the 11sp state pill and the
-     * collapse chevron in one centred row of 28dp. The action below it measures its own
-     * 77x72dp touch box instead of inheriting {@link #TARGET_DP}.
-     */
-    private static final int HEADER_DP = 28;
-    /**
-     * Two-part tab band, pre-scale dp. 34dp is ~94px visible at 2.75 (the user asked for a
-     * slightly larger control/status group: 34 or 36), and it holds a 16sp label with room
-     * to breathe. The band is still one half row wide per tab, so the whole half — not only
-     * the drawn glyph — is the tap target, and it stays far cheaper than the old 60dp row:
-     * the numbers in the header comment of {@link #buildMenu} show the content band still
-     * keeping ~76% of the menu height, which is why the bigger tab does not squeeze the
-     * switch cards off the first screenful.
-     */
-    private static final int TAB_DP = 34;
-    /** Tab label size, sp. One notch above the old 15sp so the group reads as a group. */
-    private static final float TAB_TEXT_SP = 16f;
-    /**
-     * Height of a switch card, pre-scale dp. 34dp is ~94px visible: title row (16sp + 13sp
-     * state) plus one 12sp note line, which is what the card actually needs. Cards stay the
-     * widest tap target on the page, so this is about density of information, not reach.
-     */
-    private static final int ROW_DP = 34;
-    /** Gutter between header, tab and pages, pre-scale dp (~8px visible). */
-    private static final int CHROME_GAP_DP = 4;
-    /** Inner padding of the menu surface, pre-scale dp (~10px visible). */
-    private static final int PANEL_PAD_DP = 5;
-    /** Top inset for the capsule and the menu; the half-hidden handle ignores it. */
-    private static final int TOP_GAP_DP = 8;
+
     /** Idle window before the capsule folds back into the handle. */
     private static final long IDLE_CAPSULE_MS = 3_000L;
     /** Idle window before the open menu folds back into the handle. */
@@ -194,12 +175,30 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private StageRoot panel;
     private FrameLayout.LayoutParams panelParams;
 
-    /** Expanded menu: deep-blue surface, header, two-part tab, two pages. */
-    private LinearLayout menu;
-    private View titleDot;
+    /**
+     * The one panel of this surface. It is built once per attach and is the *same* view in
+     * both non-handle stages: collapsed it is a 72px status bar (dot, name, run-state pill,
+     * chevron), expanded it is the 640x530 panel with the tab band and the pages. That is the
+     * kit's `.np` / `.np.c` pair — one element, two paddings — instead of the two separate
+     * views (a hand-drawn capsule and a menu) the previous build had, which is what made the
+     * collapse look like a cut rather than a fold.
+     */
+    private PanelColumn menu;
+    /** Host of {@link #menu}: it owns the .75 pre-scale of the panel (see ScaledMenuHost). */
+    private ScaledMenuHost menuHost;
+    /** Whole header row: it is the collapse / expand toggle (the kit's clickable `.hd`). */
+    private LinearLayout headerRow;
+    private GameTopUi.StatusDot titleDot;
     private TextView title;
     private TextView statePill;
-    private View collapseButton;
+    /** The chevron: up while expanded, rotated 180deg while collapsed. */
+    private GameTopUi.Glyph chevron;
+    /** Everything below the header: gone while the panel is collapsed. */
+    private LinearLayout body;
+    /** Vertical band of the active page; the panel caps it, the ScrollView scrolls it. */
+    private android.widget.ScrollView band;
+    /** Natural content of both pages, measured with an unbounded height. */
+    private PagesHost pages;
 
     private LinearLayout tabControl;
     private LinearLayout tabStatus;
@@ -237,13 +236,51 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     private TextView panelNote;
     private GameTopUi.Switch panelSwitch;
 
-    /* Status page: the name row with its state dot, the detail rows and the actions. */
-    private LinearLayout statusCard;
-    private View statusDot;
-    private TextView statusMode;
-    private TextView statusDetail;
+    /* Card 4: opponent display names. One shared choice, stored by the manager and applied to
+     * the Rust modder by the game process; nothing here writes a preference of its own. */
+    /** Segmented control order: normal, preset names, custom. */
+    private static final OpponentNamingMode[] NAMING_MODES = {
+        OpponentNamingMode.NORMAL, OpponentNamingMode.ABC, OpponentNamingMode.CUSTOM
+    };
+    private LinearLayout namingCard;
+    /** The always-visible value row: title, note, the value pill and the disclosure arrow. */
+    private LinearLayout namingRow;
+    private TextView namingTitle;
+    private TextView namingState;
+    private TextView namingNote;
+    /** Value pill of the row: the current mode, or the three custom names joined. */
+    private TextView namingValue;
+    /** The "›" of the value row; rotated 90deg while the settings below are open. */
+    private GameTopUi.Glyph namingChevron;
+    /** The inline settings block below the row, hidden until the row is tapped. */
+    private LinearLayout namingSettings;
+    private boolean namingOpen;
+    /** Three segmented cells, in {@link #NAMING_MODES} order. */
+    private final TextView[] namingOptions = new TextView[3];
+    /** Container of the segmented cells (the quiet band behind them). */
+    private LinearLayout namingModes;
+    /** The three label editors; only on screen while the custom mode is selected. */
+    private LinearLayout namingEditor;
+    private final EditText[] namingInputs = new EditText[3];
+    /** Seat labels of the editors (left / top / right), repainted on a language switch. */
+    private final TextView[] namingLabels = new TextView[3];
+    private TextView namingSave;
+    /** Last choice the manager reported; the painters read only this field. */
+    private OpponentNaming naming = OpponentNaming.decode(null);
+    /** Serializes the naming writes. Deliberately not {@link #actionBusy}: a name change is
+     * independent of unattended mode, the service and the display mode. */
+    private final AtomicBoolean namingBusy = new AtomicBoolean();
+    /** Failure copy of card 4, kept in Chinese so a language switch can re-translate it. */
+    private String namingNoticeKey = "";
+    private boolean namingNoticeFailed;
+
+    /* Status page: key/value rows of the real polled state, the advice line and the actions. */
+    private GameTopUi.StatusDot statusDot;
     private TextView statusService;
+    private TextView statusMode;
     private TextView statusRematch;
+    private TextView statusPanel;
+    private TextView statusDetail;
     private TextView startStop;
     private LinearLayout manualRow;
 
@@ -272,8 +309,17 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     /* Top-centre docking geometry: the control never drags, it always sits top-centre. */
     private View decor;
+    /** The resting lip. Not part of the redesign: its behaviour, drawing and size are as shipped. */
     private GameTopUi.HandleView handleTab;
-    private GameTopUi.CapsuleView capsule;
+
+    /**
+     * True while the panel is drawn collapsed (the 72px status bar). The stage is the source
+     * of truth — {@code STAGE_MENU} means expanded — and this field only mirrors what the
+     * views currently show, so a frame animation can be interrupted and re-synced.
+     */
+    private boolean panelCollapsed = true;
+    /** Frame driver of the fold animation; null while the panel is at rest. */
+    private GameTopDesign.Motion motion;
     /** Only keeps the wrap-content root clamped top-centre; it never drives a drag. */
     private SizeWatcher hooks;
 
@@ -549,12 +595,19 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         panelParams = null;
         decor = null;
         handleTab = null;
-        capsule = null;
+        if (motion != null) motion.cancel();
+        motion = null;
         menu = null;
+        menuHost = null;
+        headerRow = null;
+        body = null;
+        band = null;
+        pages = null;
         title = null;
         titleDot = null;
         statePill = null;
-        collapseButton = null;
+        chevron = null;
+        panelCollapsed = true;
         controlTab.unbind();
         statusTab.unbind();
         pageControl = pageStatus = null;
@@ -570,12 +623,29 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         panelCard = null;
         panelTitle = panelState = panelNote = null;
         panelSwitch = null;
-        statusCard = null;
+        releaseNamingViews();
         statusDot = null;
-        statusMode = statusDetail = statusService = statusRematch = null;
+        statusMode = statusDetail = statusService = statusRematch = statusPanel = null;
         startStop = null;
         manualRow = null;
         active.clear();
+    }
+
+    /**
+     * Drops the naming card's view references. Called from both teardown paths (detach and the
+     * language-switch rebuild), so the next {@link #buildNamingCard} starts from a clean slate
+     * and a closed menu does not pin the views (and their focus listeners) it just dropped.
+     */
+    private void releaseNamingViews() {
+        namingCard = null;
+        namingTitle = namingState = namingNote = null;
+        namingEditor = null;
+        namingSave = null;
+        for (int slot = 0; slot < namingOptions.length; slot++) {
+            namingOptions[slot] = null;
+            namingInputs[slot] = null;
+            namingLabels[slot] = null;
+        }
     }
 
     private android.view.Window observedWindow;
@@ -630,18 +700,38 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         GameTopUi.pressable(view, shape);
     }
 
-    private TextView cell(Context context, float size, int color, boolean bold) {
-        TextView view = GameTopUi.text(context, size, color, bold);
-        view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(context, 10), dp(context, 8), dp(context, 10), dp(context, 8));
-        view.setMinHeight(dp(context, 34));
-        return view;
+    /* -------------------------------------------------------------- design px */
+
+    /** Match-parent child of {@code heightDesignPx}, in the panel's own pixel space. */
+    private static LinearLayout.LayoutParams fixed(Context context, float heightDesignPx) {
+        return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            GameTopDesign.px(context, heightDesignPx));
+    }
+
+    /** Same, with a design-px gap above it: the row rhythm of the design. */
+    private static LinearLayout.LayoutParams fixed(Context context, float heightDesignPx,
+                                                   float gapDesignPx) {
+        LinearLayout.LayoutParams params = fixed(context, heightDesignPx);
+        params.topMargin = GameTopDesign.px(context, gapDesignPx);
+        return params;
     }
 
     /**
-     * Opens the menu on the control page (from a capsule tap or an explicit call) and
-     * asks for a fresh status immediately. This is the only place the menu stage is
-     * entered, so every entry point arms the idle window exactly once.
+     * A row of the design: as tall as its own minimum (84px), which lets the ⓘ explanation of
+     * card 2 and the naming settings grow their card by exactly the lines they add. A fixed
+     * height would clip them instead, which is why the rows are not measured to a constant.
+     */
+    private static LinearLayout.LayoutParams rowBox(Context context, float gapDesignPx) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        if (gapDesignPx > 0f) params.topMargin = GameTopDesign.px(context, gapDesignPx);
+        return params;
+    }
+
+    /**
+     * Opens the panel on the control page (from a tap on the collapsed bar or an explicit
+     * call) and asks for a fresh status immediately. This is the only place the expanded
+     * stage is entered, so every entry point arms the idle window exactly once.
      */
     private void openMenu() {
         if (stage == STAGE_MENU) return;
@@ -649,16 +739,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         tab = TAB_CONTROL;
         resetTransientMenuState();
         restartIdleTimer();
+        setCollapsed(false, true);
         applyState();
         schedulePoll(0L);
     }
 
     /**
-     * A freshly opened menu starts with card 2's long explanation folded, so the panel
-     * keeps its compact height and every card stays reachable without scrolling.
+     * A freshly opened menu starts with card 2's long explanation folded and the naming
+     * settings closed, so the panel keeps its compact height and every row stays on screen.
      */
     private void resetTransientMenuState() {
         rematchDetailOpen = false;
+        namingOpen = false;
     }
 
     private StageRoot build(Activity activity) {
@@ -666,13 +758,15 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         root.setClipChildren(false);
         root.setClipToPadding(false);
 
-        // Resting entry: 30dp visible pill inside a 44dp touch box at the window edge.
+        // Resting entry: the shipped 84x30dp lip in its 108x44dp touch box. The redesign
+        // starts below it — nothing here was touched.
         handleTab = new GameTopUi.HandleView(activity);
         handleTab.setContentDescription(t("展开雀魂助手"));
         handleTab.setStateColor(stateColor());
         handleTab.setOnClickListener(view -> {
             stage = STAGE_CAPSULE;
             restartIdleTimer();
+            setCollapsed(true, true);
             applyState();
         });
         FrameLayout.LayoutParams handleParams = new FrameLayout.LayoutParams(
@@ -681,44 +775,29 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         handleParams.topMargin = 0;
         root.addView(handleTab, handleParams);
 
-        // Assistant capsule: state dot, short phrase, hairline, four-icon grid.
-        capsule = new GameTopUi.CapsuleView(activity);
-        capsule.setContentDescription(t("打开雀魂助手菜单"));
-        capsule.setStateColor(stateColor());
-        // openMenu() arms the idle window, so the capsule needs no touch listener of its
-        // own; a plain click keeps the ripple and the accessibility tap working.
-        capsule.setOnClickListener(view -> openMenu());
-        FrameLayout.LayoutParams capsuleParams = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            dp(activity, GameTopUi.CapsuleView.HEIGHT_DP),
-            Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        capsuleParams.topMargin = dp(activity, TOP_GAP_DP);
-        root.addView(capsule, capsuleParams);
-
         menu = buildMenu(activity);
+        // The host owns the .75 pre-scale: it measures the panel wider than it is drawn and
+        // reports its own box as exactly what the finger sees (see ScaledMenuHost).
+        menuHost = new ScaledMenuHost(activity);
+        menuHost.addView(menu, new FrameLayout.LayoutParams(
+            GameTopDesign.px(activity, GameTopDesign.PANEL_W),
+            ViewGroup.LayoutParams.WRAP_CONTENT));
         FrameLayout.LayoutParams menuParams = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        menuParams.topMargin = dp(activity, TOP_GAP_DP);
-        // The host occupies the visible scaled size, not the original large rectangle.
-        ScaledMenuHost menuHost = new ScaledMenuHost(activity);
-        menuHost.addView(menu, new FrameLayout.LayoutParams(dp(activity, 500),
-            ViewGroup.LayoutParams.WRAP_CONTENT));
-        // Outside the panel the menu stays open: the root below turns such a tap into the
-        // same explicit "collapse" the arrow performs (see StageRoot). The host itself stays
-        // click-through, so the idle window is not re-armed by touches outside the panel.
+        menuParams.topMargin = GameTopDesign.px(activity, GameTopDesign.ANCHOR_TOP);
         root.addView(menuHost, menuParams);
 
-        // Outer touch watcher. It only observes: every event is handed straight back to
-        // the normal child / click path (return false), so switches, rows and the scroll
-        // behaviour of the panel keep working exactly as before.
+        // The panel starts folded: the collapsed bar is a normal state of this view, not a
+        // separate surface, so nothing has to be animated to show it.
+        setCollapsed(true, false);
         return root;
     }
 
     /**
      * Records menu interactions for the idle timer and never consumes the event.
-     * ACTION_DOWN arms a hold so a finger resting on the panel (reading the status)
-     * does not trigger the fall-back mid-read.
+     * ACTION_DOWN arms a hold so a finger resting on the panel (reading the status) does
+     * not trigger the fall-back mid-read.
      */
     private void noteMenuTouch(MotionEvent event) {
         switch (event.getActionMasked()) {
@@ -795,13 +874,164 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         collapse();
     }
 
-    /** Back to the half-hidden handle. The timer is not armed again from here. */
+    /**
+     * Back to the half-hidden handle, without folding through the bar: the idle window and
+     * the outside tap both leave the surface entirely. The timer is not armed again here.
+     */
     private void collapse() {
         stopIdleTimer();
         if (stage == STAGE_HANDLE) return;
         stage = STAGE_HANDLE;
+        setCollapsed(true, true);
         resolveOutsideClick();
         applyState();
+    }
+
+    /**
+     * The header of the panel is the fold toggle of the design: expanded -> collapsed bar,
+     * collapsed bar -> expanded panel. It never jumps straight to the handle, so a tap never
+     * hides the surface the user is reading.
+     */
+    private void togglePanel() {
+        if (stage == STAGE_HANDLE) return;
+        if (stage == STAGE_MENU) {
+            stage = STAGE_CAPSULE;
+            setCollapsed(true, true);
+        } else {
+            stage = STAGE_MENU;
+            setCollapsed(false, true);
+        }
+        restartIdleTimer();
+        applyState();
+    }
+
+    /**
+     * Folds or unfolds the panel.
+     *
+     * <p>Geometry is applied immediately and only *visuals* are animated, in one direction:
+     *
+     * <ul>
+     *   <li>the outer padding eases between 16/18 (expanded) and 10/10 (collapsed) over the
+     *       design's 280ms expand / 220ms collapse curves — that is the box closing;</li>
+     *   <li>the body of the panel (tab band + pages) fades in over 200ms after the design's
+     *       80ms delay and slides up 8px, or fades out over 120ms and slides down 8px. It is
+     *       made GONE only once it is invisible, so the panel's height never visibly jumps
+     *       over a half-faded row;</li>
+     *   <li>the chevron rotates between 0 and 180 degrees over the same call.</li>
+     * </ul>
+     *
+     * <p>If the platform cannot animate right now ({@link GameTopDesign#canAnimate}: no
+     * window, or the system animator duration scale is 0) the final state is applied in one
+     * step. That is also what makes the layout probes deterministic: they build the tree
+     * without a window, so they only ever measure the final geometry.
+     */
+    private void setCollapsed(boolean collapsed, boolean animate) {
+        boolean same = panelCollapsed == collapsed;
+        panelCollapsed = collapsed;
+        if (menu == null) return;
+
+        int padH = GameTopDesign.px(menu.getContext(), collapsed
+            ? GameTopDesign.PANEL_PAD_COLLAPSED_H : GameTopDesign.PANEL_PAD_H);
+        int padV = GameTopDesign.px(menu.getContext(), collapsed
+            ? GameTopDesign.PANEL_PAD_COLLAPSED_V : GameTopDesign.PANEL_PAD_TOP);
+        int padBottom = GameTopDesign.px(menu.getContext(), collapsed
+            ? GameTopDesign.PANEL_PAD_COLLAPSED_V : GameTopDesign.PANEL_PAD_BOTTOM);
+        float rotation = collapsed ? 180f : 0f;
+
+        if (motion != null) motion.cancel();
+        if (!animate || !GameTopDesign.canAnimate(menu) || (same && !collapsed)) {
+            applyFoldedFrame(collapsed, 1f);
+            return;
+        }
+
+        final boolean folding = collapsed;
+        final int fromTop = menu.getPaddingTop();
+        final int fromBottom = menu.getPaddingBottom();
+        final int toTop = padV;
+        final int toBottom = padBottom;
+        final int toLeft = padH;
+        final View content = body;
+        final long duration = folding ? GameTopDesign.MS_COLLAPSE : GameTopDesign.MS_EXPAND;
+        final float[] easing = folding ? GameTopDesign.EASE_COLLAPSE : GameTopDesign.EASE_EXPAND;
+
+        if (!folding && content != null) {
+            // The body has to exist while it fades in; it was GONE while collapsed.
+            content.setAlpha(0f);
+            show(content, true);
+        }
+        if (!folding && chevron != null) chevron.setRotation(0f);
+
+        motion = new GameTopDesign.Motion(menu);
+        motion.start(duration, easing, eased -> {
+            int top = Math.round(fromTop + (toTop - fromTop) * eased);
+            int bottom = Math.round(fromBottom + (toBottom - fromBottom) * eased);
+            menu.setPadding(toLeft, top, toLeft, bottom);
+            if (chevron != null) chevron.setRotation(rotation * eased);
+            if (content != null) content.setAlpha(folding ? 1f - eased : eased);
+            applyRowMotion(folding, eased, duration);
+        }, () -> {
+            motion = null;
+            applyFoldedFrame(folding, 1f);
+        });
+    }
+
+    /**
+     * Applies the resting geometry of one fold state. Called directly when there is nothing
+     * to animate, and at the end (or on cancel) of a fold, so an interrupted animation can
+     * never leave the panel between two states.
+     */
+    private void applyFoldedFrame(boolean collapsed, float eased) {
+        if (menu == null) return;
+        Context context = menu.getContext();
+        int padH = GameTopDesign.px(context, collapsed
+            ? GameTopDesign.PANEL_PAD_COLLAPSED_H : GameTopDesign.PANEL_PAD_H);
+        int padTop = GameTopDesign.px(context, collapsed
+            ? GameTopDesign.PANEL_PAD_COLLAPSED_V : GameTopDesign.PANEL_PAD_TOP);
+        int padBottom = GameTopDesign.px(context, collapsed
+            ? GameTopDesign.PANEL_PAD_COLLAPSED_V : GameTopDesign.PANEL_PAD_BOTTOM);
+        menu.setPadding(padH, padTop, padH, padBottom);
+        show(body, !collapsed);
+        if (body != null) {
+            body.setAlpha(1f);
+            body.setTranslationY(0f);
+        }
+        if (chevron != null) chevron.setRotation(collapsed ? 180f : 0f);
+        resetRowMotion();
+        menu.requestLayout();
+    }
+
+    /** Rows fade in one after another (30ms apart) and slide up 8px, exactly as in the kit. */
+    private void applyRowMotion(boolean folding, float eased, long duration) {
+        if (pageControl == null && pageStatus == null) return;
+        LinearLayout page = tab == TAB_STATUS ? pageStatus : pageControl;
+        if (page == null) return;
+        float elapsed = eased * duration;
+        int count = page.getChildCount();
+        for (int i = 0; i < count; i++) {
+            View row = page.getChildAt(i);
+            if (row == null || row.getVisibility() == View.GONE) continue;
+            float raw = folding
+                ? GameTopDesign.clamp((elapsed) / (float) GameTopDesign.MS_CONTENT_OUT)
+                : GameTopDesign.clamp((elapsed - GameTopDesign.MS_CONTENT_IN_DELAY
+                    - i * GameTopDesign.MS_ROW_STAGGER) / (float) GameTopDesign.MS_CONTENT_IN);
+            row.setAlpha(folding ? 1f - raw : raw);
+            row.setTranslationY(folding ? raw * GameTopDesign.px(menu.getContext(),
+                GameTopDesign.ROW_TRANSLATE) : (1f - raw) * GameTopDesign.px(menu.getContext(),
+                GameTopDesign.ROW_TRANSLATE));
+        }
+    }
+
+    /** Puts every page row back to its resting look: opaque and in place. */
+    private void resetRowMotion() {
+        for (LinearLayout page : new LinearLayout[]{pageControl, pageStatus}) {
+            if (page == null) continue;
+            for (int i = 0; i < page.getChildCount(); i++) {
+                View row = page.getChildAt(i);
+                if (row == null) continue;
+                row.setAlpha(1f);
+                row.setTranslationY(0f);
+            }
+        }
     }
 
     /**
@@ -813,7 +1043,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (panel == null) return;
         panel.post(() -> {
             if (panel == null || panel.getParent() == null) return;
-            if (menu != null) ((CappedColumn) menu).refreshCap();
+            if (menu != null) {
+                menu.setReserve(GameTopDesign.windowReserve(menu.getContext(),
+                    menu.getResources().getDisplayMetrics().heightPixels));
+                menu.requestLayout();
+            }
             applyState();
         });
     }
@@ -854,22 +1088,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * decor constraint the window hands down: the root must only ever be as large as
      * what it draws, otherwise the game's touches would be eaten by an invisible box
      * around the menu. Children are measured exactly as FrameLayout would, against the
-     * real window size, so the capped panel and CENTER_HORIZONTAL gravity still work.
+     * real window size, so the wrap-content panel and CENTER_HORIZONTAL gravity still work.
      *
      * <p>Outside touches: while the menu is open the root becomes clickable and any tap
      * that is not consumed by the panel reaches it, which closes the menu — the exact
-     * action of the header arrow. The root's own bounds are now the visible panel (the
-     * handle and the capsule are GONE), so the game's hand tiles and buttons outside it
-     * are untouched. While the handle or the capsule is showing the root is wrap-content
-     * around that small view and never clickable at all.
+     * action of the outside-tap watcher. The root's own bounds are now the visible panel (the
+     * handle is GONE), so the game's hand tiles and buttons outside it are untouched.
      *
      * <p>No gesture of its own: the root deliberately overrides neither
-     * {@code onInterceptTouchEvent} nor {@code onTouchEvent}. There is no horizontal
-     * swipe-to-switch-tab any more — a side swipe used to swallow the gesture and throw the
-     * user into the other page mid-scroll / mid-drag. The two pages are switched only by
-     * their own tab shells, the switches only by the right-hand {@link GameTopUi.Switch},
-     * and the only touch behaviour left inside the panel is the ScrollView's normal
-     * vertical scrolling.
+     * {@code onInterceptTouchEvent} nor {@code onTouchEvent}. The two pages are switched only
+     * by their own tab shells, the switches only by the right-hand {@link GameTopUi.Switch},
+     * and the only touch behaviour left inside the panel is the ScrollView's normal vertical
+     * scrolling.
      */
     private final class StageRoot extends FrameLayout {
         StageRoot(Context context) { super(context); }
@@ -933,36 +1163,49 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    /** A menu host with matching visual, layout and touch bounds. */
+    /**
+     * The one deliberate scale of this surface: the panel is laid out at {@code 1 / SCALE} of
+     * its visible size and drawn at {@code SCALE}, so Android's own touch transform maps a
+     * finger position onto the child exactly. Its own measured box is the *visible* box,
+     * which is what the stage root and the outside-tap test use.
+     *
+     * <p>{@link GameTopDesign#px} already divided the .75 out of every design value, so the
+     * panel is 640 design px wide on the finger's side of this host — not 640 * .75.
+     */
     private static final class ScaledMenuHost extends FrameLayout {
-        float SCALE = .75f;
+        float SCALE = GameTopDesign.HOST_SCALE;
         ScaledMenuHost(Context context) { super(context); }
 
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
             View child = getChildAt(0);
-            int availableWidth = MeasureSpec.getSize(widthSpec);
-            int screenWidth = getResources().getDisplayMetrics().widthPixels;
-            int screenHeight = getResources().getDisplayMetrics().heightPixels;
-            int visualWidth = Math.round(screenWidth * .42f);
-            if (availableWidth > 0) visualWidth = Math.min(visualWidth, availableWidth);
-            int width = Math.round(visualWidth / SCALE);
-            int availableHeight = MeasureSpec.getSize(heightSpec);
-            int visualHeight = Math.round(screenHeight * .60f);
-            if (availableHeight > 0) visualHeight = Math.min(visualHeight, availableHeight);
-            // The child gets the pre-scale size of the *visible* box (648 / .75 = 864), not
-            // the rounded pixels scaled back: the panel is capped to exactly what the finger
-            // sees, so no chip of it can slide under the bottom edge.
-            int height = Math.round(visualHeight / SCALE);
-            child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
-                MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY));
-            // Report the visible box itself. Rounding the already-rounded child size
-            // (864 * .75 -> 648) only agrees when the two roundings cancel, and a 1px
-            // disagreement inside the stage root shows up as a clipped bottom edge.
-            setMeasuredDimension(visualWidth, visualHeight);
+            if (child == null) {
+                setMeasuredDimension(0, 0);
+                return;
+            }
+            Context context = getContext();
+            int availableWidth = MeasureSpec.getMode(widthSpec) == MeasureSpec.UNSPECIFIED
+                ? 0 : MeasureSpec.getSize(widthSpec);
+            int availableHeight = MeasureSpec.getMode(heightSpec) == MeasureSpec.UNSPECIFIED
+                ? 0 : MeasureSpec.getSize(heightSpec);
+            int designWidth = GameTopDesign.visiblePx(context, GameTopDesign.PANEL_W);
+            int visibleWidth = availableWidth > 0
+                ? Math.min(designWidth, availableWidth) : designWidth;
+            int preWidth = Math.max(1, Math.round(visibleWidth / SCALE));
+            // The height is the panel's own: the design asks for a 530px card on a device
+            // whose window could hold 900, and a ScrollView band that is handed the whole
+            // window would have nothing left to scroll. The parent's box is only a ceiling.
+            int maxPreHeight = availableHeight > 0 ? Math.round(availableHeight / SCALE) : 0;
+            int childHeightSpec = maxPreHeight > 0
+                ? MeasureSpec.makeMeasureSpec(maxPreHeight, MeasureSpec.AT_MOST)
+                : MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
+            child.measure(MeasureSpec.makeMeasureSpec(preWidth, MeasureSpec.EXACTLY),
+                childHeightSpec);
+            setMeasuredDimension(visibleWidth, Math.round(child.getMeasuredHeight() * SCALE));
         }
 
         @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
             View child = getChildAt(0);
+            if (child == null) return;
             child.setPivotX(0f);
             child.setPivotY(0f);
             child.setScaleX(SCALE);
@@ -972,204 +1215,280 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     /**
-     * Vertical LinearLayout capped to a maximum height. Used for the expanded panel so
-     * it can never grow past the window in landscape; the inner pages are measured
-     * against the cap, and the top of the panel (header, tab) stays reachable.
+     * The panel: a vertical stack of a fixed header, the tab band and the scrolling pages,
+     * measured to its own content and clamped to the window reserve.
+     *
+     * <p>It replaced the old "cap everything to the window reserve" column, which made the
+     * panel always as tall as the window allowed (648 visible px) no matter how little the
+     * content needed: that is why the previous build's page had empty space under the last
+     * row and why the scroll band never reported an overflow. Two measure passes fix it —
+     * one for the natural height (band at wrap_content), one for the height the content
+     * really needs (band at weight 1, so a long page scrolls instead of growing the panel).
      */
-    private static final class CappedColumn extends LinearLayout {
-        private final int marginReserve;
-        private int maxHeight;
+    private static final class PanelColumn extends LinearLayout {
+        private final int chromeHeight;
+        private final int tabBlock;
+        private int reserve;
+        private View body;
+        private View band;
+        private boolean fitted;
 
-        CappedColumn(Context context, int maxHeight) {
+        PanelColumn(Context context, int reserve, int chromeHeight, int tabBlock) {
             super(context);
-            this.marginReserve = maxHeight;
-            this.maxHeight = Math.max(0, maxHeight);
+            this.reserve = Math.max(0, reserve);
+            this.chromeHeight = Math.max(0, chromeHeight);
+            this.tabBlock = Math.max(0, tabBlock);
             setOrientation(VERTICAL);
         }
 
-        /**
-         * Re-reads the window height after a rotation / size change so a menu opened in
-         * portrait can never overflow a short landscape window.
-         */
-        void refreshCap() {
-            int available = marginReserve;
-            View parent = (View) getParent();
-            if (parent != null && parent.getHeight() > 0 && !(parent instanceof ScaledMenuHost)) {
-                available = Math.min(available, parent.getHeight());
-            }
-            maxHeight = Math.max(0, available);
+        /** The scrolling body and its band: both are re-measured by this column. */
+        void bindPages(View body, View band) {
+            this.body = body;
+            this.band = band;
+        }
+
+        void setReserve(int value) {
+            int next = Math.max(0, value);
+            if (next == reserve) return;
+            reserve = next;
             requestLayout();
         }
 
+        /**
+         * Two passes: first the natural height of the content (both the body and the band at
+         * wrap_content), then exactly the height that content needs — capped by
+         * {@link #reserve}. In the second pass the band gets an explicit height, so a page
+         * that is taller than the panel scrolls inside it instead of growing it ("scroll
+         * correctness" is these two numbers agreeing with what the ScrollView sees).
+         */
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
-            boolean bounded = MeasureSpec.getMode(heightSpec) != MeasureSpec.UNSPECIFIED;
-            if (maxHeight > 0 && bounded) {
-                // The host already capped the height, so the panel takes exactly that much:
-                // a definite height is what lets the scrolling body (weight 1) fill the
-                // space the compact chrome leaves instead of wrapping to content. The old
-                // wrap-measure-then-clip left the body at its content height and pushed the
-                // pinned divider/collapse row up over the cards.
-                int exact = MeasureSpec.makeMeasureSpec(maxHeight, MeasureSpec.EXACTLY);
-                super.onMeasure(widthSpec, exact);
-                setMeasuredDimension(getMeasuredWidth(), maxHeight);
+            int size = MeasureSpec.getSize(heightSpec);
+            int mode = MeasureSpec.getMode(heightSpec);
+            int cap = reserve;
+            if (mode == MeasureSpec.EXACTLY) cap = size;
+            else if (mode == MeasureSpec.AT_MOST) cap = cap > 0 ? Math.min(cap, size) : size;
+            if (cap <= 0) {
+                super.onMeasure(widthSpec, heightSpec);
                 return;
             }
-            super.onMeasure(widthSpec, heightSpec);
+            fit(false);
+            super.onMeasure(widthSpec, MeasureSpec.makeMeasureSpec(cap, MeasureSpec.AT_MOST));
+            int natural = getMeasuredHeight();
+            int wanted = Math.min(natural, cap);
+            fit(true);
+            super.onMeasure(widthSpec, MeasureSpec.makeMeasureSpec(wanted, MeasureSpec.EXACTLY));
+            setMeasuredDimension(getMeasuredWidth(), wanted);
+        }
+
+        /**
+         * Pins the body and the band to a definite height (final pass) or lets them wrap (the
+         * natural pass). Explicit heights instead of LinearLayout weights: a weighted child
+         * inside an AT_MOST parent is handed the whole budget by the platform, which is
+         * exactly how the previous build always ended up with a full-height panel.
+         */
+        private void fit(boolean definite) {
+            if (fitted == definite && definite) return;
+            fitted = definite;
+            int bodyHeight = ViewGroup.LayoutParams.WRAP_CONTENT;
+            int bandHeight = ViewGroup.LayoutParams.WRAP_CONTENT;
+            if (definite) {
+                bodyHeight = Math.max(0, getMeasuredHeight() - getPaddingTop()
+                    - getPaddingBottom() - chromeHeight);
+                bandHeight = Math.max(0, bodyHeight - tabBlock);
+            }
+            setHeight(body, bodyHeight);
+            setHeight(band, bandHeight);
+        }
+
+        private static void setHeight(View view, int height) {
+            if (view == null) return;
+            ViewGroup.LayoutParams raw = view.getLayoutParams();
+            if (!(raw instanceof LinearLayout.LayoutParams)) return;
+            LinearLayout.LayoutParams params = (LinearLayout.LayoutParams) raw;
+            params.weight = 0f;
+            // Mutated in place: the parent already holds this instance, and calling
+            // setLayoutParams() from inside a measure pass would request another layout.
+            params.height = height;
         }
     }
 
     /**
-     * The expanded panel: deep-blue surface, compact header, two-part tab, two pages.
-     *
-     * <p>Vertical budget, in the pre-scale coordinates the panel is laid out in, for the
-     * reporter's 2376x1080 @ 2.75 device (density 2.75, the 648px the finger sees = 864
-     * pre-scale px at {@link ScaledMenuHost#SCALE} .75):
-     *
-     * <pre>
-     *   panel padding         5dp          14px        11px visible
-     *   header               28dp          77px        58px visible
-     *   gutter                4dp          11px         8px visible
-     *   tab                  34dp          94px        70px visible
-     *   gutter                4dp          11px         8px visible
-     *   body (weight 1)                 781px       472px visible = 73% of the menu
-     *   panel padding         5dp          14px        11px visible
-     *   ---- total                     1036px       648px visible
-     * </pre>
-     *
-     * <p>The tab band is 34dp since the control/status group was enlarged (it was 22dp / 61px
-     * for ~2 builds): the band costs 24px visible more and the body keeps 472px = 73% of the
-     * menu, i.e. still over the 65% / 420px budget the layout probe enforces, and still enough
-     * for two full switch cards plus most of the third in the first screenful. The body is a
-     * ScrollView, so nothing is ever clipped away — the chrome simply never eats the panel.
-     *
-     * <p>Nothing is pinned below the scroll band any more: the 1dp divider and the 135px
-     * "收起面板" row are gone (the header chevron and the outside tap both collapse), so the
-     * band keeps every pixel the chrome does not need.
+     * Holds the two pages and reports the taller of them, whatever height budget the parent
+     * hands down. That is what lets the panel's natural measure pass learn the real content
+     * height of a page even though the pages sit inside a ScrollView.
      */
-    private LinearLayout buildMenu(Activity activity) {
-        int maxHeight = Math.round(activity.getResources().getDisplayMetrics().heightPixels
-            - GameTopUi.density(activity) * (TOP_GAP_DP + 8));
-        LinearLayout panelView = new CappedColumn(activity, maxHeight);
-        panelView.setBackground(GameTopUi.panel(activity));
-        int pad = dp(activity, PANEL_PAD_DP);
-        panelView.setPadding(pad, pad, pad, pad);
-        panelView.setElevation(dp(activity, 12));
-        // Width is capped so a narrow portrait screen never pushes the panel off-screen;
-        // the status page scrolls instead of growing past the window height.
-        int width = Math.min(dp(activity, 272),
-            Math.max(dp(activity, 232), Math.round(screenWidthDp(activity) * 0.84f)));
-        panelView.setMinimumWidth(width);
+    private static final class PagesHost extends FrameLayout {
+        PagesHost(Context context) { super(context); }
 
-        panelView.addView(buildHeader(activity),
-            new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(activity, HEADER_DP)));
-        panelView.addView(spacer(activity, CHROME_GAP_DP));
-        panelView.addView(buildTabs(activity),
-            new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(activity, TAB_DP)));
-        panelView.addView(spacer(activity, CHROME_GAP_DP));
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            int width = MeasureSpec.getMode(widthSpec) == MeasureSpec.UNSPECIFIED
+                ? getSuggestedMinimumWidth() : MeasureSpec.getSize(widthSpec);
+            if (width <= 0) width = Math.max(1, getMeasuredWidth());
+            int height = 0;
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                if (child.getVisibility() == GONE) continue;
+                child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                height = Math.max(height, child.getMeasuredHeight());
+            }
+            setMeasuredDimension(width, height);
+        }
 
-        LinearLayout body = new LinearLayout(activity);
-        body.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        panelView.addView(body, bodyParams);
-
-        android.widget.ScrollView pageScroll = new android.widget.ScrollView(activity);
-        pageScroll.setFillViewport(true);
-        pageScroll.setVerticalScrollBarEnabled(false);
-        body.addView(pageScroll, new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        FrameLayout pages = new FrameLayout(activity);
-        pageScroll.addView(pages, new android.widget.ScrollView.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        pageControl = buildControlPage(activity);
-        pages.addView(pageControl, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        pageStatus = buildStatusPage(activity);
-        pages.addView(pageStatus, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return panelView;
+        @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                if (child.getVisibility() == GONE) continue;
+                child.layout(0, 0, child.getMeasuredWidth(), child.getMeasuredHeight());
+            }
+        }
     }
 
     /**
-     * Header: live state dot, the name, the run-state pill and the collapse arrow, all in
-     * one 28dp row (77px visible at 2.75).
+     * The panel: violet glass with a single amber hairline, the clickable header, and the
+     * body (tab band + pages).
      *
-     * <p>The chevron keeps a 24x26dp box of its own instead of the 60dp
-     * {@link #TARGET_DP}: 60dp is taller than the whole header and would drag it back to
-     * the old 165px, whose only purpose was reach. Reach costs content here, and the header
-     * is the user's explicit way out of the menu — the outside tap and the idle window both
-     * still collapse it.
+     * <p>Vertical budget of the expanded control page, in design px of the 1080-short-side
+     * stage, which is what the finger measures:
+     *
+     * <pre>
+     *   panel padding        16 + 18        34
+     *   header                 52           86
+     *   tab band margin-top    12           98
+     *   tab band               58          156
+     *   tab band margin-bottom 14          170
+     *   4 setting rows       4*84 + 3*8    530
+     * </pre>
+     *
+     * So the whole control page is 530px of a 1080px-tall stage: four rows, one screen, no
+     * scrolling. The status page is 406px (four 64px key/value rows, the advice line and the
+     * primary action) and only scrolls once its conditional hand-off row appears.
+     */
+    private PanelColumn buildMenu(Activity activity) {
+        int reserve = GameTopDesign.windowReserve(activity,
+            activity.getResources().getDisplayMetrics().heightPixels);
+        PanelColumn panel = new PanelColumn(activity, reserve,
+            GameTopDesign.px(activity, GameTopDesign.HEADER_H),
+            GameTopDesign.px(activity, GameTopDesign.TABS_H)
+                + GameTopDesign.px(activity, GameTopDesign.TABS_MARGIN_TOP)
+                + GameTopDesign.px(activity, GameTopDesign.TABS_MARGIN_BOTTOM));
+        panel.setBackground(GameTopUi.panel(activity));
+        panel.setElevation(GameTopDesign.px(activity, 12));
+        int padH = GameTopDesign.px(activity, GameTopDesign.PANEL_PAD_H);
+        panel.setPadding(padH, GameTopDesign.px(activity, GameTopDesign.PANEL_PAD_TOP), padH,
+            GameTopDesign.px(activity, GameTopDesign.PANEL_PAD_BOTTOM));
+
+        headerRow = buildHeader(activity);
+        panel.addView(headerRow, fixed(activity, GameTopDesign.HEADER_H));
+
+        body = vertical(activity);
+        panel.addView(body, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout tabs = buildTabs(activity);
+        LinearLayout.LayoutParams tabParams = fixed(activity, GameTopDesign.TABS_H,
+            GameTopDesign.TABS_MARGIN_TOP);
+        tabParams.bottomMargin = GameTopDesign.px(activity, GameTopDesign.TABS_MARGIN_BOTTOM);
+        body.addView(tabs, tabParams);
+
+        pages = new PagesHost(activity);
+        pageControl = buildControlPage(activity);
+        pages.addView(pageControl, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        pageStatus = buildStatusPage(activity);
+        pages.addView(pageStatus, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        band = new android.widget.ScrollView(activity);
+        band.setFillViewport(false);
+        band.setVerticalScrollBarEnabled(false);
+        band.setClipToPadding(false);
+        band.addView(pages, new android.widget.ScrollView.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        body.addView(band, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        panel.bindPages(body, band);
+        return panel;
+    }
+
+    /**
+     * Header: the live state dot, the name, the run-state pill and the fold chevron, in one
+     * 52px row. The whole row — not just the chevron — is the fold toggle, which is what the
+     * hand-off's clickable `.hd` does.
      */
     private LinearLayout buildHeader(Activity activity) {
         LinearLayout header = new LinearLayout(activity);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(activity, 2), 0, 0, 0);
+        header.setPadding(GameTopDesign.px(activity, GameTopDesign.HEADER_INSET), 0, 0, 0);
+        header.setClickable(true);
+        header.setFocusable(true);
+        header.setContentDescription(t("收起面板"));
+        ripple(header, GameTopUi.solid(activity, GameTopDesign.HEADER_H / 2f,
+            android.graphics.Color.TRANSPARENT));
+        // One listener, created with the row: a language switch rebuilds the tree instead of
+        // re-binding, so no listener can stack.
+        header.setOnClickListener(view -> togglePanel());
 
-        titleDot = GameTopUi.dot(activity, GameTopUi.INK_FAINT);
-        header.addView(titleDot);
+        titleDot = new GameTopUi.StatusDot(activity);
+        header.addView(titleDot, new LinearLayout.LayoutParams(
+            GameTopDesign.px(activity, GameTopDesign.DOT_HALO),
+            GameTopDesign.px(activity, GameTopDesign.DOT_HALO)));
 
-        title = GameTopUi.text(activity, 15, GameTopUi.INK, true);
+        title = GameTopUi.label(activity, GameTopDesign.TEXT_TITLE, GameTopDesign.INK, true);
         title.setText(t("雀魂助手"));
-        header.addView(title, new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        statePill = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, true);
-        statePill.setGravity(Gravity.CENTER);
-        // 1dp vertical padding: the row is only 28dp tall, so the pill must not add air.
-        statePill.setPadding(dp(activity, 8), dp(activity, 1), dp(activity, 8), dp(activity, 1));
-        statePill.setBackground(GameTopUi.statePill(activity));
-        LinearLayout.LayoutParams pillParams = new LinearLayout.LayoutParams(
+        title.setLetterSpacing(GameTopDesign.LETTER_SPACING);
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        pillParams.leftMargin = dp(activity, 6);
-        header.addView(statePill, pillParams);
+        titleParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.HEADER_GAP);
+        header.addView(title, titleParams);
 
-        // Collapse arrow: a chevron-up path in a 24x26dp target, right of the pill. The
-        // header is 28dp tall, so the box is the tallest thing that still fits it.
-        FrameLayout arrowBox = new FrameLayout(activity);
-        arrowBox.setContentDescription(t("收起面板"));
-        GameTopUi.Glyph arrow = new GameTopUi.Glyph(activity, GameTopUi.ICON_CHEVRON_UP,
-            GameTopUi.INK_MUTED, 16, 1.8f);
-        FrameLayout.LayoutParams arrowParams = new FrameLayout.LayoutParams(
-            dp(activity, 16), dp(activity, 16), Gravity.CENTER);
-        arrowBox.addView(arrow, arrowParams);
-        ripple(arrowBox, GameTopUi.round(activity, 10, 0x00000000, 0, 0));
-        arrowBox.setOnClickListener(view -> collapse());
-        LinearLayout.LayoutParams boxParams = new LinearLayout.LayoutParams(
-            dp(activity, 24), dp(activity, 26));
-        header.addView(arrowBox, boxParams);
-        collapseButton = arrowBox;
+        header.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1f));
+
+        statePill = GameTopUi.label(activity, GameTopDesign.TEXT_PILL,
+            GameTopDesign.AMBER_TEXT, false);
+        statePill.setGravity(Gravity.CENTER);
+        statePill.setPadding(GameTopDesign.px(activity, GameTopDesign.PILL_PAD_H),
+            GameTopDesign.px(activity, GameTopDesign.PILL_PAD_V),
+            GameTopDesign.px(activity, GameTopDesign.PILL_PAD_H),
+            GameTopDesign.px(activity, GameTopDesign.PILL_PAD_V));
+        statePill.setBackground(GameTopUi.statePill(activity));
+        header.addView(statePill, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        chevron = new GameTopUi.Glyph(activity, GameTopUi.ICON_CHEVRON_UP,
+            GameTopDesign.INK_TAB_OFF, GameTopDesign.px(activity, GameTopDesign.CHEVRON),
+            GameTopDesign.pxFloat(activity, 1.8f));
+        LinearLayout.LayoutParams chevronParams = new LinearLayout.LayoutParams(
+            GameTopDesign.px(activity, GameTopDesign.CHEVRON),
+            GameTopDesign.px(activity, GameTopDesign.CHEVRON));
+        chevronParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.CHEVRON_GAP);
+        header.addView(chevron, chevronParams);
         return header;
     }
 
     /**
-     * The two-part tab above the cards: one gold capsule for the selected section, a
-     * quiet card for the other. Both sides share the row's half width, so the hit target
-     * is the full half rather than only the drawn text.
-     *
-     * <p>This row is the ONLY way to switch page: no root-level gesture, no swipe. Each
-     * half is a clickable shell with its own listener (see {@link #bindTab}).
+     * The segmented control of the design: one quiet rounded container, two amber-gradient
+     * halves. Both halves share the row's half width, so the hit target is the full half
+     * rather than only the drawn text, and this row is the ONLY way to switch page: no
+     * root-level gesture, no swipe.
      */
     private LinearLayout buildTabs(Activity activity) {
-        LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setBackground(GameTopUi.round(activity, 11, 0x14000000, 0, 0));
-        // 1dp inset: the tab capsule is the whole band, the row only a hairline frame.
-        row.setPadding(dp(activity, 1), dp(activity, 1), dp(activity, 1), dp(activity, 1));
+        LinearLayout tabs = new LinearLayout(activity);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setGravity(Gravity.CENTER_VERTICAL);
+        tabs.setBackground(GameTopUi.tabBand(activity));
+        int pad = GameTopDesign.px(activity, GameTopDesign.TABS_PAD);
+        tabs.setPadding(pad, pad, pad, pad);
         bindTab(activity, controlTab, TAB_CONTROL);
         bindTab(activity, statusTab, TAB_STATUS);
-        row.addView(controlTab.shell, new LinearLayout.LayoutParams(
+        tabs.addView(controlTab.shell, new LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
         LinearLayout.LayoutParams right = new LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-        right.leftMargin = dp(activity, 2);
-        row.addView(statusTab.shell, right);
-        return row;
+        right.leftMargin = GameTopDesign.px(activity, GameTopDesign.TAB_GAP);
+        tabs.addView(statusTab.shell, right);
+        return tabs;
     }
 
     /**
@@ -1179,16 +1498,15 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      *
      * <p>The shell — not the label, not the root — is the tap target: {@code selectTab}
      * is reached from here and from nowhere else on the touch path, so a swipe, a scroll or
-     * a tap on the cards can never change page.
+     * a tap on the rows can never change page.
      */
     private void bindTab(Activity activity, TabView view, int id) {
         LinearLayout shell = new LinearLayout(activity);
         shell.setOrientation(LinearLayout.HORIZONTAL);
         shell.setGravity(Gravity.CENTER);
-        // 8dp side padding keeps ~110px of half-row to hit; the 60dp minimum is gone
-        // so the two-part tab fits its own band instead of owning a 135px row.
-        shell.setPadding(dp(activity, 8), 0, dp(activity, 8), 0);
-        TextView label = GameTopUi.text(activity, TAB_TEXT_SP, GameTopUi.INK_MUTED, true);
+        shell.setClickable(true);
+        TextView label = GameTopUi.label(activity, GameTopDesign.TEXT_TAB,
+            GameTopDesign.INK_TAB_OFF, true);
         label.setText(id == TAB_CONTROL ? t("控制") : t("状态"));
         label.setGravity(Gravity.CENTER);
         InGameLocalizer.layout(label, 1, InGameLocalizer.Align.CENTER);
@@ -1212,26 +1530,29 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return view;
     }
 
-    /** Page 1: the independent switches the user asked for. */
+    /**
+     * Page 1: the four compact rows of the design — unattended, auto-rematch, recommendation
+     * and opponent names — every one of them a single 84px row with two text lines (title,
+     * then "state + note") and the switch on the right. Four rows plus the chrome are 530 of
+     * the stage's 1080px, so the whole page is on screen without scrolling.
+     */
     private LinearLayout buildControlPage(Activity activity) {
         LinearLayout page = vertical(activity);
 
-        unattendedCard = switchCard(activity, page, t("无人值守"),
-            t("助手服务自动分析并出牌"),
-            () -> onToggle());
+        unattendedCard = switchCard(activity, t("无人值守"),
+            t("助手服务自动分析并出牌"), () -> onToggle(), null);
         unattendedTitle = (TextView) unattendedCard.getTag(TAG_TITLE);
         unattendedState = (TextView) unattendedCard.getTag(TAG_STATE);
         unattendedNote = (TextView) unattendedCard.getTag(TAG_NOTE);
         unattendedSwitch = (GameTopUi.Switch) unattendedCard.getTag(TAG_SWITCH);
-
-        page.addView(spacer(activity, 4));
+        page.addView(unattendedCard, rowBox(activity, 0f));
 
         // Card 2 is the only card with a ⓘ: it is handed to the card builder so the
         // button really exists in the tree before anyone wires it up or reads it back.
         GameTopUi.Glyph info = new GameTopUi.Glyph(activity, GameTopUi.ICON_INFO,
-            GameTopUi.INK_MUTED, 18, 1.6f);
-        rematchCard = switchCard(activity, page, t("自动续打"),
-            t("整场牌局结束后自动继续"),
+            GameTopDesign.INK_TAB_OFF, GameTopDesign.px(activity, GameTopDesign.INFO),
+            GameTopDesign.pxFloat(activity, 1.6f));
+        rematchCard = switchCard(activity, t("自动续打"), t("整场牌局结束后自动继续"),
             () -> onRematchToggle(), info);
         rematchTitle = (TextView) rematchCard.getTag(TAG_TITLE);
         rematchState = (TextView) rematchCard.getTag(TAG_STATE);
@@ -1247,116 +1568,310 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             applyState();
             restartIdleTimer();
         });
-
-        page.addView(spacer(activity, 4));
+        page.addView(rematchCard, rowBox(activity, GameTopDesign.ROW_GAP));
 
         // Click-through fixed panel content: recommendation / honour points. Its own
         // switch, live via `panelSet`; it never closes any other feature.
-        panelCard = switchCard(activity, page, t("推荐与番点"),
-            t("穿透固定面板上的推荐与番点"),
-            () -> onPanelToggle());
+        panelCard = switchCard(activity, t("推荐与番点"), t("穿透固定面板上的推荐与番点"),
+            () -> onPanelToggle(), null);
         panelTitle = (TextView) panelCard.getTag(TAG_TITLE);
         panelState = (TextView) panelCard.getTag(TAG_STATE);
         panelNote = (TextView) panelCard.getTag(TAG_NOTE);
         panelSwitch = (GameTopUi.Switch) panelCard.getTag(TAG_SWITCH);
+        page.addView(panelCard, rowBox(activity, GameTopDesign.ROW_GAP));
+
+        // Card 4: opponent display names — the design's *value row*. It has no switch: the
+        // right-hand side is the current value and a disclosure arrow that opens the
+        // settings inline, so the choice keeps three values without a second screen.
+        namingCard = buildNamingCard(activity);
+        page.addView(namingCard, rowBox(activity, GameTopDesign.ROW_GAP));
         return page;
+    }
+
+    /**
+     * Opponent-naming row: title + note on the first two lines, the current value in a pill
+     * and a "›" on the right. Tapping the row unfolds the settings underneath it — the three
+     * mode cells and, for the custom mode, one editor per seat plus a save row — without
+     * leaving the page and without adding a second screen to go back from.
+     *
+     * <p>The card is a pure view of the shared choice: {@link #paintNaming} writes every value
+     * from the last status reply, and a tap sends the requested value through the UID-checked
+     * provider ({@code namingSet}). The stored value comes back in the reply and is painted the
+     * same way a poll is, so the cells can never show a mode the manager did not save.
+     *
+     * <p>Seat order matches the Rust rewrite: left (kamicha), top (toimen), right (shimocha). A
+     * three-player table has no toimen, so the middle editor is simply unused there.
+     *
+     * <p>Every label is created here and translated in {@link #paintNaming}, so a language
+     * switch repaints this card with the rest of the menu instead of leaving old copy behind.
+     */
+    private LinearLayout buildNamingCard(Activity activity) {
+        LinearLayout card = vertical(activity);
+        // Published before the tree is finished: the painter below reads this field, and it must
+        // never paint a half-built card into a *different* slot.
+        namingCard = card;
+        card.setMinimumHeight(GameTopDesign.px(activity, GameTopDesign.ROW_H));
+        card.setBackground(GameTopUi.row(activity));
+
+        namingRow = new LinearLayout(activity);
+        namingRow.setOrientation(LinearLayout.HORIZONTAL);
+        namingRow.setGravity(Gravity.CENTER_VERTICAL);
+        namingRow.setMinimumHeight(GameTopDesign.px(activity, GameTopDesign.ROW_H));
+        namingRow.setPadding(GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START), 0,
+            GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END), 0);
+        namingRow.setClickable(true);
+        namingRow.setContentDescription(t("对手名称"));
+        // One listener per row: a tap anywhere on it (value, title or arrow) is the same
+        // disclosure. It never writes a preference by itself.
+        namingRow.setOnClickListener(view -> {
+            namingOpen = !namingOpen;
+            applyState();
+            restartIdleTimer();
+        });
+
+        LinearLayout labels = vertical(activity);
+        namingTitle = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_TITLE,
+            GameTopDesign.INK, true);
+        labels.addView(namingTitle);
+
+        LinearLayout line = new LinearLayout(activity);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        namingState = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_OFF, true);
+        line.addView(namingState);
+        namingNote = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_SECONDARY, false);
+        namingNote.setMaxLines(1);
+        namingNote.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams noteParams = new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        noteParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.ROW_GAP);
+        line.addView(namingNote, noteParams);
+        labels.addView(line);
+        namingRow.addView(labels, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        namingValue = GameTopUi.label(activity, GameTopDesign.TEXT_CHIP, GameTopDesign.INK, false);
+        namingValue.setGravity(Gravity.CENTER);
+        namingValue.setPadding(GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_H),
+            GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_V),
+            GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_H),
+            GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_V));
+        namingValue.setBackground(GameTopUi.chip(activity));
+        LinearLayout.LayoutParams valueParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        valueParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.ROW_INNER_GAP);
+        namingRow.addView(namingValue, valueParams);
+
+        namingChevron = new GameTopUi.Glyph(activity, GameTopUi.ICON_CHEVRON_RIGHT,
+            GameTopDesign.INK_OFF, GameTopDesign.px(activity, GameTopDesign.CHEVRON),
+            GameTopDesign.pxFloat(activity, 1.8f));
+        LinearLayout.LayoutParams chevronParams = new LinearLayout.LayoutParams(
+            GameTopDesign.px(activity, GameTopDesign.CHEVRON),
+            GameTopDesign.px(activity, GameTopDesign.CHEVRON));
+        chevronParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.CHEVRON_GAP);
+        namingRow.addView(namingChevron, chevronParams);
+        card.addView(namingRow, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        namingSettings = vertical(activity);
+        int padH = GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START);
+        namingSettings.setPadding(padH, 0, GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END),
+            GameTopDesign.px(activity, GameTopDesign.TABS_MARGIN_BOTTOM));
+
+        namingModes = new LinearLayout(activity);
+        namingModes.setOrientation(LinearLayout.HORIZONTAL);
+        namingModes.setGravity(Gravity.CENTER_VERTICAL);
+        namingModes.setBackground(GameTopUi.tabBand(activity));
+        int cellPad = GameTopDesign.px(activity, GameTopDesign.TABS_PAD);
+        namingModes.setPadding(cellPad, cellPad, cellPad, cellPad);
+        for (int slot = 0; slot < NAMING_MODES.length; slot++) {
+            final OpponentNamingMode mode = NAMING_MODES[slot];
+            TextView option = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+                GameTopDesign.INK_TAB_OFF, true);
+            option.setGravity(Gravity.CENTER);
+            option.setMinHeight(GameTopDesign.px(activity, GameTopDesign.CELL_H));
+            // One listener per cell, created with the cell; a language switch rebuilds the
+            // whole page instead of re-binding, so no listener can stack.
+            option.setOnClickListener(view -> onNamingMode(mode));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+            if (slot > 0) params.leftMargin = GameTopDesign.px(activity, GameTopDesign.TAB_GAP);
+            namingModes.addView(option, params);
+            namingOptions[slot] = option;
+        }
+        namingSettings.addView(namingModes, fixed(activity,
+            GameTopDesign.CELL_H + 2 * GameTopDesign.TABS_PAD));
+
+        namingEditor = vertical(activity);
+        namingEditor.setPadding(0, GameTopDesign.px(activity, GameTopDesign.ROW_GAP), 0, 0);
+        for (int slot = 0; slot < namingInputs.length; slot++) {
+            namingEditor.addView(namingEditorRow(activity, slot),
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    GameTopDesign.px(activity, GameTopDesign.FIELD_H + GameTopDesign.ROW_GAP)));
+        }
+        namingSettings.addView(namingEditor);
+
+        namingSave = GameTopUi.label(activity, GameTopDesign.TEXT_CHIP, GameTopDesign.INK, true);
+        namingSave.setGravity(Gravity.CENTER);
+        namingSave.setBackground(GameTopUi.cell(activity, false));
+        namingSave.setOnClickListener(view -> onNamingSave());
+        namingSettings.addView(namingSave, fixed(activity, GameTopDesign.CELL_H,
+            GameTopDesign.ROW_GAP));
+        card.addView(namingSettings);
+
+        // Paint the fresh tree immediately: the first status reply arrives a moment later, and
+        // an unpainted card would show three empty cells and an empty editor block until then.
+        paintNaming();
+        return card;
+    }
+
+    /**
+     * One labelled editor of the custom block. The editor is a plain single-line text field:
+     * the panel is a child of the game's own decor view, so the system keyboard works exactly
+     * as it does for the game, and the ScrollView above it scrolls the focused field into
+     * view. The label is written in {@link #paintNaming}.
+     */
+    private LinearLayout namingEditorRow(Activity activity, int slot) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView label = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_KEY, false);
+        label.setPadding(0, 0, GameTopDesign.px(activity, GameTopDesign.ROW_INNER_GAP), 0);
+        row.addView(label, new LinearLayout.LayoutParams(
+            GameTopDesign.px(activity, 28 * 2.2f), ViewGroup.LayoutParams.WRAP_CONTENT));
+        EditText input = new EditText(activity);
+        input.setTextSize(GameTopDesign.sp(activity, GameTopDesign.TEXT_ROW_DESC));
+        input.setTextColor(GameTopDesign.INK);
+        input.setSingleLine(true);
+        input.setInputType(InputType.TYPE_CLASS_TEXT);
+        input.setBackground(GameTopUi.field(activity));
+        input.setPadding(GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_H),
+            GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_V),
+            GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_H),
+            GameTopDesign.px(activity, GameTopDesign.CHIP_PAD_V));
+        input.setHint(t("留空保留原名"));
+        namingLabels[slot] = label;
+        LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        inputParams.topMargin = GameTopDesign.px(activity, GameTopDesign.ROW_GAP);
+        row.addView(input, inputParams);
+        // Committing on focus loss is what makes the panel safe to fold away: the poll stops
+        // overwriting a field that still has the finger's focus, and leaving the field saves it.
+        input.setOnFocusChangeListener((view, hasFocus) -> {
+            if (!hasFocus) onNamingSave();
+        });
+        namingInputs[slot] = input;
+        return row;
     }
 
     /**
      * Long explanation of the auto-next-game card, only visible while its ⓘ is open.
      * It is built together with the card (so a language switch rebuilds it too) and is
-     * hidden by {@link #paintSwitches()}, which owns the expanded flag.
+     * hidden by {@link #paintSwitches()}, which owns the expanded flag. The card grows by
+     * this one line while it is open; the row itself keeps its 84px minimum.
      */
     private void addRematchDetail(Activity activity) {
         if (rematchCard == null) return;
-        rematchDetail = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
+        rematchDetail = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_SECONDARY, false);
         rematchDetail.setText(t("只调用游戏的“下一局”原按钮，不伪造请求；未开启时不排队"));
-        rematchDetail.setPadding(dp(activity, 2), dp(activity, 4), dp(activity, 2), 0);
+        rematchDetail.setPadding(GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START),
+            GameTopDesign.px(activity, GameTopDesign.ROW_GAP),
+            GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END),
+            GameTopDesign.px(activity, GameTopDesign.ROW_GAP));
         InGameLocalizer.layout(rematchDetail, 3);
-        rematchDetail.setBackground(GameTopUi.round(activity, 8, 0x14121A2A, 0, 0));
         rematchDetail.setVisibility(View.GONE);
         rematchCard.setTag(TAG_DETAIL, rematchDetail);
         rematchCard.addView(rematchDetail);
     }
 
     /**
-     * One switch card: title, live state, switch on the right, and a note line that
-     * explains why an enabled switch is not acting yet. The state is only ever painted
-     * from the latest provider reply ({@link #applyReply}); taps go through the same
-     * callbacks the old rows used. Padding, type and the switch are a step larger than
-     * the old sidebar layout so the card is comfortable to hit.
+     * One setting row of the design: the title on the first line, the state word and the note
+     * inline on the second, arranged left of the switch. The switch is the only tap target on
+     * the row (the row itself carries no listener), so a tap on the copy can never flip a
+     * feature by accident — the wiring the gesture probe pins.
+     *
+     * <p>The row is {@code ROW_H} design px tall via its minimum, not a fixed height, so the
+     * ⓘ explanation of card 2 can grow it by one line while it is open.
      */
-    private LinearLayout switchCard(Activity activity, LinearLayout page, String titleText,
-                                    String subtitle, Runnable action) {
-        return switchCard(activity, page, titleText, subtitle, action, null);
-    }
-
-    /**
-     * Same card with an optional ⓘ button placed left of the switch. The button is built
-     * here and handed back through {@link #TAG_INFO}, so the caller can never read a slot
-     * that was never written (the crash this overload fixes).
-     */
-    private LinearLayout switchCard(Activity activity, LinearLayout page, String titleText,
+    private LinearLayout switchCard(Activity activity, String titleText,
                                     String subtitle, Runnable action, GameTopUi.Glyph info) {
         LinearLayout card = vertical(activity);
-        card.setPadding(dp(activity, 8), dp(activity, 3), dp(activity, 8), dp(activity, 3));
-        // 34dp pre-scale = ~94px visible on the reporter's device: title + state + one note
-        // line, with the whole card width as the tap target. The old 60dp minimum made
-        // every card 135px tall and pushed two of the three switches out of the first
-        // screenful; the 8dp side padding still gives a wide, comfortable row.
-        card.setMinimumHeight(dp(activity, ROW_DP));
-        ripple(card, GameTopUi.card(activity));
-        card.setClickable(true);
+        // The switch keeps 10px of its own invisible touch padding on each side, so the row
+        // only has to reserve the design's 20px end padding minus that padding.
+        card.setPadding(GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START), 0,
+            GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END
+                - GameTopDesign.TOGGLE_TOUCH_PAD), 0);
+        card.setMinimumHeight(GameTopDesign.px(activity, GameTopDesign.ROW_H));
         card.setContentDescription(titleText);
         // Card labels never toggle a setting; only the right-hand switch does.
+        ripple(card, GameTopUi.row(activity));
 
         LinearLayout top = new LinearLayout(activity);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
 
         LinearLayout labels = vertical(activity);
-        // 15sp title / 12sp state: one notch down from 16/13 so the state line fits the
-        // 34dp card without touching the note, and still comfortably readable at 2.75.
-        TextView titleView = GameTopUi.text(activity, 15, GameTopUi.INK, true);
+        LinearLayout titleLine = new LinearLayout(activity);
+        titleLine.setOrientation(LinearLayout.HORIZONTAL);
+        titleLine.setGravity(Gravity.CENTER_VERTICAL);
+        TextView titleView = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_TITLE,
+            GameTopDesign.INK, true);
         titleView.setText(titleText);
-        labels.addView(titleView);
-        TextView stateView = GameTopUi.text(activity, 12, GameTopUi.INK_MUTED, false);
-        stateView.setText(subtitle);
-        stateView.setPadding(0, dp(activity, 1), 0, 0);
-        labels.addView(stateView);
-        top.addView(labels, new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
+        titleLine.addView(titleView);
         if (info != null) {
-            // The ⓘ sits inside the card but is not part of the card's tap target: it
-            // only opens the explanation, it never flips the switch. 16dp keeps it inside
-            // the 34dp card row.
+            // The ⓘ sits inside the row but is not part of the row's tap target: it only
+            // opens the explanation, it never flips the switch.
             info.setContentDescription(titleText + "说明");
             LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(
-                dp(activity, 22), dp(activity, 26));
-            infoParams.gravity = Gravity.CENTER_VERTICAL;
-            infoParams.leftMargin = dp(activity, 4);
-            top.addView(info, infoParams);
+                GameTopDesign.px(activity, GameTopDesign.INFO),
+                GameTopDesign.px(activity, GameTopDesign.INFO));
+            infoParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.ROW_INNER_GAP);
+            titleLine.addView(info, infoParams);
         }
+        labels.addView(titleLine);
+
+        LinearLayout line = new LinearLayout(activity);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        TextView stateView = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_OFF, true);
+        stateView.setText(subtitle);
+        line.addView(stateView);
+        // The note shares the second line with the state word, exactly like the design's
+        // ".d" line, and is capped at one row with an ellipsis: it answers "what does a tap
+        // do", and a failure notice is what the card has to say right now.
+        TextView note = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_SECONDARY, false);
+        note.setMaxLines(1);
+        note.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams noteParams = new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        noteParams.leftMargin = GameTopDesign.px(activity, GameTopDesign.ROW_GAP);
+        line.addView(note, noteParams);
+        labels.addView(line);
+        top.addView(labels, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         GameTopUi.Switch toggle = new GameTopUi.Switch(activity);
         toggle.setContentDescription(titleText + "开关");
         toggle.setOnClickListener(view -> action.run());
         LinearLayout.LayoutParams switchParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        switchParams.leftMargin = dp(activity, 8);
+            GameTopDesign.px(activity, GameTopDesign.TOGGLE_W
+                + 2 * GameTopDesign.TOGGLE_TOUCH_PAD),
+            GameTopDesign.px(activity, GameTopDesign.ROW_H));
+        switchParams.leftMargin = GameTopDesign.px(activity, Math.max(0,
+            GameTopDesign.ROW_INNER_GAP - GameTopDesign.TOGGLE_TOUCH_PAD));
         top.addView(toggle, switchParams);
-        card.addView(top);
+        card.addView(top, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // One short note line, capped at a single line with an ellipsis: the idle copy
-        // answers "what does a tap do", and a failure notice is what the card has to say
-        // right now. Two lines with 13sp+12sp in a 34dp card would overflow it.
-        TextView note = GameTopUi.text(activity, 11, GameTopUi.INK_MUTED, false);
-        note.setPadding(0, dp(activity, 2), 0, 0);
         InGameLocalizer.layout(titleView, 1);
         InGameLocalizer.layout(stateView, 1);
         InGameLocalizer.layout(note, 1);
-        card.addView(note);
 
         // Filled by buildControlPage right after this call; no resource ids involved.
         // `info` is null for the cards that have no ⓘ; the tag is only written when the
@@ -1366,89 +1881,139 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         card.setTag(TAG_NOTE, note);
         card.setTag(TAG_SWITCH, toggle);
         if (info != null) card.setTag(TAG_INFO, info);
-        page.addView(card);
         return card;
     }
 
+    /** One key/value row of the status page, with its live value view. */
+    private static final class Kv {
+        LinearLayout root;
+        TextView value;
+    }
+
     /**
-     * Page 2: the name row with its state dot over the detail rows, then the manual and
-     * start / stop actions. The details are one short line each; anything longer is the
-     * card's note or the notice, which the control page already shows.
+     * Builds one 64px key/value row: the key at 70% on the left, the value in the design's
+     * strong 26px style on the right. {@code withDot} adds the live state dot to the row that
+     * reports whether the service is really running.
+     */
+    private Kv kvRow(Activity activity, String keyZh, boolean withDot) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setMinimumHeight(GameTopDesign.px(activity, GameTopDesign.ROW_H_STATUS));
+        row.setPadding(GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START), 0,
+            GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END), 0);
+        row.setBackground(GameTopUi.row(activity));
+
+        TextView key = GameTopUi.label(activity, GameTopDesign.TEXT_STATUS_KEY,
+            GameTopDesign.INK_KEY, false);
+        key.setText(t(keyZh));
+        InGameLocalizer.layout(key, 1);
+        row.addView(key, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (withDot) {
+            statusDot = new GameTopUi.StatusDot(activity);
+            LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(
+                GameTopDesign.px(activity, GameTopDesign.DOT_HALO),
+                GameTopDesign.px(activity, GameTopDesign.DOT_HALO));
+            dotParams.rightMargin = GameTopDesign.px(activity, GameTopDesign.ROW_GAP);
+            row.addView(statusDot, dotParams);
+        }
+
+        TextView value = GameTopUi.label(activity, GameTopDesign.TEXT_STATUS_VALUE,
+            GameTopDesign.INK, true);
+        value.setMaxLines(1);
+        value.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        row.addView(value, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Kv kv = new Kv();
+        kv.root = row;
+        kv.value = value;
+        return kv;
+    }
+
+    /**
+     * Page 2: the real polled state as four key/value rows — service, unattended mode,
+     * auto-rematch, recommendation panel — the advice line, and the two actions.
+     *
+     * <p>Nothing here is placeholder copy: every value comes from the last status reply, and a
+     * row always reports what the control actually knows (for example "未启动", never a dash
+     * or a fake number). The design's own status page had five placeholder rows (uptime,
+     * current round, finished games, latency); those numbers do not exist in this module, so
+     * they are not invented here — the rows are the four switches the panel really owns.
      */
     private LinearLayout buildStatusPage(Activity activity) {
         LinearLayout page = vertical(activity);
 
-        LinearLayout card = vertical(activity);
-        card.setPadding(dp(activity, 8), dp(activity, 4), dp(activity, 8), dp(activity, 4));
-        card.setBackground(GameTopUi.card(activity));
-        statusCard = card;
+        Kv service = kvRow(activity, "服务状态", true);
+        statusService = service.value;
+        page.addView(service.root, fixed(activity, GameTopDesign.ROW_H_STATUS));
 
-        LinearLayout nameRow = new LinearLayout(activity);
-        nameRow.setOrientation(LinearLayout.HORIZONTAL);
-        nameRow.setGravity(Gravity.CENTER_VERTICAL);
-        statusDot = GameTopUi.dot(activity, GameTopUi.INK_FAINT);
-        nameRow.addView(statusDot);
-        statusMode = GameTopUi.text(activity, 14, GameTopUi.INK, true);
-        nameRow.addView(statusMode, new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        card.addView(nameRow);
+        Kv mode = kvRow(activity, "无人值守", false);
+        statusMode = mode.value;
+        page.addView(mode.root, fixed(activity, GameTopDesign.ROW_H_STATUS, GameTopDesign.ROW_GAP));
 
-        statusDetail = statusLine(activity, card);
-        statusService = statusLine(activity, card);
-        statusRematch = statusLine(activity, card);
-        InGameLocalizer.layout(statusMode, 3);
-        InGameLocalizer.layout(statusDetail, 3);
-        InGameLocalizer.layout(statusService, 2);
-        InGameLocalizer.layout(statusRematch, 2);
-        page.addView(card);
+        Kv rematchRow = kvRow(activity, "自动下一局", false);
+        statusRematch = rematchRow.value;
+        page.addView(rematchRow.root,
+            fixed(activity, GameTopDesign.ROW_H_STATUS, GameTopDesign.ROW_GAP));
 
-        page.addView(spacer(activity, 8));
+        Kv panelRow = kvRow(activity, "推荐与番点", false);
+        statusPanel = panelRow.value;
+        page.addView(panelRow.root,
+            fixed(activity, GameTopDesign.ROW_H_STATUS, GameTopDesign.ROW_GAP));
 
-        startStop = cell(activity, 14, GameTopUi.INK_ON_GOLD, true);
-        startStop.setMinHeight(dp(activity, TARGET_DP));
-        ripple(startStop, GameTopUi.round(activity, 12, GameTopUi.GOLD, 0, 0));
+        // The advice / notice line: what a tap does, or what just failed. It is a text line,
+        // not a row, so it never pretends to be a key/value pair.
+        statusDetail = statusLine(activity);
+        LinearLayout.LayoutParams detailParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        detailParams.topMargin = GameTopDesign.px(activity, GameTopDesign.ROW_GAP);
+        page.addView(statusDetail, detailParams);
+
+        // The same start/stop action the first card of the control page offers, kept here
+        // because this page is where a user looks when the assistant is not doing anything.
+        startStop = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_TITLE,
+            GameTopDesign.ON_AMBER, true);
+        startStop.setGravity(Gravity.CENTER);
+        startStop.setMinimumHeight(GameTopDesign.px(activity, GameTopDesign.ROW_H));
+        ripple(startStop, GameTopUi.primary(activity));
         startStop.setOnClickListener(view -> onToggle());
         InGameLocalizer.layout(startStop, 2, InGameLocalizer.Align.CENTER);
-        page.addView(startStop, new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        page.addView(startStop, fixed(activity, GameTopDesign.ROW_H, GameTopDesign.ROW_GAP));
 
-        page.addView(spacer(activity, 8));
-
-        manualRow = actionRow(activity, t("打开管理应用"), GameTopUi.GOLD, null);
+        manualRow = actionRow(activity, t("打开管理应用"), GameTopDesign.AMBER_TEXT);
         manualRow.setOnClickListener(view -> openManager());
-        page.addView(manualRow);
+        page.addView(manualRow, fixed(activity, GameTopDesign.ROW_H, GameTopDesign.ROW_GAP));
         return page;
     }
 
-    /** One secondary row of the status card (dot-indented copy, one or two lines). */
-    private TextView statusLine(Activity activity, LinearLayout card) {
-        TextView line = GameTopUi.text(activity, 12, GameTopUi.INK_MUTED, false);
-        line.setPadding(0, dp(activity, 3), 0, 0);
-        card.addView(line);
+    /** The advice line of the status page: one wrapping label, painted by the poll. */
+    private TextView statusLine(Activity activity) {
+        TextView line = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC,
+            GameTopDesign.INK_SECONDARY, false);
+        line.setPadding(GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START), 0,
+            GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END), 0);
         return line;
     }
 
-    private LinearLayout actionRow(Activity activity, String label, int color, String description) {
+    /** One secondary action row of the status page (the hand-off to the manager app). */
+    private LinearLayout actionRow(Activity activity, String label, int color) {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER);
-        // Status-page actions are the primary targets of that page, so they keep the full
-        // 60dp (= 45dp under the finger) instead of the compact card height.
-        row.setMinimumHeight(dp(activity, TARGET_DP));
-        row.setPadding(dp(activity, 10), dp(activity, 6), dp(activity, 10), dp(activity, 6));
-        TextView text = GameTopUi.text(activity, 14, color, true);
+        row.setMinimumHeight(GameTopDesign.px(activity, GameTopDesign.ROW_H));
+        row.setPadding(GameTopDesign.px(activity, GameTopDesign.ROW_PAD_START), 0,
+            GameTopDesign.px(activity, GameTopDesign.ROW_PAD_END), 0);
+        TextView text = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_TITLE, color, true);
         text.setText(label);
         text.setGravity(Gravity.CENTER);
         InGameLocalizer.layout(text, 2, InGameLocalizer.Align.CENTER);
         row.addView(text, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        if (description != null) row.setContentDescription(description);
-        ripple(row, GameTopUi.round(activity, 12, GameTopUi.CARD, GameTopUi.CARD_BORDER, 1));
+        ripple(row, GameTopUi.row(activity));
         return row;
-    }
-
-    private static float screenWidthDp(Context context) {
-        return context.getResources().getDisplayMetrics().widthPixels / GameTopUi.density(context);
     }
 
     private static void setText(TextView view, String text) {
@@ -1480,46 +2045,44 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
         if (!visible) {
             // Nothing may be drawn before the mode is known: hide the whole in-game control
-            // (handle, capsule and menu) and the hint layer, and keep the poll quiet.
+            // (handle and panel) and the hint layer, and keep the poll quiet.
             stopIdleTimer();
             stage = STAGE_HANDLE;
             show(handleTab, false);
-            show(capsule, false);
-            if (menu != null && menu.getParent() instanceof View) show((View) menu.getParent(), false);
+            show(menuHost, false);
             resolveOutsideClick();
             return;
         }
-        boolean menuShown = stage == STAGE_MENU;
-        if (menu != null && menu.getParent() instanceof View) {
-            show((View) menu.getParent(), menuShown);
-        } else {
-            show(menu, menuShown);
-        }
-        show(capsule, stage == STAGE_CAPSULE);
+        // The panel is one view in two states: the collapsed status bar (72px) or the
+        // expanded card. The stage decides which, and setCollapsed() only touches the
+        // geometry when the state or the running animation says so — a poll that arrives
+        // every second never restarts a fold.
+        boolean menuShown = stage != STAGE_HANDLE;
+        show(menuHost, menuShown);
         show(handleTab, stage == STAGE_HANDLE);
-        // The root only accepts an outside tap while the menu is open (see StageRoot).
+        if (menuShown && motion == null && panelCollapsed != (stage != STAGE_MENU)) {
+            setCollapsed(stage != STAGE_MENU, false);
+        }
+        // The root only accepts an outside tap while the panel is expanded (see StageRoot).
         resolveOutsideClick();
-        // Handle and capsule carry the same live dot; paint them even when hidden so the
-        // next reveal is already correct instead of flashing the previous colour.
+        // The handle carries its own live dot; paint it even when hidden so the next reveal
+        // is already correct instead of flashing the previous colour.
         int state = stateColor();
         if (handleTab != null) handleTab.setStateColor(state);
-        if (capsule != null) {
-            capsule.setStateColor(state);
-            capsule.setPhrase(capsuleText());
-        }
         if (menuShown) {
             paintHeader();
             paintTab();
             paintSwitches();
+            paintNaming();
             paintStatusPage();
             paintActions();
         }
         // Polling repaints arrive here every few seconds and deliberately never touch
         // the idle window: only a real interaction (restartIdleTimer) re-arms it, and the
-        // capsule / menu are only entered through those interaction paths.
+        // panel stages are only entered through those interaction paths.
     }
 
-    /** The root is clickable exactly while the open menu is on screen. */
+    /** The root is clickable exactly while the expanded panel is on screen. */
     private void resolveOutsideClick() {
         if (panel == null) return;
         boolean wanted = stage == STAGE_MENU && inGameVisible();
@@ -1553,9 +2116,34 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         tab = wanted;
         restartIdleTimer();
         applyState();
+        fadeActivePage();
     }
 
-    /** Gold capsule for the active tab, quiet card for the other one. */
+    /**
+     * The design's tab switch: the new page fades in over 160ms and rises 6px. Nothing else
+     * moves — the panel keeps its height and the scroll offset of each page is untouched.
+     */
+    private void fadeActivePage() {
+        LinearLayout page = tab == TAB_STATUS ? pageStatus : pageControl;
+        if (page == null) return;
+        if (!GameTopDesign.canAnimate(page)) {
+            page.setAlpha(1f);
+            page.setTranslationY(0f);
+            return;
+        }
+        page.setAlpha(0f);
+        page.setTranslationY(GameTopDesign.px(page.getContext(), 6));
+        GameTopDesign.Motion tabMotion = new GameTopDesign.Motion(page);
+        tabMotion.start(GameTopDesign.MS_TAB_CONTENT, GameTopDesign.EASE_STANDARD, eased -> {
+            page.setAlpha(eased);
+            page.setTranslationY((1f - eased) * GameTopDesign.px(page.getContext(), 6));
+        }, () -> {
+            page.setAlpha(1f);
+            page.setTranslationY(0f);
+        });
+    }
+
+    /** Amber gradient for the active tab, transparent for the other one. */
     private void paintTab() {
         boolean control = tab == TAB_CONTROL;
         styleTab(controlTab, control);
@@ -1566,13 +2154,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
     private static void styleTab(TabView view, boolean selected) {
         if (!view.bound()) return;
-        view.shell.setBackground(selected ? GameTopUi.accentPill(view.shell.getContext())
-            : GameTopUi.quietPill(view.shell.getContext()));
-        int color = selected ? GameTopUi.INK_ON_GOLD : GameTopUi.INK_MUTED;
+        Context context = view.shell.getContext();
+        view.shell.setBackground(selected ? GameTopUi.tabActive(context)
+            : GameTopUi.tabIdle(context));
+        int color = selected ? GameTopDesign.ON_AMBER : GameTopDesign.INK_TAB_OFF;
         if (view.label.getCurrentTextColor() != color) view.label.setTextColor(color);
     }
 
-    /** Live state colour shared by the handle, the capsule and the header. */
+    /** Live state colour of the *handle*, which keeps the shipped palette. */
     private int stateColor() {
         if (starting) return GameTopUi.STATE_AMBER;
         if (enabled) return GameTopUi.STATE_GREEN;
@@ -1583,9 +2172,23 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     /**
+     * The same state, in the design's own palette (mint for running, amber for pending, the
+     * shared red for failures). The handle keeps {@link #stateColor()}: it is the one surface
+     * the redesign does not touch, so its dot stays the green it has always been.
+     */
+    private int panelStateColor() {
+        if (starting) return GameTopDesign.AMBER_TEXT;
+        if (enabled) return GameTopDesign.MINT;
+        if (available) return GameTopDesign.AMBER_TEXT;
+        if (demo) return GameTopDesign.AMBER_TEXT;
+        if (unreachable) return GameTopDesign.DANGER;
+        return GameTopDesign.INK_OFF;
+    }
+
+    /**
      * True when the assistant is really running: the manager says unattended mode is on,
      * or its service answered but the mode is off. A start sequence is not "running" yet —
-     * the capsule says "starting" for that.
+     * the pill says "starting" for that.
      */
     private boolean runningNow() {
         // A running service that still reports a self-test is not "running" for the user:
@@ -1593,31 +2196,35 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return enabled || (available && !demo && !starting);
     }
 
-    /** The short phrase of the capsule; never truncated, the capsule grows instead. */
-    private String capsuleText() {
-        if (starting) return t("启动中");
-        if (enabled && !available) return t("启动中");
-        if (runningNow()) return t("助手运行中");
-        return t("助手未开启");
-    }
-
-    /** Header: the state dot and the run-state pill (the name is static copy). */
+    /**
+     * Header: the live state dot, the run-state pill and the fold chevron. The pill is the
+     * only run-state copy of the surface, so the collapsed bar and the expanded panel say
+     * exactly the same thing about the same state.
+     */
     private void paintHeader() {
-        GameTopUi.setDotColor(titleDot, stateColor());
-        String pill;
-        if (starting) pill = t("启动中");
-        else if (enabled) pill = t("无人值守中");
-        else if (available && !demo) pill = t("待机");
-        else if (demo) pill = t("自检中");
-        else if (unreachable) pill = t("服务未连接");
-        else pill = t("未开启");
+        if (titleDot != null) titleDot.setColor(panelStateColor());
+        String pill = statePillText();
         setText(statePill, pill);
         if (statePill != null) {
-            boolean gold = !starting && enabled;
-            statePill.setTextColor(gold ? GameTopUi.GOLD : GameTopUi.INK_MUTED);
+            boolean live = !starting && enabled;
+            statePill.setTextColor(live ? GameTopDesign.AMBER_TEXT : GameTopDesign.INK_TAB_OFF);
             statePill.setBackground(GameTopUi.statePill(statePill.getContext()));
         }
         InGameLocalizer.layout(statePill, 1, InGameLocalizer.Align.CENTER);
+        if (chevron != null) {
+            chevron.setRotation(panelCollapsed ? 180f : 0f);
+        }
+        setDescription(headerRow, t(panelCollapsed ? "展开雀魂助手" : "收起面板"));
+    }
+
+    /** The short run-state word of the header pill; never truncated, the pill grows. */
+    private String statePillText() {
+        if (starting) return t("启动中");
+        if (enabled) return t("无人值守中");
+        if (available && !demo) return t("待机");
+        if (demo) return t("自检中");
+        if (unreachable) return t("服务未连接");
+        return t("未开启");
     }
 
     /** Live card values: state words, switches, notes and the ⓘ of card 2. */
@@ -1630,8 +2237,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
         setCardText(unattendedCard, TAG_STATE, unattendedState, unattendedStateText());
         setText(unattendedNote, unattendedNoteText());
+        if (unattendedState != null) {
+            unattendedState.setTextColor(starting || enabled ? runningNow()
+                ? GameTopDesign.MINT : GameTopDesign.AMBER_TEXT : GameTopDesign.INK_OFF);
+        }
         int unattendedTone = noticeFailed && noticeRefersToUnattended()
-            ? GameTopUi.DANGER : GameTopUi.INK_MUTED;
+            ? GameTopDesign.DANGER : GameTopDesign.INK_SECONDARY;
         if (unattendedNote != null) unattendedNote.setTextColor(unattendedTone);
         if (unattendedInfo != null) show(unattendedInfo, false);
 
@@ -1643,16 +2254,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
         setCardText(rematchCard, TAG_STATE, rematchState, rematch ? t("已开启") : t("已关闭"));
         if (rematchState != null) {
-            rematchState.setTextColor(rematchActive ? GameTopUi.GOLD
-                : rematch ? GameTopUi.INK : GameTopUi.INK_FAINT);
+            rematchState.setTextColor(rematch ? GameTopDesign.AMBER_TEXT : GameTopDesign.INK_OFF);
         }
         setText(rematchNote, rematchNoteText());
         if (rematchNote != null) {
             rematchNote.setTextColor(panelNoticeFailed()
-                ? GameTopUi.DANGER : GameTopUi.INK_MUTED);
+                ? GameTopDesign.DANGER : GameTopDesign.INK_SECONDARY);
         }
         if (rematchInfo != null) {
-            rematchInfo.setColor(rematchDetailOpen ? GameTopUi.GOLD : GameTopUi.INK_MUTED);
+            rematchInfo.setColor(rematchDetailOpen ? GameTopDesign.AMBER_TEXT
+                : GameTopDesign.INK_TAB_OFF);
         }
         if (rematchDetail != null) show(rematchDetail, rematchDetailOpen);
 
@@ -1666,17 +2277,149 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         setCardText(panelCard, TAG_STATE, panelState,
             recommendationPanel ? t("已开启") : t("已关闭"));
         if (panelState != null) {
-            panelState.setTextColor(recommendationPanel ? GameTopUi.GOLD : GameTopUi.INK_FAINT);
+            panelState.setTextColor(recommendationPanel ? GameTopDesign.AMBER_TEXT
+                : GameTopDesign.INK_OFF);
         }
         setText(panelNote, panelNoteText());
         if (panelNote != null) {
-            panelNote.setTextColor(panelNoticeFailed() ? GameTopUi.DANGER : GameTopUi.INK_MUTED);
+            panelNote.setTextColor(panelNoticeFailed() ? GameTopDesign.DANGER
+                : GameTopDesign.INK_SECONDARY);
         }
+    }
+
+    /**
+     * Live values of card 4: the value pill, the state word, the three cells, the custom
+     * editors and the note.
+     *
+     * Called from [applyState] on every pass, so a new reply, a language switch and the first
+     * paint after a rebuild all land here and no other method has to remember this card.
+     *
+     * <p>A field that still has the focus is never rewritten: the poll arrives every second
+     * while the user types, and painting the stored value over a half-typed label would delete
+     * it. Leaving the field saves it (the focus listener), and the reply then repaints it.
+     */
+    private void paintNaming() {
+        if (namingCard == null) return;
+        setText(namingTitle, t("对手名称"));
+        InGameLocalizer.layout(namingTitle, 1);
+        setText(namingState, namingStateText());
+        if (namingState != null) {
+            namingState.setTextColor(namingNoticeFailed ? GameTopDesign.DANGER
+                : namingBusy.get() ? GameTopDesign.INK_OFF : GameTopDesign.AMBER_TEXT);
+            InGameLocalizer.layout(namingState, 1);
+        }
+        setText(namingValue, namingValueText());
+        if (namingValue != null) InGameLocalizer.layout(namingValue, 1);
+        if (namingChevron != null) namingChevron.setRotation(namingOpen ? 90f : 0f);
+        for (int slot = 0; slot < namingOptions.length; slot++) {
+            TextView option = namingOptions[slot];
+            if (option == null) continue;
+            boolean selected = NAMING_MODES[slot] == naming.getMode();
+            String label = namingOptionText(NAMING_MODES[slot]);
+            setText(option, label);
+            option.setTextColor(selected ? GameTopDesign.ON_AMBER : GameTopDesign.INK_TAB_OFF);
+            // A fresh RippleDrawable on every pass (this runs once per poll) is pure garbage;
+            // the cell only has to change when the selection does.
+            Object painted = option.getTag(TAG_NAMING_SELECTED);
+            if (!(painted instanceof Boolean) || ((Boolean) painted) != selected) {
+                GameTopUi.pressable(option, GameTopUi.cell(option.getContext(), selected));
+                option.setTag(TAG_NAMING_SELECTED, selected);
+            }
+            setDescription(option, label);
+            InGameLocalizer.layout(option, 1, InGameLocalizer.Align.CENTER);
+        }
+        boolean custom = naming.getMode() == OpponentNamingMode.CUSTOM;
+        show(namingEditor, custom);
+        show(namingSave, custom);
+        setText(namingSave, t("保存名称"));
+        if (namingSave != null) {
+            namingSave.setTextColor(namingBusy.get() ? GameTopDesign.INK_OFF : GameTopDesign.INK);
+            setDescription(namingSave, t("保存名称"));
+            InGameLocalizer.layout(namingSave, 1, InGameLocalizer.Align.CENTER);
+        }
+        show(namingSettings, namingOpen);
+        if (namingRow != null) {
+            // The row keeps its 84px minimum and its whole width is the disclosure target:
+            // a tap anywhere except the settings below opens or closes them.
+            setDescription(namingRow, t("对手名称") + " · " + t(namingOpen ? "收起" : "设置"));
+        }
+        if (custom && namingOpen) {
+            for (int slot = 0; slot < namingInputs.length; slot++) {
+                TextView label = namingLabels[slot];
+                setText(label, namingSlotText(slot));
+                if (label != null) InGameLocalizer.layout(label, 1);
+                EditText input = namingInputs[slot];
+                if (input == null) continue;
+                if (input.hasFocus()) continue;
+                String stored = naming.nameAt(slot);
+                if (!stored.contentEquals(input.getText())) input.setText(stored);
+            }
+        }
+        setText(namingNote, namingNoteText());
+        if (namingNote != null) {
+            namingNote.setTextColor(namingNoticeFailed ? GameTopDesign.DANGER
+                : GameTopDesign.INK_SECONDARY);
+            InGameLocalizer.layout(namingNote, 1);
+        }
+        setDescription(namingCard, t("对手名称"));
+    }
+
+    /** Short mode word in the card's state line. */
+    private String namingStateText() {
+        if (naming.getMode() == OpponentNamingMode.ABC) return t("预设昵称");
+        if (naming.getMode() == OpponentNamingMode.CUSTOM) return t("自定义");
+        return t("正常显示");
+    }
+
+    /**
+     * The value pill of the naming row: the current choice, or the three names themselves
+     * while the custom mode is active — that is the design's "A·B·C" pill, and it is the only
+     * place the three labels are visible while the settings are folded.
+     */
+    private String namingValueText() {
+        if (naming.getMode() == OpponentNamingMode.ABC) return t("预设昵称");
+        if (naming.getMode() != OpponentNamingMode.CUSTOM) return t("正常");
+        StringBuilder joined = new StringBuilder();
+        for (int slot = 0; slot < 3; slot++) {
+            String name = naming.nameAt(slot);
+            if (name == null || name.isEmpty()) continue;
+            if (joined.length() > 0) joined.append('·');
+            joined.append(name);
+        }
+        return joined.length() == 0 ? t("自定义") : clip(joined.toString(), 12);
+    }
+
+    /** Copy of one segmented cell. */
+    private String namingOptionText(OpponentNamingMode mode) {
+        if (mode == OpponentNamingMode.ABC) return t("预设昵称");
+        if (mode == OpponentNamingMode.CUSTOM) return t("自定义");
+        return t("正常");
+    }
+
+    /** Seat name of one editor, in the same order the Rust rewrite uses. */
+    private String namingSlotText(int slot) {
+        if (slot == 1) return t("对家");
+        if (slot == 2) return t("右家");
+        return t("左家");
+    }
+
+    /**
+     * Note line of card 4: a failure or confirmation first, otherwise what the selected mode
+     * does. The copy promises the current table because the in-game Lua layer
+     * (MajsoulMaxNaming.lua) renames the seats of the table on screen and redraws it once the
+     * stored choice changes; the `authGame` rewrite only covers the next one.
+     */
+    private String namingNoteText() {
+        if (!namingNoticeKey.isEmpty()) return t(namingNoticeKey);
+        if (naming.getMode() == OpponentNamingMode.ABC) return t("三位对手显示预设昵称 · 当前牌桌立即生效");
+        if (naming.getMode() == OpponentNamingMode.CUSTOM) return t("留空的一席保留原名 · 当前牌桌立即生效");
+        return t("保留对手原名 · 当前牌桌立即生效");
     }
 
     /** True when the last failed notice came from the unattended path. */
     private boolean noticeRefersToUnattended() {
-        return noticeKey.contains("无人值守") || noticeKey.contains("启动") || noticeKey.contains("管理应用");
+        return noticeKey.contains("无人值守") || noticeKey.contains("启动")
+            || noticeKey.contains("管理应用");
     }
 
     /** True when the last failed notice came from the panel (recommendation) path. */
@@ -1684,18 +2427,37 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return noticeFailed && noticeKey.contains("面板");
     }
 
+    /**
+     * Page 2 values. Every row is a fact from the last status reply; the advice line under
+     * them carries the notice, the overlay error or what a tap will do.
+     */
     private void paintStatusPage() {
-        if (statusMode == null) return;
-        GameTopUi.setDotColor(statusDot, stateColor());
-        setText(statusMode, modeText());
+        if (statusService == null) return;
+        if (statusDot != null) {
+            statusDot.setColor(panelStateColor());
+            show(statusDot, runningNow() || starting);
+        }
+        setText(statusService, serviceValueText());
+        if (statusService != null) {
+            statusService.setTextColor(runningNow() ? GameTopDesign.MINT : GameTopDesign.INK);
+        }
+        setText(statusMode, unattendedStateText());
         if (statusMode != null) {
-            statusMode.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.INK);
+            statusMode.setTextColor(enabled ? GameTopDesign.AMBER_TEXT : GameTopDesign.INK_OFF);
+        }
+        setText(statusRematch, rematchValueText());
+        if (statusRematch != null) {
+            statusRematch.setTextColor(rematch ? GameTopDesign.AMBER_TEXT : GameTopDesign.INK_OFF);
+        }
+        setText(statusPanel, recommendationPanel ? t("已开启") : t("已关闭"));
+        if (statusPanel != null) {
+            statusPanel.setTextColor(recommendationPanel ? GameTopDesign.AMBER_TEXT
+                : GameTopDesign.INK_OFF);
         }
         setText(statusDetail, detailText());
-        setText(statusService, serviceText());
-        setText(statusRematch, rematchText());
-        if (statusRematch != null) {
-            statusRematch.setTextColor(rematchActive ? GameTopUi.GOLD : GameTopUi.INK_MUTED);
+        if (statusDetail != null) {
+            statusDetail.setTextColor(noticeFailed ? GameTopDesign.DANGER
+                : GameTopDesign.INK_SECONDARY);
         }
     }
 
@@ -1703,8 +2465,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         if (startStop != null) {
             setText(startStop, toggleText());
             startStop.setAlpha(starting ? .55f : 1f);
-            startStop.setBackground(GameTopUi.round(startStop.getContext(), 12,
-                starting ? 0xFF8A6A32 : GameTopUi.GOLD, 0, 0));
+            startStop.setTextColor(GameTopDesign.ON_AMBER);
         }
         String manualText = manualText();
         if (manualRow != null) {
@@ -1713,12 +2474,13 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
             if (manualRow.getChildCount() > 0 && manualRow.getChildAt(0) instanceof TextView) {
                 TextView label = (TextView) manualRow.getChildAt(0);
                 setText(label, manualText == null ? t("打开管理应用") : manualText);
-                label.setTextColor(noticeFailed ? GameTopUi.DANGER : GameTopUi.GOLD);
+                label.setTextColor(noticeFailed ? GameTopDesign.DANGER
+                    : GameTopDesign.AMBER_TEXT);
             }
         }
-        if (collapseButton != null) setDescription(collapseButton, t("收起面板"));
+        if (headerRow != null) setDescription(headerRow,
+            t(panelCollapsed ? "展开雀魂助手" : "收起面板"));
     }
-
     private String unattendedStateText() {
         if (starting) return t("启动中…");
         if (enabled) return t("运行中");
@@ -1755,7 +2517,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         return t("已隐藏建议牌与番点");
     }
 
-    private String serviceText() {
+    /**
+     * Value of the status page's service row. The full phrases of the previous build
+     * ("前台服务 · 运行中") are kept verbatim as the row value, so the copy stays translated in
+     * every language while the key is the row's own label.
+     */
+    private String serviceValueText() {
         if (unreachable) return managerMissing ? t("管理应用 · 未安装") : t("管理应用 · 无响应");
         if (!available && demo) return t("前台服务 · 自检中");
         if (!available) return t("前台服务 · 未运行");
@@ -1791,17 +2558,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     }
 
     /**
-     * Full auto-rematch line for the status page; the switch card shows the same
-     * facts split over its state and note lines.
+     * Value of the status page's auto-rematch row: the state word and, in brackets, the same
+     * caveat the switch card's note line shows. The row's key is "自动下一局", so the value no
+     * longer repeats it.
      */
-    private String rematchText() {
+    private String rematchValueText() {
         String state = rematch ? t("开") : t("关");
         String note;
         if (demo && rematch) note = t("自检中不生效");
         else if (rematch && !rematchActive) note = t("待条件满足");
         else if (rematch) note = t("仅按下一局原按钮");
         else note = t("点按开启");
-        return t("自动下一局 · ") + state + "（" + note + "）";
+        return state + "（" + note + "）";
     }
 
     private String detailText() {
@@ -1842,12 +2610,18 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         parent.removeView(panel);
         panel = null;
         handleTab = null;
-        capsule = null;
+        if (motion != null) motion.cancel();
+        motion = null;
         menu = null;
+        menuHost = null;
+        headerRow = null;
+        body = null;
+        band = null;
+        pages = null;
         title = null;
         titleDot = null;
         statePill = null;
-        collapseButton = null;
+        chevron = null;
         controlTab.unbind();
         statusTab.unbind();
         pageControl = pageStatus = null;
@@ -1863,9 +2637,9 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         panelCard = null;
         panelTitle = panelState = panelNote = null;
         panelSwitch = null;
-        statusCard = null;
+        releaseNamingViews();
         statusDot = null;
-        statusMode = statusDetail = statusService = statusRematch = null;
+        statusMode = statusDetail = statusService = statusRematch = statusPanel = null;
         startStop = null;
         manualRow = null;
 
@@ -1968,7 +2742,12 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
 
         setText(title, t("雀魂助手"));
         InGameLocalizer.layout(title, 1);
-        if (collapseButton != null) setDescription(collapseButton, t("收起面板"));
+        if (headerRow != null) {
+            setDescription(headerRow, t(panelCollapsed ? "展开雀魂助手" : "收起面板"));
+        }
+        if (chevron != null) chevron.setColor(GameTopDesign.INK_TAB_OFF);
+        if (namingChevron != null) namingChevron.setColor(GameTopDesign.INK_OFF);
+        if (titleDot != null) titleDot.setColor(panelStateColor());
 
         // The hand-off row only names its static label while it has no live label of its
         // own; [paintActions] owns it otherwise.
@@ -1978,15 +2757,16 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         InGameLocalizer.layout(rematchDetail, 4);
 
         if (handleTab != null) setDescription(handleTab, t("展开雀魂助手"));
-        if (capsule != null) setDescription(capsule, t("打开雀魂助手菜单"));
 
         InGameLocalizer.layout(unattendedNote, 1);
         InGameLocalizer.layout(rematchNote, 1);
         InGameLocalizer.layout(panelNote, 1);
-        InGameLocalizer.layout(statusMode, 3);
+        InGameLocalizer.layout(namingNote, 1);
+        InGameLocalizer.layout(statusMode, 1);
+        InGameLocalizer.layout(statusService, 1);
+        InGameLocalizer.layout(statusRematch, 1);
+        InGameLocalizer.layout(statusPanel, 1);
         InGameLocalizer.layout(statusDetail, 3);
-        InGameLocalizer.layout(statusService, 2);
-        InGameLocalizer.layout(statusRematch, 2);
         InGameLocalizer.layout(startStop, 2, InGameLocalizer.Align.CENTER);
         InGameLocalizer.layout(statePill, 1, InGameLocalizer.Align.CENTER);
     }
@@ -2163,6 +2943,77 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         });
     }
 
+    /**
+     * Runtime switch of the opponent-naming mode.
+     *
+     * It sends only the requested mode: the three labels belong to the stored choice and are
+     * left untouched, so switching back to "custom" restores exactly the labels the user typed
+     * in either surface. The reply is applied like a poll, so a write the manager did not store
+     * is reported instead of leaving a cell selected that the modder will never use.
+     */
+    private void onNamingMode(OpponentNamingMode mode) {
+        if (namingBusy.get() || mode == naming.getMode()) return;
+        namingBusy.set(true);
+        namingNoticeKey = "";
+        namingNoticeFailed = false;
+        applyState();
+        restartIdleTimer();
+        Bundle args = new Bundle();
+        args.putString("mode", mode.getWire());
+        call("namingSet", args, REQUEST_TIMEOUT_MS, reply -> {
+            namingBusy.set(false);
+            if (reply == null) {
+                namingNoticeFailed = true;
+                namingNoticeKey = "管理应用无响应 · 名称模式未保存";
+            } else {
+                applyReply(reply);
+                namingNoticeFailed = naming.getMode() != mode;
+                namingNoticeKey = namingNoticeFailed ? "名称模式未保存" : "";
+            }
+            applyState();
+            schedulePoll(POLL_MENU_MS);
+        });
+    }
+
+    /**
+     * Saves the three custom labels (focus loss, or an explicit tap on the save row).
+     *
+     * The write also selects the custom mode: the editors only exist while it is selected, and
+     * storing labels that are then never used would be a lie to the user. An unchanged set is
+     * skipped, so simply folding the panel never issues a write.
+     */
+    private void onNamingSave() {
+        if (namingBusy.get() || namingCard == null) return;
+        String[] names = new String[namingInputs.length];
+        boolean unchanged = naming.getMode() == OpponentNamingMode.CUSTOM;
+        for (int slot = 0; slot < names.length; slot++) {
+            EditText input = namingInputs[slot];
+            names[slot] = input == null ? "" : String.valueOf(input.getText());
+            if (!names[slot].equals(naming.nameAt(slot))) unchanged = false;
+        }
+        if (unchanged) return;
+        namingBusy.set(true);
+        namingNoticeKey = "";
+        namingNoticeFailed = false;
+        applyState();
+        Bundle args = new Bundle();
+        args.putString("mode", OpponentNamingMode.CUSTOM.getWire());
+        args.putStringArray("names", names);
+        call("namingSet", args, REQUEST_TIMEOUT_MS, reply -> {
+            namingBusy.set(false);
+            if (reply == null) {
+                namingNoticeFailed = true;
+                namingNoticeKey = "管理应用无响应 · 自定义名称未保存";
+            } else {
+                applyReply(reply);
+                namingNoticeKey = "自定义名称已保存 · 当前牌桌立即生效";
+                namingNoticeFailed = false;
+            }
+            applyState();
+            schedulePoll(POLL_MENU_MS);
+        });
+    }
+
     private void disable() {
         if (!actionBusy.compareAndSet(false, true)) return;
         setNotice("正在关闭无人值守…");
@@ -2308,6 +3159,11 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         rematchActive = reply.getBoolean("rematchActive", false);
         // Persisted click-through panel opt-in; defaults to on like the manager side.
         recommendationPanel = reply.getBoolean("recommendationPanel", recommendationPanel);
+        // Shared opponent-naming choice. A reply without the key (an older manager, a partial
+        // reply) keeps the current value, exactly like `rematch` above, so a provider hiccup
+        // can never flip the card back to "normal" behind the user's back.
+        String namingWire = reply.getString("naming");
+        if (namingWire != null) naming = OpponentNaming.decode(namingWire);
         unreachable = false;
         managerMissing = false;
     }

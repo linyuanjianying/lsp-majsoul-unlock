@@ -58,6 +58,7 @@ rm -rf "$OUT/kotlin" && mkdir -p "$OUT/kotlin"
   -no-stdlib -classpath "$OUT/shim:$STDLIB:$ANDROID_JAR${JSON:+:$JSON}" \
   -jvm-target 21 -nowarn -d "$OUT/kotlin" \
   "$SRC/helper/InGameLocalizer.kt" \
+  "$SRC/manager/OpponentNaming.kt" \
   "$PROJ/tools/tests/jvm-shims/support/com/yefeng/majmax/hookprobe/helper/GameMenuText.kt" \
   "$PROJ/tools/tests/jvm-shims/support/com/yefeng/majmax/hookprobe/manager/ManagerLanguage.kt" \
   "$PROJ/tools/tests/jvm-shims/support/com/yefeng/majmax/hookprobe/manager/AssistLaunch.kt" \
@@ -70,7 +71,7 @@ CLASSPATH_PROD="$OUT/kotlin:$OUT/shim:$STDLIB"
 [ -n "$JSON" ] && CLASSPATH_PROD="$CLASSPATH_PROD:$JSON"
 "$JAVAC" -nowarn -source 21 -target 21 -encoding UTF-8 -proc:none \
   -d "$OUT/classes" -cp "$CLASSPATH_PROD" \
-  "$SRC/GameTopControl.java" "$SRC/GameTopUi.java" \
+  "$SRC/GameTopControl.java" "$SRC/GameTopUi.java" "$SRC/GameTopDesign.java" \
   "$SRC/GameDisplayGate.java" "$SRC/HookDiagnostics.java"
 
 echo "== 4/5 probe =="

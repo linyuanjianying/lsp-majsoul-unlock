@@ -2,6 +2,7 @@ package com.yefeng.majmax.hookprobe;
 
 import android.content.Context;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.net.Uri;
 import android.util.Log;
 
@@ -22,6 +23,7 @@ import java.util.zip.ZipFile;
 import org.json.JSONObject;
 import com.yefeng.majmax.hookprobe.catalog.UnlockCatalogData;
 import com.yefeng.majmax.hookprobe.catalog.UnlockCatalogInstaller;
+import com.yefeng.majmax.hookprobe.manager.OpponentNaming;
 
 import io.github.libxposed.api.XposedModule;
 
@@ -32,7 +34,8 @@ public final class ProbeModule extends XposedModule {
     private static final Uri AI_ENDPOINT_URI = Uri.parse(
             "content://com.yefeng.majmax.hookprobe.ai/capture");
     private static final String[] VERSIONED_ASSETS = {
-            "ui/MajsoulMaxSettings.lua", "ui/MajsoulMaxAutoDiscard.lua"
+            "ui/MajsoulMaxSettings.lua", "ui/MajsoulMaxAutoDiscard.lua",
+            "ui/MajsoulMaxNaming.lua"
     };
 
     /** Read shipped bytes from the APK, not LSPosed's asset-blind class loader. */
@@ -61,6 +64,21 @@ public final class ProbeModule extends XposedModule {
             });
     private static volatile int aiEndpointPort;
     private static volatile byte[] aiEndpointToken = new byte[0];
+    /**
+     * Minimum spacing of the opponent-naming poll. The value only changes when a user taps a
+     * control, so one read per second is enough to hand an edit to the modder (the in-game Lua
+     * layer then redraws the table on screen), and it keeps the 250 ms endpoint loop's binder
+     * traffic unchanged.
+     */
+    private static final long NAMING_POLL_MS = 1_000L;
+    private static long namingCheckedAt;
+    /**
+     * The last choice successfully handed to the modder, as the provider's wire string. Only a
+     * value that actually differs is applied: `majmax_modder_update_settings` rewrites
+     * `settings.mod.json`, and the poll (or a second surface) must not rewrite it once per
+     * second. Volatile because the endpoint executor is the only writer and diagnostics read it.
+     */
+    private static volatile String appliedNaming = "";
     private boolean targetProcess;
     private static final AtomicBoolean TOP_CONTROL_REGISTERED = new AtomicBoolean();
 
@@ -68,6 +86,14 @@ public final class ProbeModule extends XposedModule {
     private static native void nativeCaptureEndpoint(int port, byte[] token);
     private static native void nativeAutoCommand(String command, long generation, long connection, long sequence);
     private static native String nativeAutoResults();
+    /**
+     * Applies one camelCase `SettingsPatch` (only the opponent-naming fields are ever sent) to
+     * the Rust modder and returns its status code: 0 = applied and persisted, 1 = the modder is
+     * not configured yet, negative = rejected. The modder keeps the value in memory and writes
+     * `settings.mod.json` atomically, so the next `authGame` response already uses it and the
+     * in-game display refresh (which polls the same snapshot) sees the new choice.
+     */
+    private static native int nativeApplyNaming(byte[] patch);
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
@@ -229,6 +255,9 @@ public final class ProbeModule extends XposedModule {
         if (!AI_ENDPOINT_POLLING.compareAndSet(false, true)) return;
         AI_ENDPOINT_EXECUTOR.scheduleWithFixedDelay(() -> {
             try {
+                // The opponent-naming choice is independent of capture, so it is synced
+                // first: a game with no AI endpoint still honours the shared setting.
+                syncOpponentNaming(gameContext);
                 Bundle endpoint = gameContext.getContentResolver().call(
                         AI_ENDPOINT_URI, "endpoint", null, null);
                 int port = endpoint == null ? 0 : endpoint.getInt("port", 0);
@@ -277,6 +306,57 @@ public final class ProbeModule extends XposedModule {
                 }
             }
         }, 0, 250, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Hands the shared opponent-naming choice to the Rust modder.
+     *
+     * The choice is owned by the manager process ([com.yefeng.majmax.hookprobe.manager
+     * .OpponentNamingSettings]) because both surfaces have to agree on one value: the in-game
+     * control writes it through the provider, and the floating window — which runs in the
+     * manager process — writes it directly. This process is the only one that holds the
+     * modder, so it is also the only one that can apply the value, and it does so from the
+     * endpoint loop that already runs for the whole life of the game.
+     *
+     * Semantics that matter here:
+     *
+     *  - A missing manager (no app installed, revoked URI grant, manager killed between two
+     *    polls) is *not* an error: the modder keeps whatever it already has, exactly like the
+     *    unlock catalog keeps its last good copy.
+     *  - Only a changed value is written, so the file is not rewritten once per second.
+     *  - The very first successful read is always applied, even when it says `normal`: that is
+     *    what makes the manager-side store the single source of truth instead of letting a
+     *    value written by another build survive forever in `settings.mod.json`.
+     *  - A rejected patch (status != 0) is not remembered, so the next poll retries once the
+     *    modder is configured; a rejected value can never be mistaken for an applied one.
+     */
+    private static void syncOpponentNaming(Context context) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - namingCheckedAt < NAMING_POLL_MS) return;
+        namingCheckedAt = now;
+        String wire;
+        try {
+            Bundle reply = context.getContentResolver().call(AI_ENDPOINT_URI, "namingGet", null, null);
+            wire = reply == null ? null : reply.getString("naming");
+        } catch (Throwable missing) {
+            return;
+        }
+        String patch = OpponentNaming.patchForWire(wire);
+        if (patch == null || wire == null || wire.equals(appliedNaming)) return;
+        int status;
+        try {
+            status = nativeApplyNaming(patch.getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable unavailable) {
+            // The native library is not loaded (module disabled or wrong process); nothing to do.
+            return;
+        }
+        if (status != 0) {
+            Log.w(TAG, "Opponent naming patch rejected: status=" + status);
+            return;
+        }
+        appliedNaming = wire;
+        HookDiagnostics.event("INFO", "hook.naming", "NAMING_APPLIED",
+                HookDiagnostics.fields("mode", OpponentNaming.modeOf(wire), "slots", OpponentNaming.slotsOf(wire)));
     }
 
     private static void copyAsset(ZipFile moduleApk, String name, File directory,

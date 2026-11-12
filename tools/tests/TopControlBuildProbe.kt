@@ -221,7 +221,45 @@ fun main() {
         check("$name was created", privateField(control, name) != null)
     }
 
-    // ---- 7. failures were recorded, never thrown out of build -----------------
+    // ---- 7. the opponent-naming card is built, populated and wired -------------
+    // Card 4 is the runtime selector of the naming modes (normal / preset names / custom). It has no
+    // switch: the three cells are the controls, and the three editors only exist while custom
+    // is selected. The probe proves the whole tree exists, the cells carry listeners, and the
+    // custom block starts hidden for the default (normal) choice.
+    val namingCard = privateField(control, "namingCard") as LinearLayout?
+    check("namingCard was built", namingCard != null)
+    check("the naming card is inside the control page",
+        namingCard != null && walk(page).contains(namingCard))
+    val naming = privateField(control, "naming")
+    val namingMode = naming?.let { runCatching { it.javaClass.getMethod("getMode").invoke(it) }.getOrNull() }
+    checkEq("the naming card starts on the normal mode", "NORMAL", namingMode?.toString())
+    val options = privateField(control, "namingOptions") as? Array<*>
+    checkEq("three naming cells were created", 3, options?.size)
+    options?.forEachIndexed { index, cell ->
+        check("naming cell $index exists", cell is View)
+        check("naming cell $index has a click listener",
+            cell is View && cell.hasOnClickListeners())
+        check("naming cell $index is inside the card",
+            cell is View && namingCard != null && walk(namingCard).contains(cell))
+    }
+    val editor = privateField(control, "namingEditor") as? View
+    val save = privateField(control, "namingSave") as? View
+    check("the custom editor block exists", editor != null)
+    check("the custom editor block is hidden in normal mode",
+        editor != null && editor.visibility == View.GONE)
+    check("the save row exists", save != null)
+    check("the save row is hidden in normal mode", save != null && save.visibility == View.GONE)
+    val inputs = privateField(control, "namingInputs") as? Array<*>
+    checkEq("three custom-name editors were created", 3, inputs?.size)
+    inputs?.forEachIndexed { index, input ->
+        check("custom editor $index is an EditText", input is android.widget.EditText)
+        check("custom editor $index is inside the editor block",
+            input is View && editor != null && walk(editor).contains(input))
+    }
+    val state = privateField(control, "namingState") as? android.widget.TextView
+    check("the mode tag was painted at build time", state != null && state.text.isNotEmpty())
+
+    // ---- 8. failures were recorded, never thrown out of build -----------------
     // The build path stays wrapped so a future layout mistake cannot kill the game: the
     // probe proves the boundary exists by calling attach() on a control whose window has
     // no decor view, which must return quietly instead of throwing.

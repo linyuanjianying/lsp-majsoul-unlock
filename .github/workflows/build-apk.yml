@@ -104,6 +104,7 @@ jobs:
           "$LUA" tools/tests/test_emoji_compat.lua
           "$LUA" tools/tests/test_auto_discard.lua
           "$LUA" tools/tests/test_auto_rematch.lua
+          "$LUA" tools/tests/test_naming_refresh.lua
 
       - name: Verify versioned unlock catalog
         run: python3 tools/update_unlock_catalog.py --check

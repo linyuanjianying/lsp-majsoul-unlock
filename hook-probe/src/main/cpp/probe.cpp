@@ -55,6 +55,14 @@ extern "C" void majmax_modder_free(uint8_t *data, size_t len);
 extern "C" int majmax_modder_get_settings(RustBuffer *output);
 extern "C" int majmax_modder_update_settings(const uint8_t *patch, size_t patchLen,
         RustBuffer *output);
+// Opponent naming: the compact state the Lua layer polls, the server name the
+// current authGame response replaced for one account (empty when nothing to
+// restore), and the region tag of one account. All three hand back an owned
+// buffer that must be released with majmax_modder_free; the values are player
+// names and are never logged.
+extern "C" int majmax_naming_state(RustBuffer *output);
+extern "C" int majmax_naming_original(uint32_t accountId, RustBuffer *output);
+extern "C" int majmax_naming_prefix(uint32_t accountId, RustBuffer *output);
 
 HookFn installHook = nullptr;
 std::atomic<void *> il2cppHandle{nullptr};
@@ -178,6 +186,103 @@ int luaMarkUiReady(void *) {
     return 0;
 }
 
+/**
+ * Hands the compact opponent-naming state (`mode\nslot0\nslot1\nslot2`) to Lua.
+ *
+ * The Lua refresh only compares this string with the previous one, so a value
+ * change is exactly "the user picked something new" and the redraw happens once.
+ * An empty string means the modder has not published anything yet, which the Lua
+ * side treats as "leave the table alone".
+ */
+int luaNamingState(void *state) {
+    RustBuffer output{};
+    if (majmax_naming_state(&output) != 0 || !output.data) {
+        pushLuaText(state, "");
+        return 1;
+    }
+    pushLuaText(state, std::string(reinterpret_cast<const char *>(output.data), output.len));
+    majmax_modder_free(output.data, output.len);
+    return 1;
+}
+
+/**
+ * Parses one bounded decimal account id out of a Lua string.
+ *
+ * The account id arrives as the decimal string Lua produced with
+ * `string.format('%.0f', id)`: that reuses the two Lua functions this bridge
+ * already binds and needs no integer conversion export. The bound is ten digits
+ * (an account id is a `uint32`), but ten digits can describe values up to
+ * 9 999 999 999, so the accumulation has to reject the overflow instead of
+ * wrapping around: a wrapped value is still "ten digits", it just names a
+ * different account, and the answer would silently be another player's name.
+ */
+bool parseAccountId(const char *text, size_t length, uint32_t &accountId) {
+    if (!text || length == 0 || length > 10) return false;
+    uint32_t value = 0;
+    for (size_t index = 0; index < length; ++index) {
+        const char digit = text[index];
+        if (digit < '0' || digit > '9') return false;
+        const uint32_t number = static_cast<uint32_t>(digit - '0');
+        // value * 10 + number <= UINT32_MAX, rearranged so nothing overflows.
+        if (value > (UINT32_MAX - number) / 10) return false;
+        value = value * 10 + number;
+    }
+    accountId = value;
+    return true;
+}
+
+/// Reads the account id from Lua argument 1; false for anything unusable.
+bool luaAccountArgument(void *state, uint32_t &accountId) {
+    if (!luaGetTop || !luaToLString || luaGetTop(state) < 1) return false;
+    size_t length = 0;
+    const char *text = luaToLString(state, 1, &length);
+    return parseAccountId(text, length, accountId);
+}
+
+/**
+ * Returns the server nickname the current authGame replaced for one account, or
+ * an empty string when nothing has to be restored.
+ *
+ * The name comes back without the region tag: the Lua layer prepends the tag of
+ * the same account itself (see luaNamingPrefix) when the independent
+ * showServer switch is on, so switching the tag off cannot leave an old one
+ * behind and switching it back on cannot double it.
+ */
+int luaNamingOriginal(void *state) {
+    uint32_t accountId = 0;
+    RustBuffer output{};
+    if (!luaAccountArgument(state, accountId) || accountId == 0
+            || majmax_naming_original(accountId, &output) != 0 || !output.data) {
+        pushLuaText(state, "");
+        return 1;
+    }
+    pushLuaText(state, std::string(reinterpret_cast<const char *>(output.data), output.len));
+    majmax_modder_free(output.data, output.len);
+    return 1;
+}
+
+/**
+ * Returns the region tag the game shows in front of a name of one account
+ * (`[CN]`, `[JP]`, `[EN]`, `[??]`), or an empty string.
+ *
+ * This is the same `zone_tag` the authGame rewrite uses, so the display layer
+ * never has to derive a prefix from a label's text: it asks for the tag of the
+ * seat's account id and prepends it verbatim, or does not, depending on the
+ * showServer flag of the compact state.
+ */
+int luaNamingPrefix(void *state) {
+    uint32_t accountId = 0;
+    RustBuffer output{};
+    if (!luaAccountArgument(state, accountId) || accountId == 0
+            || majmax_naming_prefix(accountId, &output) != 0 || !output.data) {
+        pushLuaText(state, "");
+        return 1;
+    }
+    pushLuaText(state, std::string(reinterpret_cast<const char *>(output.data), output.len));
+    majmax_modder_free(output.data, output.len);
+    return 1;
+}
+
 int luaLogMessage(void *state) {
     if (!luaGetTop || !luaToLString || luaGetTop(state) < 1) return 0;
     size_t length = 0;
@@ -245,6 +350,16 @@ bool installLuaBridge(void *state) {
     luaSetField(state, kLuaGlobalsIndex, "__majmax_auto_current");
     luaPushCClosure(state, luaAutoAck, 0);
     luaSetField(state, kLuaGlobalsIndex, "__majmax_auto_ack");
+    // Opponent naming for the current table: state to poll, the server name to
+    // restore when the user goes back to "normal", and the region tag of a seat
+    // so the display layer composes names from the same data the protocol
+    // rewrite uses instead of guessing a prefix.
+    luaPushCClosure(state, luaNamingState, 0);
+    luaSetField(state, kLuaGlobalsIndex, "__majmax_naming_state");
+    luaPushCClosure(state, luaNamingOriginal, 0);
+    luaSetField(state, kLuaGlobalsIndex, "__majmax_naming_original");
+    luaPushCClosure(state, luaNamingPrefix, 0);
+    luaSetField(state, kLuaGlobalsIndex, "__majmax_naming_prefix");
     INFO("Lua settings bridge registered");
     return true;
 }
@@ -338,8 +453,12 @@ void hookedLuaLooperUpdate(void *looper) {
     void *state = luaClientGetMainState(client);
     if (!state) return;
     // Static code only. Commands remain JSON data and are revalidated in Lua.
-    void *chunk = api.stringNew("if __majmax_auto_tick then __majmax_auto_tick() end");
-    void *name = api.stringNew("@MajsoulMaxAutoTick");
+    // The naming tick is the same kind of static entry point: it re-reads the
+    // modder state and, when it changed, redraws the current table once.
+    void *chunk = api.stringNew(
+            "if __majmax_auto_tick then __majmax_auto_tick() end "
+            "if __majmax_naming_tick then __majmax_naming_tick() end");
+    void *name = api.stringNew("@MajsoulMaxTick");
     if (chunk && name) luaStateDoString(state, chunk, name);
 }
 
@@ -743,6 +862,14 @@ static bool loadUiScript(const char *configDir) {
         std::string autoScript((std::istreambuf_iterator<char>(autoInput)), std::istreambuf_iterator<char>());
         if (autoScript.size() < 64 * 1024) script = "do\n" + autoScript + "\nend\n" + script;
     }
+    // Opponent naming is a separate display-only module (it hooks
+    // DesktopMgr:get_player_name and redraws the table), so it is loaded the
+    // same way, ahead of the settings page that owns the cards.
+    std::ifstream namingInput(std::string(configDir) + "/ui/MajsoulMaxNaming.lua", std::ios::binary);
+    if (namingInput) {
+        std::string namingScript((std::istreambuf_iterator<char>(namingInput)), std::istreambuf_iterator<char>());
+        if (namingScript.size() < 64 * 1024) script = "do\n" + namingScript + "\nend\n" + script;
+    }
     {
         std::lock_guard<std::mutex> lock(uiScriptMutex);
         uiScript = std::move(script);
@@ -798,6 +925,38 @@ Java_com_yefeng_majmax_hookprobe_ProbeModule_nativeAutoCommand(
     autoGeneration = static_cast<uint64_t>(generation);
     autoConnection = static_cast<uint64_t>(connection);
     autoSequence = static_cast<uint64_t>(sequence);
+}
+
+/**
+ * Applies one camelCase SettingsPatch to the Rust modder (opponent naming only).
+ *
+ * The patch is built by the Kotlin side (com.yefeng.majmax.hookprobe.manager.OpponentNaming)
+ * because the Rust field names live there and in settings.rs; this bridge only moves the UTF-8
+ * bytes across. The modder parses, validates, persists and republishes the snapshot in one
+ * call, so the next authGame response already sees the new mode without a restart. The Lua
+ * layer polls the same snapshot (majmax_naming_state) and redraws the table that is already on
+ * screen, which is the contract the UI promises ("applies immediately").
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_yefeng_majmax_hookprobe_ProbeModule_nativeApplyNaming(
+        JNIEnv *env, jclass, jbyteArray patch) {
+    if (!patch) return -1;
+    // A UTF-8 byte array, not a jstring: JNI strings use modified UTF-8, so an emoji or any
+    // other non-BMP character in a custom label would arrive as CESU-8 and serde_json would
+    // reject the whole patch. The Kotlin side encodes explicitly with StandardCharsets.UTF_8.
+    const jsize length = env->GetArrayLength(patch);
+    // Bounded like the Lua bridge: a naming patch is a few hundred bytes, so anything close to
+    // the modder's own 64 KiB ceiling is a bug and is refused before it reaches Rust.
+    if (length <= 0 || length > 16 * 1024) return -1;
+    jbyte *bytes = env->GetByteArrayElements(patch, nullptr);
+    if (!bytes) return -2;
+    RustBuffer output{};
+    const int status = majmax_modder_update_settings(
+            reinterpret_cast<const uint8_t *>(bytes), static_cast<size_t>(length), &output);
+    if (output.data) majmax_modder_free(output.data, output.len);
+    env->ReleaseByteArrayElements(patch, bytes, JNI_ABORT);
+    if (status != 0) WARN("Opponent naming patch rejected: status=%d", status);
+    return status;
 }
 
 extern "C" JNIEXPORT jstring JNICALL

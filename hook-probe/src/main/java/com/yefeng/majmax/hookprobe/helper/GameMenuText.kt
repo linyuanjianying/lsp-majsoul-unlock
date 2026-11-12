@@ -51,6 +51,10 @@ internal object GameMenuText {
         put("服务未连接", "No service", "サービス未接続")
         put("未开启", "Off", "オフ")
         put("读取显示模式", "Reading mode", "表示モードを読み込み中")
+        // Key of the status page's service row. The value next to it is the full
+        // "前台服务 · 运行中" family below, so the row reads as a key/value pair in every
+        // language without changing any of the shipped phrases.
+        put("服务状态", "Service", "サービス")
         put("无人值守开", "Unattended on", "放置モード オン")
 
         // ---- switch cards ----------------------------------------------------
@@ -196,6 +200,43 @@ internal object GameMenuText {
         put("已关闭无人值守 · 助手服务保持运行", "Unattended off · the assistant service keeps running",
             "放置モードをオフにしました · サービスは継続します")
         put("未安装管理应用", "Manager app is not installed", "管理アプリがインストールされていません")
+
+        // ---- opponent naming card ("对手名称") --------------------------------
+        // The card has three modes: server names, three fixed preset nicknames and three
+        // user-defined labels. "Seat" names follow Japanese mahjong usage and the English
+        // romanised forms the rest of this table already uses.
+        //
+        // The middle mode is shown as "预设昵称" (preset nicknames) because the three
+        // opponents become fixed names rather than anonymous letters. The stored wire
+        // value stays "abc" and the card must never show it: a settings document written
+        // by an older build (or by the manager app's "anonymize" spelling) keeps working.
+        put("对手名称", "Opponent names", "相手の名前")
+        put("正常", "Normal", "通常")
+        put("正常显示", "Server names", "通常表示")
+        put("预设昵称", "Preset names", "プリセット名")
+        put("自定义", "Custom", "カスタム")
+        put("左家", "Left", "上家")
+        put("对家", "Top", "対面")
+        put("右家", "Right", "下家")
+        put("保存名称", "Save names", "名前を保存")
+        put("留空保留原名", "Empty keeps the name", "空欄なら元の名前")
+        put("三位对手显示预设昵称 · 当前牌桌立即生效",
+            "Opponents show preset names · applies to the current table",
+            "相手はプリセット名で表示 · 現在の対局に反映")
+        put("留空的一席保留原名 · 当前牌桌立即生效",
+            "An empty seat keeps the server name · applies to the current table",
+            "空欄の席は元の名前のまま · 現在の対局に反映")
+        put("保留对手原名 · 当前牌桌立即生效",
+            "Opponent names are kept · applies to the current table",
+            "相手の元の名前のまま · 現在の対局に反映")
+        put("自定义名称已保存 · 当前牌桌立即生效",
+            "Custom names saved · applies to the current table",
+            "カスタム名を保存しました · 現在の対局に反映")
+        put("名称模式未保存", "The naming mode was not saved", "名前モードを保存できません")
+        put("管理应用无响应 · 名称模式未保存", "Manager app not responding · the naming mode was not saved",
+            "管理アプリ応答なし · 名前モードが保存されていません")
+        put("管理应用无响应 · 自定义名称未保存", "Manager app not responding · the custom names were not saved",
+            "管理アプリ応答なし · カスタム名が保存されていません")
 
         // ---- accessibility labels -------------------------------------------
         put("展开雀魂助手", "Expand Mahjong Assistant", "雀魂アシストを展開")

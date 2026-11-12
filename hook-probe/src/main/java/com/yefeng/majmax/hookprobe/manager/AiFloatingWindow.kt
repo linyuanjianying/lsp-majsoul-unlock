@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.MotionEvent
@@ -14,6 +15,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.CompoundButton
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -147,6 +149,34 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
     private var panelName: TextView? = null
     private var panelCaption: TextView? = null
     private var appliedPanelEnabled: Boolean? = null
+
+    /**
+     * Opponent-naming card: the same shared choice the in-game control shows.
+     *
+     * This window runs inside the manager process, so it reads and writes
+     * [OpponentNamingSettings] directly — no provider round trip — while the game process
+     * applies the stored value to the Rust modder on its own poll. The two surfaces therefore
+     * never keep separate copies: whichever one writes, the other one reads it back on its next
+     * tick.
+     */
+    private var namingName: TextView? = null
+    private var namingState: TextView? = null
+    private var namingNote: TextView? = null
+    private var namingSave: TextView? = null
+    private var namingEditor: LinearLayout? = null
+    private val namingCells = ArrayList<TextView>()
+    private val namingInputs = ArrayList<EditText>()
+    private val namingLabels = ArrayList<TextView>()
+    /** Segmented cells, in the order a table shows the seats. */
+    private val namingModes = listOf(OpponentNamingMode.NORMAL, OpponentNamingMode.ABC,
+        OpponentNamingMode.CUSTOM)
+
+    /** Guards against a focus-loss save re-entering while a write is in flight. */
+    private var namingWriting = false
+    /** One-line notice of the last naming write (already localized), reset on a language switch. */
+    private var namingNotice: String? = null
+    /** The stored choice the visible card was last painted from (null forces a repaint). */
+    private var appliedNamingKey: String? = null
     /** Handle of the grab target inside the title row (drags the window). */
     private var dragHandle: View? = null
     /** Dot + title + pill group; also the header's drag target. */
@@ -237,6 +267,17 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         panelName = null
         panelCaption = null
         appliedPanelEnabled = null
+        // The naming card goes with the view tree: keeping these would pin the old views (and
+        // their editors' focus listeners) until the next rebuild.
+        namingName = null
+        namingState = null
+        namingNote = null
+        namingSave = null
+        namingEditor = null
+        namingCells.clear()
+        namingInputs.clear()
+        namingLabels.clear()
+        appliedNamingKey = null
         dragHandle = null
         labelGroup = null
     }
@@ -311,6 +352,10 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         language = next
         // Make the value-gated appliers write again: their text is copy too.
         appliedPanelEnabled = null
+        appliedNamingKey = null
+        // The notice is already-localized copy of the previous language: drop it, the mode
+        // sentence below it is regenerated anyway.
+        namingNotice = null
         renderHeader()
         if (root != null && panelOpen()) {
             showTab()
@@ -899,6 +944,8 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         content.addView(rematchCard())
         content.addView(style.spacer(8))
         content.addView(recommendationPanelCard())
+        content.addView(style.spacer(8))
+        content.addView(namingCard())
         content.addView(style.spacer(12))
         content.addView(stopButton())
     }
@@ -965,6 +1012,10 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         if (panelOpen() && tab == 0 && !helpOpen) {
             applyRematch()
             applyPanel(RecommendationPanelSettings.read(context))
+            // Same one-preference read-back as the panel card: a mode written by the in-game
+            // control (or by this window) reaches the other surface on its next tick, so the
+            // two can never show different modes.
+            applyNaming(storedNaming())
         }
         if (panelOpen() && tab == 1 && !helpOpen) renderStatusPane()
     }
@@ -1130,6 +1181,270 @@ internal class AiFloatingWindow(private val context: Context, private val stop: 
         "已隐藏建议牌与番点，其他功能不受影响",
         "Suggested tiles and yaku are hidden; everything else keeps working",
         "候補牌と翻は非表示。他の機能は影響を受けません")
+
+    // ---- 对手名称卡 (opponent naming) ----------------------------------------
+
+    /**
+     * The stored shared choice; a read failure behaves like the fresh-install default.
+     *
+     * [OpponentNamingSettings] is the single copy the in-game control writes through the
+     * provider, so this window must never keep a second one in memory: it reads, paints and
+     * writes that one value.
+     */
+    private fun storedNaming(): OpponentNaming = runCatching {
+        OpponentNamingSettings.read(context)
+    }.getOrDefault(OpponentNaming())
+
+    /**
+     * Opponent-naming card of the 控制 pane: title + current mode, the three-way selector and —
+     * only while 自定义 is selected — one editor per seat with a save row.
+     *
+     * Seat order follows the Rust rewrite: left (kamicha), top (toimen), right (shimocha); a
+     * three-player table has no toimen, so the middle editor keeps its (empty) value unused.
+     *
+     * The card owns no preference of its own: it reads [OpponentNamingSettings] when built and
+     * writes it on a tap, and [updateAuto]'s tick re-reads it through [applyNaming], so a change
+     * made in the in-game control appears here within one tick.
+     */
+    private fun namingCard(): LinearLayout {
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = style.card(opacity)
+            setPadding(dp(12), dp(6), dp(12), dp(10))
+        }
+        val head = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        namingName = style.text(t("对手名称", "Opponent names", "相手の名前"), 14f, style.ink, true)
+            .apply { maxLines = 2 }
+        head.addView(namingName, LinearLayout.LayoutParams(0,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        namingState = style.text("", 11f, style.accent, true).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            background = style.valueTag()
+        }
+        head.addView(namingState, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        card.addView(head)
+
+        val cells = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        namingCells.clear()
+        namingModes.forEachIndexed { index, mode ->
+            val cell = style.text(namingModeLabel(mode), 11.5f, style.inkSoft, true).apply {
+                gravity = Gravity.CENTER
+                minimumHeight = dp(36)
+                setPadding(dp(4), dp(4), dp(4), dp(4))
+                // One listener per cell, created with the cell: a rebuild creates new ones, so
+                // nothing can accumulate on an existing view.
+                setOnClickListener { onNamingMode(mode) }
+            }
+            val params = LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            if (index > 0) params.leftMargin = dp(4)
+            cells.addView(cell, params)
+            namingCells.add(cell)
+        }
+        card.addView(cells, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(6) })
+
+        namingEditor = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        namingInputs.clear()
+        namingLabels.clear()
+        for (slot in 0 until OpponentNamingSettings.SLOTS) {
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) }
+            }
+            val label = style.text(namingSlotLabel(slot), 11f, style.muted)
+            label.setPadding(0, 0, dp(6), 0)
+            namingLabels.add(label)
+            row.addView(label, LinearLayout.LayoutParams(dp(36),
+                LinearLayout.LayoutParams.WRAP_CONTENT))
+            val input = EditText(context).apply {
+                setTextSize(12f)
+                setTextColor(style.ink)
+                isSingleLine = true
+                inputType = InputType.TYPE_CLASS_TEXT
+                background = style.shape(style.cardColor(opacity), dp(8).toFloat(),
+                    style.cardStroke())
+                setPadding(dp(8), dp(6), dp(8), dp(6))
+                // Leaving the field saves it, so a typed label is never lost to the 200 ms tick
+                // that repaints the card.
+                setOnFocusChangeListener { _, hasFocus -> if (!hasFocus) onNamingSave() }
+            }
+            row.addView(input, LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            namingEditor?.addView(row)
+            namingInputs.add(input)
+        }
+        card.addView(namingEditor)
+
+        namingSave = style.text(t("保存名称", "Save names", "名前を保存"), 12f, style.ink, true)
+            .apply {
+                gravity = Gravity.CENTER
+                minimumHeight = dp(style.touchTarget)
+                background = style.tinted(style.accentSoft, dp(12).toFloat())
+                setOnClickListener { onNamingSave() }
+            }
+        card.addView(namingSave, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(4) })
+
+        namingNote = style.text("", 11f, style.muted).apply { maxLines = 3 }
+        card.addView(namingNote, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(4) })
+
+        // A fresh tree has no painted value yet; the painter below must fill every part in.
+        appliedNamingKey = null
+        applyNaming(storedNaming())
+        return card
+    }
+
+    /** Copy of one segmented cell. */
+    private fun namingModeLabel(mode: OpponentNamingMode): String = when (mode) {
+        OpponentNamingMode.ABC -> t("预设昵称", "Preset names", "プリセット名")
+        OpponentNamingMode.CUSTOM -> t("自定义", "Custom", "カスタム")
+        else -> t("正常", "Normal", "通常")
+    }
+
+    /** The short mode word in the card's value tag. */
+    private fun namingModeState(mode: OpponentNamingMode): String = when (mode) {
+        OpponentNamingMode.ABC -> t("预设昵称", "Preset names", "プリセット名")
+        OpponentNamingMode.CUSTOM -> t("自定义", "Custom", "カスタム")
+        else -> t("正常显示", "Server names", "通常表示")
+    }
+
+    /** Seat name of one editor, in the order the Rust rewrite consumes the labels. */
+    private fun namingSlotLabel(slot: Int): String = when (slot) {
+        1 -> t("对家", "Top", "対面")
+        2 -> t("右家", "Right", "下家")
+        else -> t("左家", "Left", "上家")
+    }
+
+    /**
+     * Paints the card from [stored].
+     *
+     * Idempotent and callback-free, so the 200 ms tick can call it unconditionally: it writes
+     * the mode tag, the three cells and the note, and only touches the editors when the stored
+     * value actually changed (or the tree was just rebuilt). A field that still has the focus is
+     * never rewritten, so a half-typed label survives the tick that arrives while typing.
+     */
+    private fun applyNaming(stored: OpponentNaming) {
+        val custom = stored.mode == OpponentNamingMode.CUSTOM
+        namingName?.text = t("对手名称", "Opponent names", "相手の名前")
+        namingState?.text = namingModeState(stored.mode)
+        namingState?.setTextColor(if (namingNotice != null) style.warn else style.accent)
+        namingCells.forEachIndexed { index, cell ->
+            val mode = namingModes[index]
+            val selected = mode == stored.mode
+            cell.text = namingModeLabel(mode)
+            cell.setTextColor(if (selected) style.onAccent else style.inkSoft)
+            // This runs on every 200 ms tick: a new RippleDrawable per pass would be pure
+            // garbage, so the pill is only rebuilt when the selection actually moves.
+            if (cell.tag != selected) {
+                cell.background = if (selected) style.tinted(style.accent, dp(10).toFloat())
+                else style.tinted(style.tabTrack, dp(10).toFloat())
+                cell.tag = selected
+            }
+            cell.contentDescription = namingModeLabel(mode)
+        }
+        namingEditor?.visibility = if (custom) View.VISIBLE else View.GONE
+        namingSave?.visibility = if (custom) View.VISIBLE else View.GONE
+        namingSave?.text = t("保存名称", "Save names", "名前を保存")
+        namingSave?.contentDescription = t("保存名称", "Save names", "名前を保存")
+        val key = stored.toJson().toString()
+        if (custom && appliedNamingKey != key) {
+            namingInputs.forEachIndexed { slot, input ->
+                input.hint = t("留空保留原名", "Empty keeps the name", "空欄なら元の名前")
+                if (input.hasFocus()) return@forEachIndexed
+                val label = stored.nameAt(slot)
+                if (input.text.toString() != label) input.setText(label)
+            }
+            namingLabels.forEachIndexed { slot, label ->
+                label.text = namingSlotLabel(slot)
+            }
+        }
+        appliedNamingKey = key
+        namingNote?.text = namingNoteText(stored)
+        namingNote?.setTextColor(if (namingNotice != null) style.warn else style.muted)
+    }
+
+    /** Note line: a write notice first, otherwise what the mode does. */
+    private fun namingNoteText(stored: OpponentNaming): String {
+        namingNotice?.let { return it }
+        return when (stored.mode) {
+            OpponentNamingMode.ABC -> t(
+                "三位对手显示预设昵称 · 当前牌桌立即生效",
+                "Opponents show preset names; applies to the current table",
+                "相手はプリセット名で表示。現在の対局に反映")
+            OpponentNamingMode.CUSTOM -> t(
+                "留空的一席保留原名 · 当前牌桌立即生效",
+                "An empty field keeps that seat's name; applies to the current table",
+                "空欄の席は元の名前のまま。現在の対局に反映")
+            else -> t(
+                "保留对手原名 · 当前牌桌立即生效",
+                "Server names are kept; applies to the current table",
+                "元の名前のまま。現在の対局に反映")
+        }
+    }
+
+    /**
+     * Runtime switch of the naming mode.
+     *
+     * Only the mode is written: the three labels belong to the stored choice, so switching back
+     * to 自定义 restores exactly what was typed before, in either surface. The write goes to
+     * [OpponentNamingSettings] and the game process applies it to the Rust modder on its own
+     * poll, which is why the note says "next game" instead of pretending the current table is
+     * renamed retroactively.
+     */
+    private fun onNamingMode(mode: OpponentNamingMode) {
+        val stored = storedNaming()
+        if (namingWriting || mode == stored.mode) return
+        namingWriting = true
+        namingNotice = null
+        val saved = runCatching {
+            OpponentNamingSettings.applyPatch(context, mode.wire, null)
+        }.getOrNull()
+        namingWriting = false
+        if (saved == null) {
+            namingNotice = t("名称模式未保存", "The mode was not saved", "モードを保存できません")
+        }
+        applyNaming(saved ?: storedNaming())
+    }
+
+    /**
+     * Saves the three custom labels (focus loss, or the 保存名称 row).
+     *
+     * The write also selects 自定义: the editors only exist while it is selected, and storing
+     * labels that are then never used would be a lie to the user. An unchanged set is skipped,
+     * so simply leaving the card never issues a write.
+     */
+    private fun onNamingSave() {
+        if (namingWriting || namingEditor == null) return
+        val stored = storedNaming()
+        val names = namingInputs.map { it.text.toString() }
+        val unchanged = stored.mode == OpponentNamingMode.CUSTOM &&
+            names == (0 until OpponentNamingSettings.SLOTS).map { stored.nameAt(it) }
+        if (unchanged) return
+        namingWriting = true
+        val saved = runCatching {
+            OpponentNamingSettings.applyPatch(context, OpponentNamingMode.CUSTOM.wire, names)
+        }.getOrNull()
+        namingWriting = false
+        namingNotice = if (saved == null) {
+            t("名称未保存", "The names were not saved", "名前を保存できません")
+        } else {
+            t("已保存 · 当前牌桌立即生效", "Saved; applies to the current table", "保存しました。現在の対局に反映")
+        }
+        applyNaming(saved ?: storedNaming())
+    }
 
     /** Sets the thumb without notifying the listener. */
     private fun applyChecked(toggle: Switch, checked: Boolean) {

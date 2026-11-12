@@ -200,6 +200,11 @@ impl Modder {
                 for p in &mut msg.players {
                     self.change_player(p).await?;
                 }
+                // Opponent display names are only carried by this response, so
+                // the seat-aware rewrite runs here, after the per-player
+                // cosmetics above and only on an inbound payload.
+                let seat_list = msg.seat_list.clone();
+                self.apply_opponent_naming(&seat_list, &mut msg).await;
                 modified_data = Some(msg.encode_to_vec());
             }
             ".lq.Lobby.fetchTitleList" => {
@@ -500,6 +505,88 @@ impl Modder {
         Ok(())
     }
 
+    /// Rewrite the display names of the opponent seats in an `authGame`
+    /// response.
+    ///
+    /// `seat_list` indexes seats in play order, so the local player's seat is
+    /// its own `account_id` position in that list. Only the other seats are
+    /// touched, and only when the local account is present in the list: without
+    /// that anchor the visual order is unknown and every server name is kept.
+    ///
+    /// The label replaces the *name*, never the region tag: `show_server` is the
+    /// sole authority for the `[CN]`/`[JP]`/`[EN]`/`[??]` prefix and applies to
+    /// all three modes, so a rewritten seat is rendered as
+    /// `zone_tag + label` when the switch is on and as the bare label when it
+    /// is off. Seat names already carry that tag at this point (the per-player
+    /// pass above prefixed them), which is exactly why the label has to be
+    /// composed through [`opponent_display_name`] instead of copied verbatim.
+    ///
+    /// Every `authGame` also publishes the server nicknames it is about to
+    /// replace to the display cache (see `crate::publish_naming_originals`), so
+    /// the in-game layer can go back to `normal` without another game: the
+    /// response that built the current table no longer contains those names.
+    /// Those cached names are the *pre-prefix* ones (see [`without_zone_tag`]),
+    /// so the display layer can re-render them under the live `showServer`
+    /// state instead of being stuck with the tag of the game they came from.
+    /// The cache is replaced wholesale here, i.e. it can only ever describe the
+    /// table of the response being parsed, and it is emptied when nothing is
+    /// rewritten.
+    async fn apply_opponent_naming(&self, seat_list: &[u32], msg: &mut lq::ResAuthGame) {
+        let mut originals: Vec<(u32, String)> = Vec::new();
+        let account_id = self.safe.read().await.account_id;
+        let (labels, show_server) = {
+            let mod_settings = self.mod_settings.read().await;
+            (
+                (0..crate::settings::OPPONENT_LABEL_SLOTS)
+                    .map(|slot| mod_settings.opponent_label(slot).map(str::to_owned))
+                    .collect::<Vec<_>>(),
+                mod_settings.show_server(),
+            )
+        };
+        let self_seat = seat_list.iter().position(|id| *id == account_id);
+        if account_id == 0 || labels.iter().all(Option::is_none) {
+            crate::publish_naming_originals(originals);
+            return;
+        }
+        let Some(self_seat) = self_seat else {
+            crate::publish_naming_originals(originals);
+            return;
+        };
+        for (slot, seat) in opponent_seat_order(seat_list.len(), self_seat)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(Some(label)) = labels.get(slot) else {
+                continue;
+            };
+            let Some(target) = seat_list.get(seat).copied() else {
+                continue;
+            };
+            if target == 0 || target == account_id {
+                continue;
+            }
+            // Keep the first server name seen for this account: a seat has
+            // exactly one view, and a repeated id must not grow the cache.
+            if originals.iter().all(|(id, _)| *id != target) {
+                let view = msg
+                    .players
+                    .iter()
+                    .chain(msg.robots.iter())
+                    .find(|view| view.account_id == target);
+                if let Some(view) = view {
+                    originals.push((target, without_zone_tag(target, &view.nickname, show_server)));
+                }
+            }
+            let display = opponent_display_name(target, label, show_server);
+            for view in msg.players.iter_mut().chain(msg.robots.iter_mut()) {
+                if view.account_id == target {
+                    view.nickname.clone_from(&display);
+                }
+            }
+        }
+        crate::publish_naming_originals(originals);
+    }
+
     async fn perfect_character(&self, id: u32) -> Result<lq::Character> {
         let mut character = lq::Character {
             charid: id,
@@ -791,17 +878,85 @@ impl Modder {
     }
 }
 
-fn add_zone_id(id: u32, name: &str) -> String {
+/// Visual left-to-right opponent seat order for one game.
+///
+/// Majsoul numbers seats in play order: the seat after the local player is the
+/// shimocha on the right, the following one the toimen at the top and the seat
+/// before the local player is the kamicha on the left. Reading the seats other
+/// than the local one in reverse order therefore yields screen order
+/// `[kamicha, toimen, shimocha]`, i.e. `self + n - 1 ..= self + 1` modulo `n`.
+/// The in-tree evidence for those relative directions is Akagi's
+/// `game_state::mahgen_view` (kamicha renders on the left, shimocha on the
+/// right) and `game_state::tracker` (`toimen` is `seat + 2`). A three-player
+/// table only has two opponents, so the third label stays unused.
+///
+/// The client protocol exposes no additional ordering information beyond this
+/// rotation, so the mapping is derived from the relative seat arithmetic alone
+/// and is deliberately not based on the array order of `players`.
+pub(crate) fn opponent_seat_order(seat_count: usize, self_seat: usize) -> Vec<usize> {
+    if seat_count < 2 || self_seat >= seat_count {
+        return Vec::new();
+    }
+    (1..seat_count)
+        .rev()
+        .map(|offset| (self_seat + offset) % seat_count)
+        .collect()
+}
+
+/// Region tag the client shows in front of a player name.
+///
+/// The value is derived from the account id alone (the top bits carry the
+/// region), and it is the only place that mapping exists: the protocol-side
+/// rewrite below and the `majmax_naming_prefix` C ABI the in-game Lua layer
+/// calls both go through this function, so the two can never drift apart.
+/// The Chinese tag contains a U+FEFF byte-order mark after the `C`, exactly as
+/// the game sends it; it is part of the string and must not be normalised.
+pub(crate) fn zone_tag(id: u32) -> &'static str {
     const CN: &str = "[C\u{feff}N]";
     let zone_code = id >> 23;
-    let zone = match zone_code {
+    match zone_code {
         code if code <= 6 => CN,
         code if (7..=12).contains(&code) => "[JP]",
         code if (13..=15).contains(&code) => "[EN]",
         _ => "[??]",
     }
-    .to_string();
-    zone + name
+}
+
+/// Display name of a seat whose server name was replaced by `label`.
+///
+/// `show_server` is an independent switch, not a property of the naming mode:
+/// when it is on, the label keeps the zone tag exactly like a server name
+/// would; when it is off, neither a server name nor a label carries one.
+/// Account id 0 means "no account" (a robot), which has no region at all, so
+/// such a seat is never tagged.
+fn opponent_display_name(account_id: u32, label: &str, show_server: bool) -> String {
+    if show_server && account_id != 0 {
+        add_zone_id(account_id, label)
+    } else {
+        label.to_owned()
+    }
+}
+
+/// Server name with the zone tag [`add_zone_id`] added stripped off again.
+///
+/// Used for the restore cache: the display layer re-applies the tag from the
+/// live `show_server` state, and storing an already tagged name would either
+/// double the tag (switch stays on) or keep a stale one (switch turns off).
+/// Only the exact tag of that account is removed, and only when the switch was
+/// on - i.e. only when this module put it there - so a server name that happens
+/// to start with `[CN]` on its own is never rewritten.
+fn without_zone_tag(account_id: u32, nickname: &str, show_server: bool) -> String {
+    if !show_server || account_id == 0 {
+        return nickname.to_owned();
+    }
+    nickname
+        .strip_prefix(zone_tag(account_id))
+        .map(str::to_owned)
+        .unwrap_or_else(|| nickname.to_owned())
+}
+
+fn add_zone_id(id: u32, name: &str) -> String {
+    zone_tag(id).to_string() + name
 }
 
 fn encode_uuid(uuid: &str) -> String {
@@ -943,6 +1098,60 @@ mod tests {
                 .unwrap();
         // 回退到 main_char(200001) 的默认装扮
         assert_eq!(account.avatar_id, 400101);
+    }
+
+    #[test]
+    fn opponent_seat_order_reads_visual_left_to_right() {
+        // Four-player tables: kamicha (self + 3) on the left, toimen (self + 2)
+        // in the middle, shimocha (self + 1) on the right.
+        assert_eq!(opponent_seat_order(4, 0), vec![3, 2, 1]);
+        assert_eq!(opponent_seat_order(4, 1), vec![0, 3, 2]);
+        assert_eq!(opponent_seat_order(4, 2), vec![1, 0, 3]);
+        assert_eq!(opponent_seat_order(4, 3), vec![2, 1, 0]);
+        // Three-player tables have no toimen.
+        assert_eq!(opponent_seat_order(3, 0), vec![2, 1]);
+        assert_eq!(opponent_seat_order(3, 2), vec![1, 0]);
+        // Degenerate inputs stay safe instead of panicking.
+        assert!(opponent_seat_order(1, 0).is_empty());
+        assert!(opponent_seat_order(4, 9).is_empty());
+    }
+
+    #[test]
+    fn zone_tag_follows_the_account_region_and_keeps_the_bom() {
+        // The region lives in the top bits of the account id.
+        assert_eq!(zone_tag(0), "[C\u{feff}N]");
+        assert_eq!(zone_tag(2202), "[C\u{feff}N]");
+        assert_eq!(zone_tag(6 << 23), "[C\u{feff}N]");
+        assert_eq!(zone_tag(7 << 23), "[JP]");
+        assert_eq!(zone_tag(12 << 23), "[JP]");
+        assert_eq!(zone_tag(13 << 23), "[EN]");
+        assert_eq!(zone_tag(15 << 23), "[EN]");
+        assert_eq!(zone_tag(16 << 23), "[??]");
+        // add_zone_id is the tag plus the name, byte for byte.
+        assert_eq!(add_zone_id(7 << 23, "名字"), "[JP]名字");
+        assert_eq!(add_zone_id(2202, ""), "[C\u{feff}N]");
+    }
+
+    #[test]
+    fn a_rewritten_name_only_carries_the_tag_of_the_independent_switch() {
+        let cn = zone_tag(2202);
+        // Switch on: the label keeps the region tag the server name had.
+        assert_eq!(opponent_display_name(2202, "领头的羊", true), format!("{cn}领头的羊"));
+        // Switch off: the bare label, even though the mode is unchanged.
+        assert_eq!(opponent_display_name(2202, "领头的羊", false), "领头的羊");
+        // A robot has no account and therefore no region: never tagged.
+        assert_eq!(opponent_display_name(0, "远见的鹰", true), "远见的鹰");
+
+        // The restore cache stores the name without the tag we added, so the
+        // display layer can render it under the live switch.
+        assert_eq!(without_zone_tag(2202, &format!("{cn}东家"), true), "东家");
+        // Switching the tag off must not leave a stale prefix behind.
+        assert_eq!(without_zone_tag(2202, &format!("{cn}东家"), false), format!("{cn}东家"));
+        // A name without our tag is never rewritten, and a name that only looks
+        // like it belongs to another region keeps its bytes.
+        assert_eq!(without_zone_tag(2202, "东家", true), "东家");
+        assert_eq!(without_zone_tag(2202, "[JP]东家", true), "[JP]东家");
+        assert_eq!(without_zone_tag(0, &format!("{cn}机器人"), true), format!("{cn}机器人"));
     }
 
     #[tokio::test]

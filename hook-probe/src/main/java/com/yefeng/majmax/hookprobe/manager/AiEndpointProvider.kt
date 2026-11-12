@@ -27,6 +27,16 @@ import java.util.UUID
 internal const val KEY_UI_LANGUAGE = "uiLanguage"
 
 /**
+ * Reply field carrying the shared opponent-naming choice as JSON
+ * (`{"mode":"normal|abc|custom","names":["","",""]}`).
+ *
+ * It travels on every status reply (through [AssistLaunch.withDisplayMode]) so the in-game
+ * control can paint it from its existing poll, and on the dedicated `namingGet` reply the game
+ * process uses to hand the value to the Rust modder.
+ */
+internal const val KEY_NAMING = "naming"
+
+/**
  * `overlayError` value meaning "this process could not read its display state".
  */
 internal const val DISPLAY_MODE_UNAVAILABLE = "display_mode_unavailable"
@@ -131,6 +141,27 @@ class AiEndpointProvider : ContentProvider() {
             val requested = extras?.takeIf { it.containsKey("enabled") }?.getBoolean("enabled")
                 ?: throw IllegalArgumentException("Missing enabled")
             RecommendationPanelSettings.save(app, requested)
+            return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)
+        }
+        if (method == "namingGet") {
+            // Read of the single shared opponent-naming choice. The game process applies the
+            // returned value to the Rust modder; nothing here touches the service, the
+            // display mode or any other preference.
+            return Bundle().apply {
+                putString(KEY_NAMING, OpponentNamingSettings.read(app).toJson().toString())
+            }
+        }
+        if (method == "namingSet") {
+            // Patch write, deliberately different from rematchSet/panelSet: the choice has two
+            // parts (mode and three labels) and the two surfaces edit them at different times.
+            // A missing key therefore keeps the stored value instead of being rejected, so a
+            // mode tap can never erase labels typed in the other surface. The reply is a full
+            // status bundle, so the caller applies the *stored* value like any poll and can
+            // tell a lost write from a saved one.
+            val mode = extras?.getString("mode")
+            val names = extras?.getStringArray("names")?.toList()
+            if (mode == null && names == null) throw IllegalArgumentException("Missing naming patch")
+            OpponentNamingSettings.applyPatch(app, mode, names)
             return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)
         }
         if (method == "displayMode" || method == "runMode") {
@@ -533,6 +564,10 @@ object AssistLaunch {
         // from the game side is the `panelSet` method. It is independent of
         // unattended mode, auto-rematch, the display mode and the cat-head hints.
         bundle.putBoolean("recommendationPanel", RecommendationPanelSettings.read(context))
+        // Shared opponent-naming choice, read-only projection of the one stored value. The
+        // in-game control paints it from its existing poll, and the game process applies it to
+        // the Rust modder; this projection never writes, starts or stops anything.
+        bundle.putString(KEY_NAMING, OpponentNamingSettings.read(context).toJson().toString())
         return bundle
     }
 

@@ -12,6 +12,113 @@ use std::{
 };
 use tracing::error;
 
+/// Number of opponent display-name slots a game can assign. A four-player
+/// table has three opponents; a three-player table uses the first two.
+pub const OPPONENT_LABEL_SLOTS: usize = 3;
+
+/// Fixed preset labels used by [`NamingMode::Abc`], ordered left to right.
+///
+/// The three seats a four-player table shows are kamicha (left), toimen (top)
+/// and shimocha (right), which is also the order
+/// `ModSettings::opponent_label` hands them out in. The persisted wire value of
+/// the mode stays `abc`, so a document written by an older build (or the
+/// manager app's `anonymize` spelling) keeps meaning the same thing.
+pub const ANONYMOUS_OPPONENT_LABELS: [&str; OPPONENT_LABEL_SLOTS] = ["领头的羊", "镇山的虎", "远见的鹰"];
+
+/// Longest accepted user-defined opponent name. Matches the nickname limit
+/// enforced for the local player below.
+pub const MAX_OPPONENT_NAME_CHARS: usize = 64;
+
+/// How the display names of the opponents are rewritten.
+///
+/// The mode only affects received client display data and is applied at two
+/// places: the in-game Lua layer renames the seats of the table on screen as soon
+/// as the value changes (`naming_wire` is its trigger), and an `authGame` response
+/// is parsed with the same choice for the next game. An outgoing request is never
+/// changed, and the choice is not a network or protocol setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NamingMode {
+    /// Keep the server-provided names, i.e. the pre-existing behavior.
+    #[default]
+    Normal,
+    /// Replace the opponents with the fixed preset labels (see
+    /// [`ANONYMOUS_OPPONENT_LABELS`]); the user-facing name of this mode is
+    /// "预设昵称" / "Preset names".
+    Abc,
+    /// Replace the opponents with the user-defined `custom_names` entries.
+    Custom,
+}
+
+impl NamingMode {
+    /// Canonical value persisted in `settings.mod.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Abc => "abc",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Parse a persisted or patched value.
+    ///
+    /// The accepted spellings cover both the canonical names and the wording
+    /// used while the feature was described ("anonymize" for the `A`/`B`/`C`
+    /// mode), and are case and separator insensitive. An unknown value degrades
+    /// to [`NamingMode::Normal`] instead of failing the whole settings load, so
+    /// a document written by a newer build can never stop the mod from starting.
+    pub fn parse(value: &str) -> Self {
+        let normalized: String = value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|character| character.to_ascii_lowercase())
+            .collect();
+        match normalized.as_str() {
+            "abc" | "anon" | "anonymize" | "anonymized" | "anonymizeabc" | "abcnames" => Self::Abc,
+            "custom" | "customnames" => Self::Custom,
+            _ => Self::Normal,
+        }
+    }
+}
+
+impl Serialize for NamingMode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for NamingMode {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(deserializer)?))
+    }
+}
+
+/// Validate user-defined opponent labels.
+///
+/// Empty entries are allowed on purpose: they mean "keep the server name for
+/// this seat" and are only checked for length and control characters.
+pub fn validate_opponent_names(names: &[String]) -> Result<()> {
+    ensure!(
+        names.len() <= OPPONENT_LABEL_SLOTS,
+        "自定义对手名称最多 {OPPONENT_LABEL_SLOTS} 项"
+    );
+    for name in names {
+        ensure!(
+            name.chars().count() <= MAX_OPPONENT_NAME_CHARS,
+            "自定义对手名称不能超过 {MAX_OPPONENT_NAME_CHARS} 个字符"
+        );
+        ensure!(
+            name.chars().all(|character| !character.is_control()),
+            "自定义对手名称不能包含控制字符"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct MaxData {
     pub character: Vec<u32>,
@@ -121,6 +228,11 @@ pub struct ModSettings {
     pub main_char: u32,
     pub char_skin: HashMap<u32, u32>,
     pub nickname: String,
+    /// Opponent display-name mode; see [`NamingMode`].
+    pub naming_mode: NamingMode,
+    /// User-defined labels for [`NamingMode::Custom`], in left-to-right
+    /// visual seat order. Missing or empty entries keep the server name.
+    pub custom_names: Vec<String>,
     pub star_character: Vec<u32>,
     pub hidden_characters: Vec<u32>,
     hint_switch: bool,
@@ -145,6 +257,8 @@ impl Default for ModSettings {
             main_char: 200001,
             char_skin: HashMap::new(),
             nickname: String::new(),
+            naming_mode: NamingMode::Normal,
+            custom_names: Vec::new(),
             star_character: Vec::new(),
             hidden_characters: Vec::new(),
             hint_switch: true,
@@ -178,6 +292,8 @@ pub struct SettingsPatch {
     pub random_char_switch: Option<bool>,
     pub random_char_pool: Option<Vec<(u32, u32)>>,
     pub nickname: Option<String>,
+    pub naming_mode: Option<NamingMode>,
+    pub custom_names: Option<Vec<String>>,
 }
 
 impl SettingsPatch {
@@ -190,6 +306,8 @@ impl SettingsPatch {
             && self.random_char_switch.is_none()
             && self.random_char_pool.is_none()
             && self.nickname.is_none()
+            && self.naming_mode.is_none()
+            && self.custom_names.is_none()
     }
 }
 
@@ -260,6 +378,58 @@ impl ModSettings {
         self.anti_nickname_censorship
     }
 
+    pub fn naming_mode(&self) -> NamingMode {
+        self.naming_mode
+    }
+
+    /// Label for one opponent slot in left-to-right visual seat order.
+    ///
+    /// `None` means "leave this seat's server name alone", which is what
+    /// [`NamingMode::Normal`] and empty custom entries produce.
+    pub fn opponent_label(&self, slot: usize) -> Option<&str> {
+        match self.naming_mode() {
+            NamingMode::Normal => None,
+            NamingMode::Abc => ANONYMOUS_OPPONENT_LABELS.get(slot).copied(),
+            NamingMode::Custom => self
+                .custom_names
+                .get(slot)
+                .filter(|name| !name.trim().is_empty())
+                .map(String::as_str),
+        }
+    }
+
+    /// Compact description of the naming choice for the in-game Lua layer.
+    ///
+    /// The wire is `<mode>\n<show_server:0|1>\n<slot0>\n<slot1>\n<slot2>`:
+    /// `mode` is the canonical [`NamingMode`] spelling, the second line is the
+    /// independent `showServer` switch and each slot is the label that should
+    /// replace the server name, or an empty line when the seat keeps it. A
+    /// newline separator needs no escaping because
+    /// [`validate_opponent_names`] rejects control characters, and the compact
+    /// form keeps the whole settings document out of the Lua bridge (only the
+    /// switch and the three labels ever cross it).
+    ///
+    /// The `showServer` switch is published separately from `mode` on purpose:
+    /// it is the sole authority for the `[CN]`/`[JP]`/`[EN]`/`[??]` zone tag, so
+    /// it has to apply to all three modes (server names, preset labels and
+    /// custom labels alike) and the display layer must be able to compose a
+    /// name without knowing which mode produced the label.
+    ///
+    /// The same string is used as the change token: the Lua side redraws the
+    /// current table exactly when this value differs from the previous one, so
+    /// flipping `showServer` alone repaints the table too.
+    pub fn naming_wire(&self) -> String {
+        let mut wire = String::with_capacity(32 + OPPONENT_LABEL_SLOTS * 8);
+        wire.push_str(self.naming_mode().as_str());
+        wire.push('\n');
+        wire.push(if self.show_server { '1' } else { '0' });
+        for slot in 0..OPPONENT_LABEL_SLOTS {
+            wire.push('\n');
+            wire.push_str(self.opponent_label(slot).unwrap_or(""));
+        }
+        wire
+    }
+
     pub fn apply_patch(&mut self, patch: SettingsPatch) -> Result<()> {
         if let Some(nickname) = patch.nickname {
             ensure!(nickname.chars().count() <= 64, "昵称不能超过 64 个字符");
@@ -268,6 +438,13 @@ impl ModSettings {
                 "昵称不能包含控制字符"
             );
             self.nickname = nickname;
+        }
+        if let Some(names) = patch.custom_names {
+            validate_opponent_names(&names)?;
+            self.custom_names = names;
+        }
+        if let Some(mode) = patch.naming_mode {
+            self.naming_mode = mode;
         }
         if let Some(pool) = patch.random_char_pool {
             ensure!(pool.len() <= 256, "随机角色池不能超过 256 项");
@@ -353,6 +530,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_pinned_upstream_settings_document() {
+        // The shipped document predates the naming modes, so loading it must
+        // keep the previous behavior and only fill in the new defaults.
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../external/MajsoulMax-rs/liqi_config");
+        let settings = ModSettings::load(&directory).unwrap();
+        assert_eq!(settings.naming_mode(), NamingMode::Normal);
+        assert!(settings.custom_names.is_empty());
+        assert!(!settings.char_skin.is_empty());
+    }
+
+    #[test]
     fn missing_enabled_field_keeps_mod_enabled() {
         let settings: ModSettings = serde_json::from_str(
             r#"{"mainChar":200001,"nickname":"旧配置"}"#,
@@ -395,5 +584,145 @@ mod tests {
                 ..Default::default()
             })
             .is_err());
+    }
+
+    #[test]
+    fn legacy_settings_keep_normal_naming() {
+        // Files written before the naming modes existed must load and behave
+        // exactly like the previous build.
+        let settings: ModSettings =
+            serde_json::from_str(r#"{"mainChar":200001,"nickname":"旧配置"}"#).unwrap();
+        assert_eq!(settings.naming_mode(), NamingMode::Normal);
+        assert!(settings.custom_names.is_empty());
+        assert_eq!(settings.opponent_label(0), None);
+    }
+
+    #[test]
+    fn naming_mode_is_tolerant_on_load_and_canonical_on_save() {
+        assert_eq!(NamingMode::parse("Anonymize"), NamingMode::Abc);
+        assert_eq!(NamingMode::parse("a_b-c"), NamingMode::Abc);
+        assert_eq!(NamingMode::parse("Custom Names"), NamingMode::Custom);
+        assert_eq!(NamingMode::parse("future-mode"), NamingMode::Normal);
+
+        let settings: ModSettings = serde_json::from_str(
+            r#"{"namingMode":"anonymize","customNames":["甲","","丙"]}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.naming_mode(), NamingMode::Abc);
+        assert_eq!(settings.custom_names.len(), 3);
+
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["namingMode"], serde_json::json!("abc"));
+        assert_eq!(saved["customNames"], serde_json::json!(["甲", "", "丙"]));
+    }
+
+    #[test]
+    fn opponent_labels_follow_the_mode_and_keep_original_when_empty() {
+        let mut settings = ModSettings::default();
+        assert_eq!(settings.opponent_label(0), None);
+
+        settings
+            .apply_patch(SettingsPatch {
+                naming_mode: Some(NamingMode::Abc),
+                ..Default::default()
+            })
+            .unwrap();
+        // Preset labels, in the visual left-to-right order the rewrite uses.
+        assert_eq!(settings.opponent_label(0), Some("领头的羊"));
+        assert_eq!(settings.opponent_label(1), Some("镇山的虎"));
+        assert_eq!(settings.opponent_label(2), Some("远见的鹰"));
+        assert_eq!(settings.opponent_label(3), None);
+
+        settings
+            .apply_patch(SettingsPatch {
+                naming_mode: Some(NamingMode::Custom),
+                custom_names: Some(vec![" 上家 ".to_owned(), String::new(), "  ".to_owned()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settings.opponent_label(0), Some(" 上家 "));
+        assert_eq!(settings.opponent_label(1), None);
+        assert_eq!(settings.opponent_label(2), None);
+    }
+
+    #[test]
+    fn naming_wire_is_the_compact_lua_state() {
+        let mut settings = ModSettings::default();
+        // Normal mode: no label on any line, so the Lua layer leaves the
+        // received (server) names alone. `showServer` keeps its default (on),
+        // which is the field the display layer reads to rebuild the zone tag.
+        assert_eq!(settings.naming_wire(), "normal\n1\n\n\n");
+
+        settings
+            .apply_patch(SettingsPatch {
+                naming_mode: Some(NamingMode::Abc),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settings.naming_wire(), "abc\n1\n领头的羊\n镇山的虎\n远见的鹰");
+
+        settings
+            .apply_patch(SettingsPatch {
+                naming_mode: Some(NamingMode::Custom),
+                custom_names: Some(vec!["上家".to_owned(), String::new(), "下家".to_owned()]),
+                ..Default::default()
+            })
+            .unwrap();
+        // An empty slot stays an empty line: "keep the server name here".
+        assert_eq!(settings.naming_wire(), "custom\n1\n上家\n\n下家");
+
+        // `showServer` is independent of the mode: turning it off only changes
+        // the flag line, the labels stay identical.
+        settings
+            .apply_patch(SettingsPatch {
+                show_server: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settings.naming_wire(), "custom\n0\n上家\n\n下家");
+        // And it is part of the change token, so flipping it alone is one edit.
+        assert_ne!(
+            settings.naming_wire(),
+            ModSettings::default().naming_wire()
+        );
+    }
+
+    #[test]
+    fn patch_rejects_bad_opponent_names() {
+        let mut settings = ModSettings::default();
+        assert!(
+            settings
+                .apply_patch(SettingsPatch {
+                    custom_names: Some(vec!["A".to_owned(); OPPONENT_LABEL_SLOTS + 1]),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert!(
+            settings
+                .apply_patch(SettingsPatch {
+                    custom_names: Some(vec!["bad\nname".to_owned()]),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert!(
+            settings
+                .apply_patch(SettingsPatch {
+                    custom_names: Some(vec!["字".repeat(MAX_OPPONENT_NAME_CHARS + 1)]),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        // A rejected patch must not partially apply.
+        assert!(settings.custom_names.is_empty());
+        assert!(
+            settings
+                .apply_patch(SettingsPatch {
+                    custom_names: Some(vec!["字".repeat(MAX_OPPONENT_NAME_CHARS)]),
+                    ..Default::default()
+                })
+                .is_ok()
+        );
     }
 }

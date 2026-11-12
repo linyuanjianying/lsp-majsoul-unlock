@@ -12,7 +12,9 @@
 //   * a horizontal drag and a tap on the switch cards must not change the page,
 //   * the two tabs have a slightly bigger band (TAB_DP 34) with a 16sp label,
 //   * the outside-tap watcher (Window.Callback proxy) stays observe-only: it closes the
-//     menu from outside, and it never selects a tab or flips a switch.
+//     menu from outside, and it never selects a tab or flips a switch,
+//   * the vertical scroll band is the panel's own band (it ends at the panel's bottom
+//     edge, not 172px below it) and scrolling it never switches the page.
 //
 // This probe builds the REAL menu on a plain JVM (android.* comes from
 // tools/tests/jvm-shims/android-shim) and drives synthetic MotionEvents through the real
@@ -392,10 +394,67 @@ fun main() {
         }
     }
 
-    // ---- 8. scrolling still exists (the vertical ScrollView is untouched) ----------
+    // ---- 8. vertical scrolling still exists (and is the band the finger sees) -------
+    // The panel used to be measured to the window reserve (1036px) instead of the host's
+    // pre-scale viewport (864px): the scroll band hung 172px below the visible menu, the last
+    // card was clipped and the ScrollView saw no overflow. The band geometry below is what
+    // that bug broke, and the drag at the end proves the gesture still reaches the panel
+    // instead of being stolen by a swipe handler.
     val scroll = walk(root).firstOrNull { it is android.widget.ScrollView }
     check("the page band is still a ScrollView", scroll != null)
     check("the scroll view is inside the panel", scroll != null && walk(root).contains(scroll))
+    val band = if (scroll != null) (if (scroll.height > 0) scroll.height else scroll.measuredHeight) else 0
+    val body = scroll?.parent as? ViewGroup
+    check("the scroll band fits inside the body (nothing is pinned under it)",
+        body != null && band > 0 && band <= body.measuredHeight) {
+        "band=$band body=${body?.measuredHeight}"
+    }
+    val menuBox = if (menu.height > 0) menu.height else menu.measuredHeight
+    check("the scroll band is inside the panel box", band > 0 && band <= menuBox) {
+        "band=$band menu=$menuBox"
+    }
+    val page = privateField(control, "pageControl") as View
+    page.measure(
+        View.MeasureSpec.makeMeasureSpec(Math.max(1, scroll?.measuredWidth ?: 1),
+            View.MeasureSpec.AT_MOST),
+        View.MeasureSpec.makeMeasureSpec(60_000, View.MeasureSpec.AT_MOST))
+    val contentH = page.measuredHeight
+    val maxScroll = Math.max(0, contentH - band)
+    val pageStack = (0 until (page as ViewGroup).childCount)
+        .map { page.getChildAt(it) }
+        .filter { it.visibility != View.GONE }
+        .sumOf { it.measuredHeight }
+    println("   scroll band=$band of a ${menu.width}x$menuBox panel, page content=$contentH " +
+        "(rows $pageStack), scrollable=${maxScroll}px (${if (maxScroll > 0) "overflows" else "fits"})")
+    check("the control page has content inside the band", contentH > 0 && band > 0)
+    check("the whole row stack is part of the measured page content",
+        pageStack > 0 && pageStack <= contentH) { "rows=$pageStack content=$contentH" }
+    // A vertical drag across the page must reach the panel and change nothing: no tab
+    // switch, no page change, and no feature flip (the cards carry no listener at all).
+    drag(root, pageCenterX, pageCenterY + 140f, pageCenterX, pageCenterY - 180f)
+    checkEq("a vertical drag does not switch the page", 0, privateField(control, "tab"))
+    checkEq("a vertical drag leaves the control page visible", View.VISIBLE, pageControl.visibility)
+    // The JVM shim models measure/layout/hit-testing but no scroll offset. The offset is
+    // asserted only when the shim grows one (scrollTo/getScrollY), so this probe never turns
+    // a missing model into a silent pass on a platform that has real scrolling.
+    val scrollTo = runCatching {
+        scroll?.javaClass?.getMethod("scrollTo", Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType)
+    }.getOrNull()
+    val getScrollY = runCatching { scroll?.javaClass?.getMethod("getScrollY") }.getOrNull()
+    if (scroll != null && scrollTo != null && getScrollY != null) {
+        val before = getScrollY.invoke(scroll) as Int
+        scrollTo.invoke(scroll, 0, maxScroll)
+        val after = getScrollY.invoke(scroll) as Int
+        check("a vertical scroll reaches the bottom of the page", after - before == maxScroll) {
+            "before=$before after=$after maxScroll=$maxScroll"
+        }
+        checkEq("scrolling the band does not switch the page", 0, privateField(control, "tab"))
+    } else {
+        println("   scroll offset: not modelled by the JVM shim " +
+            "(no scrollTo/getScrollY); vertical scrolling is asserted through the band " +
+            "geometry and the untouched dispatch path")
+    }
 
     println("=== $passed passed, $failed failed ===")
     if (failed > 0) {
