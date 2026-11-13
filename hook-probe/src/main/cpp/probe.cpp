@@ -862,8 +862,8 @@ static bool loadUiScript(const char *configDir) {
         std::string autoScript((std::istreambuf_iterator<char>(autoInput)), std::istreambuf_iterator<char>());
         if (autoScript.size() < 64 * 1024) script = "do\n" + autoScript + "\nend\n" + script;
     }
-    // Opponent naming is a separate display-only module (it hooks
-    // DesktopMgr:get_player_name and redraws the table), so it is loaded the
+    // Opponent naming is a separate display-only module (it updates opponent
+    // player_datas nicknames and redraws the table), so it is loaded the
     // same way, ahead of the settings page that owns the cards.
     std::ifstream namingInput(std::string(configDir) + "/ui/MajsoulMaxNaming.lua", std::ios::binary);
     if (namingInput) {

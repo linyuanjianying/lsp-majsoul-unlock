@@ -2,14 +2,42 @@
 --
 -- The Rust modder rewrites the names inside the `authGame` response, which means
 -- a change can only be seen in the next game. This module closes that gap on the
--- display side: it wraps `DesktopMgr:get_player_name` -- the getter the table
--- reads for every seat -- and redraws the table once when the shared choice (the
--- in-game control and the floating window write the same setting) changes.
+-- display side, and it renames the table exactly the way the client renames it
+-- itself (`DesktopMgr:SetNicknameAnonymous`): the opponent seats of the current
+-- table get their `player_datas[seat].nickname` replaced, and the client's own
+-- seat redraw is called once when that changed something.
+--
+-- That field is the one the client paints with: its result page builds every card
+-- with `container_name:SetName(DesktopMgr.Inst.player_datas[seat].nickname,
+-- ...)` (UI_GameEnd), and its anonymous mode renames a live table by writing this
+-- very field and then calling `UI_DesktopInfo.Inst:InitRoom()` + `RefreshSeat()`.
+-- `DesktopMgr:get_player_name` is a different, filtered path (taboo check, hidden
+-- nicknames, friend remarks) and no table label is built through it, which is why
+-- a previous version of this file -- one that only wrapped that getter -- could be
+-- installed correctly and still never change a single name on screen.
+--
+-- Redraw: `UI_DesktopInfo.Inst:RefreshSeat(true)`, i.e. the call the client makes
+-- itself every time the seat content changes while the table is up
+-- (`DesktopMgr:ChangeMainBody` and `DesktopMgr:RefreshSeatOnNewRound` both set
+-- `self.seat` and then repaint the seats, and the names have to follow the seat,
+-- so that repaint covers them). `InitRoom()` -- also part of the client's own
+-- rename sequence -- is the room-initialisation call and is *not* used here: it
+-- runs once per table, and re-running it in the middle of a round would reset the
+-- round UI. Known uncertainty: the client's `UI_DesktopInfo` chunk is not part of
+-- the available decompiled dump (the packaged scripts are encrypted), so this
+-- cannot be read line by line. Should a seat label turn out not to be repainted by
+-- `RefreshSeat`, the replacement still lands on the next repaint point (the next
+-- round, the next seat switch, the result page or the next `authGame`), because
+-- the data field above is the client's only source for a name.
+--
+-- The getter is still wrapped, but only so that a consumer of it reports the same
+-- name the table shows, and only for the seats this module actually renamed. A
+-- seat that was not renamed keeps the game's own answer, remark flag included.
 --
 -- It never touches the network, the protocol or the server payload, it runs only
--- on Unity's main thread from the native pump, and it only ever replaces the
--- names of the opponents of the current table: the local seat keeps its own name
--- and every failure falls back to the untouched getter.
+-- on Unity's main thread from the native pump, and it only ever replaces the names
+-- of the opponents of the current table: the local seat keeps its own name and
+-- every failure falls back to the untouched game data.
 --
 -- A replaced name is composed as `region tag + label`, where the tag comes from
 -- the seat's account id (asked from the native side, the same zone_tag the
@@ -53,9 +81,17 @@ local function read_state()
         force = '1'
     end
     if not mode then return nil end
+    -- Only the two label modes ever use a slot. `normal` publishes empty slots
+    -- (the modder's `opponent_label` answers nothing for it), but this module must
+    -- not depend on that alone: a half updated install -- a new native side with
+    -- an old state, or the other way round -- could hand over a normal mode with
+    -- labels still in it, and a normal mode must never rename anything. An
+    -- unknown spelling fails closed the same way: the game's own names stay.
+    local labels_mode = mode == 'abc' or mode == 'custom' or mode == 'anonymize'
     return {
         signature = raw,
         mode = mode,
+        labels_mode = labels_mode,
         show = show == '1',
         force = force == '1',
         labels = { first, second, third },
@@ -98,6 +134,14 @@ local function prefix(account, show)
         N.prefixCount = N.prefixCount + 1
     end
     return value
+end
+
+-- The table that is on screen right now, or nil.
+local function table_now()
+    local desktop = g('DesktopMgr')
+    local instance = desktop and rawget(desktop, 'Inst')
+    if type(instance) ~= 'table' then return nil end
+    return instance
 end
 
 -- Opponent seats in screen order, derived from the game's own turn order:
@@ -146,28 +190,22 @@ local function cached_original(account)
     return nil
 end
 
--- Replacement name for one seat, or nil when the game's own answer stands.
--- `current` is what the game itself would display for that seat (the response's
--- nickname, i.e. whatever the authGame rewrite left there).
-local function replacement(self, seat, state, current)
-    local seats, count = opponent_seats(self)
-    if not seats then return nil end
-    local slot
-    for index = 1, count do
-        if seats[index] == seat then slot = index end
-    end
-    if not slot then return nil end
-    local player = self.player_datas[seat]
-    local account = player and player.account_id
-    if type(account) ~= 'number' or account < 0 then account = 0 end
-
-    local label = state.labels[slot]
+-- The name one opponent seat has to show, as (name, managed).
+--
+-- `managed` marks the seats whose displayed name this module owns: the table's
+-- own getter then has to report the same string. A name this module never wrote
+-- stays unmanaged, so its remark flag and the game's own filtering still apply.
+--
+-- `record` is the value this module replaced for that seat, so a later normal
+-- mode can put the table back exactly as it was without asking anyone.
+local function desired(seat, account, index, current, state)
+    local label = state.labels_mode and state.labels[index] or nil
     if type(label) == 'string' and label ~= '' then
         -- The label replaces the name only: the region tag is owned by the
         -- independent showServer switch, exactly like it is in the authGame
         -- rewrite, so a preset or custom label is never shown bare while the
         -- switch is on and never inherits a tag while it is off.
-        return prefix(account, state.show) .. label
+        return prefix(account, state.show) .. label, true
     end
 
     -- Normal mode, or a custom slot left empty: the response that built this
@@ -177,33 +215,104 @@ local function replacement(self, seat, state, current)
     -- switch off cannot keep an old prefix and turning it back on cannot double
     -- one. A robot or a seat without an account id has nothing to restore.
     local cached = cached_original(account)
-    if cached then return prefix(account, state.show) .. cached end
+    if cached then return prefix(account, state.show) .. cached, true end
 
-    -- No cached name: this seat was not renamed, so the game's own answer
-    -- stands. The one thing the switch still has to do on a live table is drop
-    -- a prefix that the response was built with - only that exact tag of that
-    -- exact account, and only while the switch is off. Nothing is ever added
-    -- here: a name without the tag may legitimately have none (the response was
-    -- built with the switch off, or the seat is a robot), and inventing one
-    -- would modify a name this module never wrote.
-    if state.show or account <= 0 or type(current) ~= 'string' then return nil end
+    -- No server name to restore: the name the table already carries was not
+    -- written by this module, so only the switch may still act on it, and only
+    -- on the exact tag of this exact account. Turning the switch off drops a tag
+    -- the response was built with; turning it back on puts that same tag back.
+    -- Nothing is ever invented here: a name without a tag may legitimately have
+    -- none (the response was built with the switch off, or the seat is a robot).
+    local record = N.raw and N.raw[seat]
+    local base = (record and record.account == account) and record.value or current
+    if state.show then return base, false end
     local tag = prefix(account, true)
-    if tag ~= '' and current:sub(1, #tag) == tag then return current:sub(#tag + 1) end
-    return nil
+    if tag ~= '' and base:sub(1, #tag) == tag then return base:sub(#tag + 1), false end
+    return base, false
 end
 
--- Resolves one seat. `original` keeps its own two return values, so the friend
--- remark flag the game computes stays intact for every seat whose rendered name
--- does not change (an unchanged replacement is reported as "no replacement").
-local function resolve(original, self, seat)
-    local name, isRemark = original(self, seat)
-    local state = N.state
-    if not state then return name, isRemark end
-    local replaced = replacement(self, seat, state, name)
-    if replaced and replaced ~= name then return replaced, false end
-    return name, isRemark
+-- Writes the wanted name into the seat data. Idempotent: it is called once per
+-- pump tick, so a name the game rebuilds (a new round re-reads
+-- `player_datas_temp`) is restored without another user edit, and a table that
+-- already shows the right names costs no writes and no redraw.
+local function apply(self, state)
+    local data = self.player_datas
+    if type(data) ~= 'table' then return false end
+    if N.data ~= data then
+        -- A new table replaced the seat data: what was replaced belongs to the
+        -- previous one.
+        N.data = data
+        N.raw = {}
+        N.managed = {}
+    end
+    local seats, count = opponent_seats(self)
+    if not seats then return false end
+    if not N.raw then N.raw = {} end
+    if not N.managed then N.managed = {} end
+    local changed, seen = false, {}
+    for index = 1, count do
+        local seat = seats[index]
+        local player = data[seat]
+        local current = player and player.nickname
+        if type(current) == 'string' then
+            local account = player.account_id
+            if type(account) ~= 'number' or account < 0 then account = 0 end
+            local want, managed = desired(seat, account, index, current, state)
+            if want ~= current then
+                local record = N.raw[seat]
+                if not record or record.account ~= account or current ~= record.written then
+                    -- First write for this seat, or the game replaced the name
+                    -- behind this module: remember what is there now.
+                    record = { account = account, value = current }
+                    N.raw[seat] = record
+                end
+                record.written = want
+                player.nickname = want
+                changed = true
+            end
+            seen[seat] = true
+            N.managed[seat] = managed and want or nil
+        end
+    end
+    -- A seat that is no longer an opponent of this table (a four-player table
+    -- becoming a three-player one, or the main body switching to that seat) must
+    -- not keep a name this module owns: it gets exactly the name that was there
+    -- before the first replacement.
+    for seat in pairs(N.managed) do
+        if not seen[seat] then
+            N.managed[seat] = nil
+            local record = N.raw[seat]
+            local player = data[seat]
+            if record and player and player.nickname == record.written
+                    and type(player.account_id) == 'number'
+                    and player.account_id == record.account then
+                player.nickname = record.value
+                N.raw[seat] = nil
+                changed = true
+            end
+        end
+    end
+    return changed
 end
 
+-- The client's own redraw entry point for the seat names. It is the call the
+-- client makes right after it changes the seat content of a live table itself
+-- (see the header: the `true` is the flag those call sites pass).
+local function redraw()
+    local info = g('UI_DesktopInfo')
+    local instance = info and rawget(info, 'Inst')
+    if type(instance) ~= 'table' then return false end
+    -- UI instances inherit their methods from the class table via __index.
+    -- The outer tick is protected by pcall for lazy ToLua lookup failures.
+    local refresh = instance.RefreshSeat
+    if type(refresh) ~= 'function' then return false end
+    local ok = pcall(refresh, instance, true)
+    return ok
+end
+
+-- The filtered getter, wrapped only so a consumer of it agrees with the table.
+-- A seat this module did not rename keeps the game's own two return values, the
+-- friend remark flag included.
 local function install()
     local desktop = g('DesktopMgr')
     if type(desktop) ~= 'table' then return false end
@@ -211,11 +320,15 @@ local function install()
     if type(original) ~= 'function' then return false end
     if original == N.wrapper then return true end
     local function get_player_name(self, seat)
-        local ok, name, isRemark = pcall(resolve, original, self, seat)
-        if ok then return name, isRemark end
-        -- A naming bug must never reach the game: the untouched getter decides,
-        -- exactly as if this module were not loaded.
-        return original(self, seat)
+        local ok, name, isRemark = pcall(original, self, seat)
+        if not ok then
+            -- A naming bug must never reach the game: the untouched getter
+            -- decides, exactly as if this module were not loaded.
+            return original(self, seat)
+        end
+        local managed = N.managed and N.managed[seat]
+        if managed then return managed, false end
+        return name, isRemark
     end
     N.wrapper = get_player_name
     desktop.get_player_name = get_player_name
@@ -229,33 +342,28 @@ local function is_installed()
     return type(desktop) == 'table' and rawget(desktop, 'get_player_name') == N.wrapper
 end
 
--- The client's own redraw entry point for the seat names.
-local function redraw()
-    local info = g('UI_DesktopInfo')
-    local instance = info and rawget(info, 'Inst')
-    if type(instance) ~= 'table' then return false end
-    -- UI instances inherit their methods from the class table via __index.
-    -- The outer tick is protected by pcall for lazy ToLua lookup failures.
-    local refresh = instance.RefreshSeat
-    if type(refresh) ~= 'function' then return false end
-    local ok = pcall(refresh, instance, true)
-    return ok
-end
-
 local function tick()
     if not is_installed() then install() end
     local state = read_state()
     N.state = state
-    if state and state.signature ~= N.signature then
+    if not state then return end
+    local self = table_now()
+    if not self then return end
+    if state.signature ~= N.signature then
         N.signature = state.signature
-        N.attempts = state.force and REFRESH_ATTEMPTS or nil
+        if state.force then N.dirty = true end
     end
-    if not N.attempts then return end
+    if apply(self, state) then N.dirty = true end
+    if not N.dirty then return end
     if redraw() then
+        N.dirty = nil
         N.attempts = nil
-    else
-        N.attempts = N.attempts - 1
-        if N.attempts <= 0 then N.attempts = nil end
+        return
+    end
+    N.attempts = (N.attempts or REFRESH_ATTEMPTS) - 1
+    if N.attempts <= 0 then
+        N.dirty = nil
+        N.attempts = nil
     end
 end
 

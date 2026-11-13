@@ -14,8 +14,9 @@ import java.util.Locale
  *
  * The mode only affects *display* data. The Rust side rewrites the `authGame` response of the
  * next game, and the in-game Lua layer (`MajsoulMaxNaming.lua`) renames the seats of the table
- * that is already on screen and redraws it once, so a change lands immediately and never needs a
- * restart of the game or of the mod.
+ * that is already on screen - it writes `player_datas[seat].nickname`, the field the client
+ * paints a seat label from, and then asks for one repaint - so a change lands without a restart
+ * of the game or of the mod.
  */
 internal enum class OpponentNamingMode(val wire: String) {
     /** Server-provided names, i.e. the pre-existing behavior. */
@@ -62,12 +63,18 @@ internal enum class OpponentNamingMode(val wire: String) {
  * distinguish "missing" from "empty". Slots are in visual seat order — left (kamicha), top
  * (toimen), right (shimocha) — which is also the order the Rust rewrite consumes them in.
  *
+ * [forceRefresh] is the in-game "repaint the table after a change" switch (on by default): it
+ * only decides whether a change that needs no seat write still repaints the table, and it is
+ * carried in the stored choice, the provider reply and the Rust patch so either surface can
+ * turn it off.
+ *
  * Deliberately free of Android view types: the game process parses this same class from the
  * provider reply, and the pure-logic JVM probe compiles it without the Android SDK.
  */
 internal data class OpponentNaming(
     val mode: OpponentNamingMode = OpponentNamingMode.NORMAL,
     val names: List<String> = emptyList(),
+    /** Redraw the table after a naming change even when no seat name had to be rewritten. */
     val forceRefresh: Boolean = true,
 ) {
     @JvmField val namesForJava: List<String> = names
@@ -80,12 +87,16 @@ internal data class OpponentNaming(
         mode,
         (0 until OpponentNamingSettings.SLOTS)
             .map { OpponentNamingSettings.normalizeName(nameAt(it)) },
+        forceRefresh,
     )
 
     /** `true` when at least one custom seat label would actually replace a name. */
     fun hasCustomNames(): Boolean = names.any { it.trim().isNotEmpty() }
 
-    /** The choice as the game-facing wire string (`{"mode":"abc","names":[...]}`). */
+    /**
+     * The choice as the game-facing wire string
+     * (`{"mode":"abc","names":[...],"forceRefresh":true}`).
+     */
     fun toJson(): JSONObject = JSONObject()
         .put("mode", mode.wire)
         .put("names", JSONArray(normalized().names))
@@ -94,8 +105,9 @@ internal data class OpponentNaming(
     /**
      * The same choice as a camelCase `SettingsPatch` for `majmax_modder_update_settings`.
      *
-     * Only the two naming fields are ever included: the Rust patch type denies unknown fields
-     * and the naming path must never touch skins, the local nickname or the presets.
+     * Only the three naming fields are ever included (`namingMode`, `customNames`,
+     * `namingForceRefresh`): the Rust patch type denies unknown fields and the naming path must
+     * never touch skins, the local nickname or the presets.
      */
     fun patchJson(): String = JSONObject()
         .put("namingMode", mode.wire)
@@ -199,8 +211,8 @@ internal object OpponentNamingSettings {
     /**
      * Stores exactly [naming] and returns what a later [read] would see.
      *
-     * Only the two naming keys are touched, so a write can never clear an unrelated
-     * preference of the assistant.
+     * Only the three naming keys are touched (`mode`, `names`, `force_refresh`), so a write can
+     * never clear an unrelated preference of the assistant.
      */
     fun save(context: Context, naming: OpponentNaming): OpponentNaming {
         val stored = naming.normalized()

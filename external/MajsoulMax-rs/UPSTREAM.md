@@ -93,11 +93,33 @@ robot opponent) and the missing-seat-anchor cases plus the untouched request.
 The rewrite above only reaches the table whose `authGame` response is being
 parsed, so a user who changes the mode while a game is running would have to
 wait for the next one. The display side is therefore handled locally by
-`hook-probe/src/main/assets/liqi_config/ui/MajsoulMaxNaming.lua`, which wraps
-`DesktopMgr:get_player_name` and redraws the table once through
-`UI_DesktopInfo.Inst:RefreshSeat(true)` when the stored choice changes. Nothing
-in the protocol changes because of it: no request is rewritten, no connection is
-touched.
+`hook-probe/src/main/assets/liqi_config/ui/MajsoulMaxNaming.lua`. Its main
+channel is not a getter: it replaces
+`DesktopMgr.Inst.player_datas[seat].nickname` of the opponent seats - the field
+the client itself paints a seat label from, since the result page builds every
+card with
+`container_name:SetName(DesktopMgr.Inst.player_datas[seat].nickname, ...)` -
+and then asks for one repaint through `UI_DesktopInfo.Inst:RefreshSeat(true)`.
+That is also the chain the client's own anonymous-nickname mode uses (write the
+field, then `InitRoom()` + `RefreshSeat()`); `InitRoom()` is deliberately not
+called here, because it is the per-room initialisation and re-running it in the
+middle of a round would reset the round UI. `DesktopMgr:get_player_name` is still
+wrapped, but only for consistency: a consumer of that filtered path (taboo
+names, hidden nicknames, friend remarks) then reports the same name for a seat
+this module renamed, with the remark flag `false`, while an untouched seat keeps
+the game's own answer and flag. Nothing in the protocol changes because of it:
+no request is rewritten, no connection is touched.
+
+The write is maintained idempotently from the native pump tick (100 ms): a seat
+that already carries the wanted name costs no write and no repaint, a name the
+client rebuilds from `player_datas_temp` at the start of a round is put back on
+the next tick without another user edit, and a seat that stops being an opponent
+(a four-player table turning into a three-player one, or `ChangeMainBody`
+switching the main body to that seat) is restored to the value that was there
+before the first replacement. Only the two label modes rename anything; `normal`
+publishes empty slots and never renames, even if a half-updated install hands it
+labels. A three-player table uses the first two labels - the client leaves the
+toimen position out itself, so no modulo arithmetic is involved.
 
 Because the rewrite already replaced the server names inside the response, the
 original names have to be kept somewhere for "go back to normal" to work while
@@ -110,22 +132,50 @@ and only while `showServer` was on, i.e. only when this module put it there), so
 the display layer can re-apply the tag from the live switch instead of being
 stuck with the one of an earlier game.
 
+That cache only covers responses this build rewrote. For every other case (the
+table was built before the mode changed, or a robot seat with account id 0) the
+display layer keeps its own per-seat record of the value it replaced, refreshed
+only when the client itself put a different value there. Restoring therefore
+resolves `Rust cache -> local record -> the value the table carries`, and the
+local record is dropped together with the seat data it belongs to.
+
 The adapter exposes that cache and the compact naming state to the Lua bridge as
 `majmax_naming_original`, `majmax_naming_prefix` and `majmax_naming_state`; all
 three live in a small dedicated mutex so the Unity main thread never waits on a
-packet being modified. The state carries the switch itself
-(`<mode>\n<show_server>\n<label0>\n<label1>\n<label2>`), so toggling `showServer`
-is its own redraw token, and the display layer never derives a prefix from a
-name or a label. The cache is cleared per `authGame` response and on connection
-close, is never written to any log, and is display-only.
+packet being modified. The state carries both switches itself
+(`<mode>\n<show_server>\n<label0>\n<label1>\n<label2>\n<force_refresh>`), so
+toggling `showServer` or `force_refresh` is its own redraw token, and the display
+layer never derives a prefix from a name or a label. `force_refresh` (the in-game
+"repaint the table after a change" switch, on by default) only decides whether a
+published change that needs no seat write still repaints the table; a change that
+does write a name always repaints. A five-line state without the sixth line is
+accepted as `force_refresh = 1`, so a half-updated install still renames
+immediately; any other shape is ignored as a whole. The cache is cleared per
+`authGame` response and on connection close, is never written to any log, and is
+display-only.
+
+Known uncertainty, kept as such: the client's `UI_DesktopInfo` chunk is not part
+of the available decompiled dump (the packaged scripts are encrypted), so
+`RefreshSeat` cannot be read line by line. The `true` argument comes from the
+client's own call sites (`DesktopMgr:ChangeMainBody`,
+`DesktopMgr:RefreshSeatOnNewRound`), not from an implementation that was read,
+and "a change repaints the live table immediately" is still an inference backed
+by a fake-page unit test; it needs one confirmation on a real device. If a
+version does not repaint seat labels there, the replacement is not lost: the data
+field is the client's only source for a name, so it lands on the next repaint
+point (the next round, the next seat switch, the result page or the next
+`authGame`).
 
 Tests: `auth_game_publishes_the_names_it_replaced`,
 `every_auth_game_replaces_the_restore_cache`,
 `preset_labels_keep_the_region_tag_of_their_own_seat`,
 `turning_show_server_off_drops_the_tag_of_a_rewritten_seat`,
-`naming_prefix_abi_matches_the_protocol_zone_tag`, and
-`a_custom_label_is_taken_verbatim_and_never_matched_against_a_tag` (plus
-`settings_patch_publishes_the_lua_state`) in `hook-probe/rust-modder`, and
-`tools/tests/test_naming_refresh.lua` for the Lua layer (normal → preset →
-custom → normal, the switch on/off/on for both label kinds and for restored
-names, the own name, three-player mapping, missing UI, missing bridge).
+`naming_prefix_abi_matches_the_protocol_zone_tag`,
+`a_custom_label_is_taken_verbatim_and_never_matched_against_a_tag` and
+`settings_patch_publishes_the_lua_state` in `hook-probe/rust-modder`, plus
+`tools/tests/test_naming_refresh.lua` for the Lua layer (seat data written
+instead of a getter, the getter answering consistently, normal -> preset ->
+custom -> normal, the switch on/off/on for both label kinds and for restored
+names, the own name, three-player mapping, a name the client rebuilt healing on
+the next tick, a seat leaving the opponent set, missing UI, missing bridge, the
+five-line state and an ignored unknown shape).

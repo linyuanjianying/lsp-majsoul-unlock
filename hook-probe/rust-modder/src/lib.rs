@@ -87,7 +87,7 @@ static CORE: OnceLock<Mutex<Core>> = OnceLock::new();
 /// and at most three names.
 #[derive(Default)]
 struct NamingView {
-    /// `<mode>\n<show_server:0|1>\n<slot0>\n<slot1>\n<slot2>`; empty until the
+    /// `<mode>\n<show_server:0|1>\n<slot0>\n<slot1>\n<slot2>\n<force_refresh:0|1>`; empty until the
     /// settings are loaded. See `ModSettings::naming_wire`.
     state: String,
     /// Server nicknames the current `authGame` response replaced, keyed by
