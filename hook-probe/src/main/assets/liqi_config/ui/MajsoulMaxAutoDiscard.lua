@@ -151,17 +151,31 @@ function R.live()
     return R.visible(popup) or false
 end
 -- Re-anchor the walk on the page that is actually up. Normally R.act() gets its
--- session from the OnShow hook; when this module loaded after the page was already
--- raised that hook never fired, so the live page (which still carries its
--- game_end_result) is adopted here instead of waiting for a show that is over.
+-- session from the OnShow hook; when that show never reached this module (it
+-- loaded after the page was already raised, the game's own OnShow raised before
+-- the hook could observe, or the reused singleton was re-raised outside the
+-- class wrapper) the walk must recover from the live page, which still carries
+-- its game_end_result.
 -- UIBase:Inherit() instances reach class methods through the metatable, so Btn_Again
 -- and Btn_Next resolve through the same chain the game's own buttons use.
 function R.attachLive()
+    -- A settlement the walk is still driving keeps the page it was anchored on:
+    -- re-reading it every tick would restart a walk that is already in flight.
     local session = R.session
-    if session then return session.stopped and nil or session end
     local ui = g('UI_GameEnd') and g('UI_GameEnd').Inst
-    if R.visible(ui) then return R.observe(ui, nil) end
-    return nil
+    local shown = R.visible(ui)
+    if not session then return shown and R.observe(ui, nil) or nil end
+    if not (session.stopped or session.done) then return session end
+    -- The answered settlement is over, but UI_GameEnd.Inst is one reused page for
+    -- every match. A later result is a settlement of its own and must be driven
+    -- (the report is exactly a second match the walk refused); the same result on
+    -- the same still-open page must not be re-adopted, or a result the user already
+    -- answered -- a manual cancel above all -- would be queued again.
+    if not shown then session.hidden = true; return nil end
+    local ok, current = pcall(function() return ui.game_end_result end)
+    if not ok or current == nil then return nil end
+    if current == session.result and not session.hidden then return nil end
+    return R.observe(ui, nil)
 end
 function R.observe(ui, data)
     R.confirming = nil
@@ -175,7 +189,10 @@ function R.observe(ui, data)
         if ok then value = current end
     end
     local nextSession = value and type(value.players) == 'table' and #value.players > 0
-        and { ui = ui, generation = R.generation, seen = {} } or nil
+        -- hidden starts false for every settlement: it only ever means "this
+        -- session's own page has gone down", which is what makes the same reused
+        -- singleton readable as the next match's result.
+        and { ui = ui, result = value, hidden = false, generation = R.generation, seen = {} } or nil
     -- A genuine new result page reuses the same Lua UI object. Only its new OnShow
     -- result (not popup reopen/confirmation ticks) creates the next action lease.
     if nextSession then
@@ -192,8 +209,17 @@ function R.installHooks()
         local original = c.OnShow
         function c:OnShow(callback, data, ...)
             local previous = R.session
-            local result = original(self, callback, data, ...)
-            if R.session == previous then R.observe(self, data) end
+            -- The game's own OnShow can raise on a settlement page it no longer
+            -- has every sub-page loaded for (it closes UI_Highlight and the reward
+            -- pages when a result page closes, and walks them again on the next
+            -- show). The result is already on the page at that point, so the walk
+            -- still anchors; the game's own error keeps travelling unchanged.
+            local ok, result = pcall(original, self, callback, data, ...)
+            if R.session == previous then
+                local anchored, observeError = pcall(R.observe, self, data)
+                if not anchored then fault('observe_exception') end
+            end
+            if not ok then error(result, 0) end
             return result
         end
     end
