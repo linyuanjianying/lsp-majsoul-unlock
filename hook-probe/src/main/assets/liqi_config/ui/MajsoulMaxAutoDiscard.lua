@@ -164,6 +164,7 @@ function R.attachLive()
     return nil
 end
 function R.observe(ui, data)
+    R.confirming = nil
     R.generation = R.generation + 1
     local value = data and data.game_end_result
     -- The hook may be installed after the page was already raised (a module that
@@ -192,7 +193,7 @@ function R.installHooks()
         function c:OnShow(callback, data, ...)
             local previous = R.session
             local result = original(self, callback, data, ...)
-            if not (data and data.reopen) and R.session == previous then R.observe(self, data) end
+            if R.session == previous then R.observe(self, data) end
             return result
         end
     end
@@ -208,9 +209,9 @@ function R.installHooks()
             return cancel(self, ...)
         end
         function p:Confirm(...)
-            -- Confirming is terminal however it was started. A user confirm opts that
-            -- settlement out; it never re-arms the walk on the same page.
-            if not R.executing then
+            -- The adapter calls the same native method for automatic confirmation.
+            -- Mark that call so the wrapper does not mistake it for a user action.
+            if not R.executing and not R.confirming then
                 R.trace('result_manual_confirm', 'manual_confirm')
                 R.cancel('manual_confirm')
             end
@@ -281,7 +282,9 @@ function R.act(command, now)
         if type(confirm) ~= 'function' then fault('confirm_unavailable'); session.pending = nil; return true end
         session.done = true -- latch before invoking: a callback can hide/destroy the UI
         R.executing = true
+        R.confirming = true
         local ok = pcall(confirm, popup)
+        R.confirming = nil
         R.executing = nil
         R.emit(ok and 'confirmed' or 'failed', ok and 'confirmation_invoked' or 'confirm_exception')
         return true
