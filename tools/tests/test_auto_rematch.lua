@@ -634,6 +634,109 @@ test('a missing confirm method is a bounded refusal', function(s)
         'a missing confirm is a refusal, not a tick crash')
 end)
 
+-- ---------------------------------------------------------------------------
+-- 0.15.9 regressions. The user report behind these checks is "the first match
+-- continues by itself, from the second match on nothing happens while the
+-- auto-rematch switch still shows as on". One cause is pinned here: the walk
+-- anchored every settlement from UI_GameEnd:OnShow only, and its finished
+-- session (done/stopped) refused every other tick for good.
+-- ---------------------------------------------------------------------------
+
+test('a later settlement is driven even when its show never reaches the module', function(s)
+    -- The adapter's own Confirm closes the result page, and the next match's page is
+    -- raised through a path the class hook cannot see (the game's OnShow raised
+    -- before the wrapper could observe, or the reused singleton was re-raised
+    -- outside it). The page still carries the new result, so the walk must anchor
+    -- on it instead of answering every tick for a settlement that is already over.
+    prime(s)
+    command(s)
+    drive(s, 0, 3)
+    assert(s.again == 1 and s.confirmAttempts == 1, 'the first settlement must complete')
+    -- Between the two matches the page is closed and the table is live again.
+    DesktopMgr.Inst.gameing = true
+    s.gameEnd.transform.gameObject.activeInHierarchy = false
+    drive(s, 3, 1)
+    -- The second match ends: same singleton, its own result, no observed show.
+    DesktopMgr.Inst.gameing = false
+    s.gameEnd.step = 0
+    s.gameEnd.btn_again.activeInHierarchy = true
+    s.gameEnd.btn_next.activeInHierarchy = true
+    s.gameEnd.game_end_result = { players = { { seat = 1 } } }
+    s.gameEnd.transform.gameObject.activeInHierarchy = true
+    drive(s, 5, 4)
+    assert(s.again == 2, 'a later settlement must be driven, got ' .. s.again)
+    assert(s.confirmAttempts == 2, 'its confirmation must run too, got ' .. s.confirmAttempts)
+end)
+
+test('a manual cancel keeps its page refused without locking out the next match', function(s)
+    -- The cancelled page stays refused for as long as it shows the result the user
+    -- took over. The next match's result, however, is a settlement of its own and
+    -- must not inherit that refusal.
+    prime(s)
+    command(s)
+    tick(s, 0.1)
+    assert(s.popup.activeInHierarchy, 'the popup must be open')
+    s.popup.locking = false
+    UI_AnotherGameConfirm.Cancel(s.popup)
+    assert(s.again == 1, 'the first settlement opened its confirmation once')
+    local agains, confirms = s.again, s.confirmAttempts
+    drive(s, 1, 4)
+    assert(s.again == agains, 'a cancelled settlement must stay refused')
+    assert(s.confirmAttempts == confirms, 'a cancelled settlement must not be confirmed')
+    -- The next match ends on the same singleton with its own result.
+    s.gameEnd.step = 0
+    s.gameEnd.btn_again.activeInHierarchy = true
+    s.gameEnd.btn_next.activeInHierarchy = true
+    s.gameEnd.game_end_result = { players = { { seat = 1 } } }
+    s.gameEnd.transform.gameObject.activeInHierarchy = true
+    drive(s, 6, 4)
+    assert(s.again == agains + 1, 'the next settlement must be driven after a cancel')
+    assert(s.confirmAttempts == confirms + 1, 'the next settlement must be confirmed')
+end)
+
+test('a raising settlement show is still observed and keeps its own error', function(s)
+    -- The real UI_GameEnd.OnShow stores game_end_result and then walks sub-pages the
+    -- previous close unloaded, so it can raise after the result is already on the
+    -- page. That raise must not leave the walk blind on the settlement it describes,
+    -- and it must keep travelling to the caller unchanged.
+    local stored = function(self, callback, args)
+        local target = (type(self) == 'table' and self.Inst) or self
+        target.game_end_result = args and args.game_end_result
+        target.transform.gameObject.activeInHierarchy = true
+        error('sub page missing')
+    end
+    _G.UI_GameEnd.OnShow = stored
+    command(s)
+    tick(s, 0)
+    local ok, err = pcall(function()
+        s.gameEnd:OnShow(function() end, { game_end_result = { players = { { seat = 1 } } } })
+    end)
+    assert(not ok, 'the game error must keep travelling')
+    assert(tostring(err):find('sub page missing', 1, true), 'the original error must survive')
+    assert(s.R.session ~= nil, 'the raising show must still be observed')
+    drive(s, 1, 4)
+    assert(s.again >= 1, 'a page whose show raised must still be driven')
+end)
+
+test('an answered settlement page is not re-armed while it stays up', function(s)
+    -- Confirm latches session.done, but the page (and its game_end_result) stay as
+    -- they were until the match view actually closes. attachLive must keep that
+    -- answered settlement latched instead of re-observing the same result on every
+    -- tick, which would hand the walk a fresh lease over a page it already answered.
+    prime(s)
+    command(s)
+    drive(s, 0, 3)
+    assert(s.again == 1 and s.confirmAttempts == 1, 'the first settlement must complete')
+    assert(s.R.session and s.R.session.done, 'the confirmation must latch the session')
+    local session = s.R.session
+    -- The popup is gone (Confirm hid it) but the final page is still showing.
+    drive(s, 3, 6)
+    assert(s.R.session == session, 'an answered page must keep its own session')
+    assert(s.R.session.done, 'an answered page must stay latched')
+    assert(s.again == 1, 'an answered page must not be driven again, got ' .. s.again)
+    assert(s.confirmAttempts == 1, 'an answered page must not be confirmed again')
+end)
+
 test('normal final ranking advances after the game closes its table socket', function(s)
     prime(s); command(s)
     s.gameEnd.btn_again.activeInHierarchy = false
