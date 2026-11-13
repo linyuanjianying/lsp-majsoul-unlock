@@ -68,7 +68,10 @@ internal enum class OpponentNamingMode(val wire: String) {
 internal data class OpponentNaming(
     val mode: OpponentNamingMode = OpponentNamingMode.NORMAL,
     val names: List<String> = emptyList(),
+    val forceRefresh: Boolean = true,
 ) {
+    @JvmField val namesForJava: List<String> = names
+    @JvmField val forceRefreshForJava: Boolean = forceRefresh
     /** Label of one slot; empty when the slot keeps the server name. */
     fun nameAt(slot: Int): String = names.getOrNull(slot).orEmpty()
 
@@ -86,6 +89,7 @@ internal data class OpponentNaming(
     fun toJson(): JSONObject = JSONObject()
         .put("mode", mode.wire)
         .put("names", JSONArray(normalized().names))
+        .put("forceRefresh", normalized().forceRefresh)
 
     /**
      * The same choice as a camelCase `SettingsPatch` for `majmax_modder_update_settings`.
@@ -96,6 +100,7 @@ internal data class OpponentNaming(
     fun patchJson(): String = JSONObject()
         .put("namingMode", mode.wire)
         .put("customNames", JSONArray(normalized().names))
+        .put("namingForceRefresh", normalized().forceRefresh)
         .toString()
 
     companion object {
@@ -117,7 +122,7 @@ internal data class OpponentNaming(
             for (slot in 0 until OpponentNamingSettings.SLOTS) {
                 names.add(array?.optString(slot, "").orEmpty())
             }
-            return OpponentNaming(mode, names)
+            return OpponentNaming(mode, names, json.optBoolean("forceRefresh", true))
         }
 
         /**
@@ -168,6 +173,7 @@ internal object OpponentNamingSettings {
     private const val PREFS = "opponent-naming"
     private const val KEY_MODE = "mode"
     private const val KEY_NAMES = "names"
+    private const val KEY_FORCE_REFRESH = "force_refresh"
 
     /** Strips control characters and caps the length; the Rust patch validates the same. */
     fun normalizeName(raw: String?): String {
@@ -187,7 +193,7 @@ internal object OpponentNamingSettings {
             val array = JSONArray(raw)
             (0 until array.length()).map { array.optString(it, "") }
         }.getOrDefault(emptyList())
-        return OpponentNaming(mode, names).normalized()
+        return OpponentNaming(mode, names, preferences.getBoolean(KEY_FORCE_REFRESH, true)).normalized()
     }
 
     /**
@@ -203,6 +209,7 @@ internal object OpponentNamingSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY_MODE, stored.mode.wire)
             .putString(KEY_NAMES, names.toString())
+            .putBoolean(KEY_FORCE_REFRESH, stored.forceRefresh)
             .commit()
         return read(context)
     }
@@ -214,11 +221,12 @@ internal object OpponentNamingSettings {
      * label edit carries the collected names), so neither surface can overwrite a value the
      * other one just wrote with a stale copy of the rest.
      */
-    fun applyPatch(context: Context, mode: String?, names: List<String>?): OpponentNaming {
+    fun applyPatch(context: Context, mode: String?, names: List<String>?, forceRefresh: Boolean? = null): OpponentNaming {
         val current = read(context)
         val next = OpponentNaming(
             if (mode == null) current.mode else OpponentNamingMode.fromWire(mode),
             names ?: current.names,
+            forceRefresh ?: current.forceRefresh,
         )
         return save(context, next)
     }

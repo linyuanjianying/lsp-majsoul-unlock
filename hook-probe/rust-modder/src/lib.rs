@@ -1436,7 +1436,7 @@ mod tests {
         // The state is published when the settings are loaded, before any user
         // interaction, otherwise the in-game layer could not tell "normal" from
         // "not loaded yet". The second line is the independent showServer flag.
-        assert_eq!(naming_state(), "normal\n1\n\n\n");
+        assert_eq!(naming_state(), "normal\n1\n\n\n\n1");
 
         // Applying a patch through the same entry point the two UI surfaces use
         // republishes the state; that value is the Lua refresh trigger.
@@ -1446,7 +1446,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(naming_state(), "custom\n1\n上家\n\n下家");
+        assert_eq!(naming_state(), "custom\n1\n上家\n\n下家\n1");
 
         // Flipping only the switch is its own redraw token: the labels are
         // untouched and the in-game layer repaints the current table from it.
@@ -1455,7 +1455,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(naming_state(), "custom\n0\n上家\n\n下家");
+        assert_eq!(naming_state(), "custom\n0\n上家\n\n下家\n1");
 
         core.update_settings(SettingsPatch {
             naming_mode: Some(NamingMode::Normal),
@@ -1463,6 +1463,6 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(naming_state(), "normal\n1\n\n\n");
+        assert_eq!(naming_state(), "normal\n1\n\n\n\n1");
     }
 }

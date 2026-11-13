@@ -831,7 +831,15 @@ end
 -- The two UIs never overlap in practice (UI_ChiPengHu covers the claim window,
 -- UI_LiqiZimo covers the player's own turn), but each button is reported with its
 -- owning UI so a button that exists on both can still be told apart.
+local function manualInputActive()
+    local dm = g('DesktopMgr')
+    local d = dm and dm.Inst
+    local r = d and d.mainrole
+    return r and (r._mouse_downed or r._during_drag or r._during_liqi or r._during_reveal or r._during_reveal_liqi)
+end
+
 local function reportButtonCoords()
+    if manualInputActive() then return end
     local dm = g('DesktopMgr')
     local d = dm and dm.Inst
     local r = d and d.mainrole
@@ -949,6 +957,7 @@ local function reportButtonCoords()
 end
 
 local function reportHandCoords()
+    if manualInputActive() then return end
     local dm = g('DesktopMgr')
     local d = dm and dm.Inst
     local r = d and d.mainrole

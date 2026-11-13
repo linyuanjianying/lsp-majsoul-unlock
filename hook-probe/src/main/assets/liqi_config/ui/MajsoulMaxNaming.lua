@@ -32,7 +32,7 @@ local function g(name)
     return rawget(_G, name)
 end
 
--- The state published by the modder: "mode\nshow_server\nslot0\nslot1\nslot2",
+-- The state published by the modder: "mode\nshow_server\nslot0\nslot1\nslot2\nforce_refresh",
 -- where the second line is "1" when the independent showServer switch is on and
 -- each slot is the label that replaces the server name, or empty meaning "keep
 -- it". The raw string doubles as the change token: a different value is exactly
@@ -46,13 +46,18 @@ local function read_state()
     if type(call) ~= 'function' then return nil end
     local ok, raw = pcall(call)
     if not ok or type(raw) ~= 'string' or raw == '' then return nil end
-    local mode, show, first, second, third =
-        raw:match('^([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)$')
+    local mode, show, first, second, third, force =
+        raw:match('^([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)$')
+    if not mode then
+        mode, show, first, second, third = raw:match('^([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)$')
+        force = '1'
+    end
     if not mode then return nil end
     return {
         signature = raw,
         mode = mode,
         show = show == '1',
+        force = force == '1',
         labels = { first, second, third },
     }
 end
@@ -243,7 +248,7 @@ local function tick()
     N.state = state
     if state and state.signature ~= N.signature then
         N.signature = state.signature
-        N.attempts = REFRESH_ATTEMPTS
+        N.attempts = state.force and REFRESH_ATTEMPTS or nil
     end
     if not N.attempts then return end
     if redraw() then

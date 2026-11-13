@@ -34,7 +34,7 @@ end
 local function fixture(options)
     options = options or {}
     _G.__majmax_naming = nil
-    local state = { wire = options.wire or "normal\n1\n\n\n", originals = options.originals or {},
+    local state = { wire = options.wire or "normal\n1\n\n\n\n1", originals = options.originals or {},
         redraws = 0, payload = options.payload or {}, prefixCalls = 0 }
 
     __majmax_naming_state = function() return state.wire end
@@ -212,7 +212,7 @@ test("going back to normal restores the names the response replaced", function()
     s.tick()
     assert(s.name(4) == CN .. "领头的羊")
 
-    s.setWire("normal\n1\n\n\n")
+    s.setWire("normal\n1\n\n\n\n1")
     s.tick()
     -- One tag, not two: the cached value is the raw server name.
     assert(s.name(4) == CN .. "左家")
@@ -228,7 +228,7 @@ test("going back to normal restores the names the response replaced", function()
     assert(s.name(4) == "左家")
     assert(s.name(3) == "对家")
     -- ... and switching it back on adds exactly one.
-    s.setWire("normal\n1\n\n\n")
+    s.setWire("normal\n1\n\n\n\n1")
     s.tick()
     assert(s.name(4) == CN .. "左家")
 
@@ -249,7 +249,7 @@ test("normal mode drops the stored tag of a seat the live switch turns off", fun
     assert(s.name(3) == "对家")
     assert(s.name(2) == "右家")
     -- Back on, the game's own (prefixed) answer stands, with one tag only.
-    s.setWire("normal\n1\n\n\n")
+    s.setWire("normal\n1\n\n\n\n1")
     s.tick()
     assert(s.name(4) == CN .. "左家")
     assert(s.name(3) == CN .. "对家")
@@ -288,7 +288,7 @@ test("a seat keeps its own region in both the label and the restore path", funct
     assert(s.name(4) == "[JP]领头的羊")
     assert(s.name(3) == CN .. "镇山的虎")
     assert(s.name(2) == "[JP]远见的鹰")
-    s.setWire("normal\n1\n\n\n")
+    s.setWire("normal\n1\n\n\n\n1")
     s.tick()
     assert(s.name(4) == "[JP]左家")
     s.setWire("normal\n0\n\n\n")
@@ -388,7 +388,7 @@ test("a robot seat is renamed but has nothing to restore", function()
     assert(s.name(2) == "远见的鹰")
     -- Back to normal there is no cached name for the robot (account 0), so the
     -- payload value stands instead of raising.
-    s.setWire("normal\n1\n\n\n")
+    s.setWire("normal\n1\n\n\n\n1")
     s.tick()
     assert(s.name(4) == CN .. "左家")
     assert(s.name(2) == CN .. "远见的鹰")

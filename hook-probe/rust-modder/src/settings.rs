@@ -233,6 +233,8 @@ pub struct ModSettings {
     /// User-defined labels for [`NamingMode::Custom`], in left-to-right
     /// visual seat order. Missing or empty entries keep the server name.
     pub custom_names: Vec<String>,
+    /// Force a table redraw after naming changes; defaults on for older settings.
+    pub naming_force_refresh: bool,
     pub star_character: Vec<u32>,
     pub hidden_characters: Vec<u32>,
     hint_switch: bool,
@@ -259,6 +261,7 @@ impl Default for ModSettings {
             nickname: String::new(),
             naming_mode: NamingMode::Normal,
             custom_names: Vec::new(),
+            naming_force_refresh: true,
             star_character: Vec::new(),
             hidden_characters: Vec::new(),
             hint_switch: true,
@@ -294,6 +297,7 @@ pub struct SettingsPatch {
     pub nickname: Option<String>,
     pub naming_mode: Option<NamingMode>,
     pub custom_names: Option<Vec<String>>,
+    pub naming_force_refresh: Option<bool>,
 }
 
 impl SettingsPatch {
@@ -308,6 +312,7 @@ impl SettingsPatch {
             && self.nickname.is_none()
             && self.naming_mode.is_none()
             && self.custom_names.is_none()
+            && self.naming_force_refresh.is_none()
     }
 }
 
@@ -400,7 +405,7 @@ impl ModSettings {
 
     /// Compact description of the naming choice for the in-game Lua layer.
     ///
-    /// The wire is `<mode>\n<show_server:0|1>\n<slot0>\n<slot1>\n<slot2>`:
+    /// The wire is `<mode>\n<show_server:0|1>\n<slot0>\n<slot1>\n<slot2>\n<force_refresh>`:
     /// `mode` is the canonical [`NamingMode`] spelling, the second line is the
     /// independent `showServer` switch and each slot is the label that should
     /// replace the server name, or an empty line when the seat keeps it. A
@@ -427,6 +432,8 @@ impl ModSettings {
             wire.push('\n');
             wire.push_str(self.opponent_label(slot).unwrap_or(""));
         }
+        wire.push('\n');
+        wire.push(if self.naming_force_refresh { '1' } else { '0' });
         wire
     }
 
@@ -445,6 +452,9 @@ impl ModSettings {
         }
         if let Some(mode) = patch.naming_mode {
             self.naming_mode = mode;
+        }
+        if let Some(value) = patch.naming_force_refresh {
+            self.naming_force_refresh = value;
         }
         if let Some(pool) = patch.random_char_pool {
             ensure!(pool.len() <= 256, "随机角色池不能超过 256 项");
@@ -651,7 +661,7 @@ mod tests {
         // Normal mode: no label on any line, so the Lua layer leaves the
         // received (server) names alone. `showServer` keeps its default (on),
         // which is the field the display layer reads to rebuild the zone tag.
-        assert_eq!(settings.naming_wire(), "normal\n1\n\n\n");
+        assert_eq!(settings.naming_wire(), "normal\n1\n\n\n\n1");
 
         settings
             .apply_patch(SettingsPatch {
@@ -659,7 +669,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(settings.naming_wire(), "abc\n1\n领头的羊\n镇山的虎\n远见的鹰");
+        assert_eq!(settings.naming_wire(), "abc\n1\n领头的羊\n镇山的虎\n远见的鹰\n1");
 
         settings
             .apply_patch(SettingsPatch {
@@ -669,7 +679,7 @@ mod tests {
             })
             .unwrap();
         // An empty slot stays an empty line: "keep the server name here".
-        assert_eq!(settings.naming_wire(), "custom\n1\n上家\n\n下家");
+        assert_eq!(settings.naming_wire(), "custom\n1\n上家\n\n下家\n1");
 
         // `showServer` is independent of the mode: turning it off only changes
         // the flag line, the labels stay identical.
@@ -679,7 +689,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(settings.naming_wire(), "custom\n0\n上家\n\n下家");
+        assert_eq!(settings.naming_wire(), "custom\n0\n上家\n\n下家\n1");
         // And it is part of the change token, so flipping it alone is one edit.
         assert_ne!(
             settings.naming_wire(),

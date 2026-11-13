@@ -29,6 +29,7 @@ import com.yefeng.majmax.hookprobe.manager.AssistLaunch;
 import com.yefeng.majmax.hookprobe.manager.ManagerLanguage;
 import com.yefeng.majmax.hookprobe.manager.OpponentNaming;
 import com.yefeng.majmax.hookprobe.manager.OpponentNamingMode;
+import com.yefeng.majmax.hookprobe.manager.OpponentNamingSettings;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
@@ -265,6 +266,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
     /** Seat labels of the editors (left / top / right), repainted on a language switch. */
     private final TextView[] namingLabels = new TextView[3];
     private TextView namingSave;
+    private GameTopUi.Switch namingForceRefreshSwitch;
     /** Last choice the manager reported; the painters read only this field. */
     private OpponentNaming naming = OpponentNaming.decode(null);
     /** Serializes the naming writes. Deliberately not {@link #actionBusy}: a name change is
@@ -1713,6 +1715,15 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         }
         namingSettings.addView(namingEditor);
 
+        namingForceRefreshSwitch = new GameTopUi.Switch(activity);
+        LinearLayout refreshRow = vertical(activity);
+        refreshRow.setOnClickListener(view -> onNamingForceRefresh());
+        namingForceRefreshSwitch.setOn(naming.forceRefreshForJava, false);
+        TextView refreshLabel = GameTopUi.label(activity, GameTopDesign.TEXT_ROW_DESC, GameTopDesign.INK, true);
+        refreshLabel.setText(t("变更后强制刷新牌桌"));
+        refreshRow.addView(refreshLabel);
+        refreshRow.addView(namingForceRefreshSwitch, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, GameTopDesign.px(activity, GameTopDesign.CELL_H)));
+        namingSettings.addView(refreshRow, fixed(activity, GameTopDesign.CELL_H * 2, GameTopDesign.ROW_GAP));
         namingSave = GameTopUi.label(activity, GameTopDesign.TEXT_CHIP, GameTopDesign.INK, true);
         namingSave.setGravity(Gravity.CENTER);
         namingSave.setBackground(GameTopUi.cell(activity, false));
@@ -2303,6 +2314,7 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
         setText(namingTitle, t("对手名称"));
         InGameLocalizer.layout(namingTitle, 1);
         setText(namingState, namingStateText());
+        if (namingForceRefreshSwitch != null) namingForceRefreshSwitch.setOn(naming.forceRefreshForJava, false);
         if (namingState != null) {
             namingState.setTextColor(namingNoticeFailed ? GameTopDesign.DANGER
                 : namingBusy.get() ? GameTopDesign.INK_OFF : GameTopDesign.AMBER_TEXT);
@@ -2951,6 +2963,14 @@ final class GameTopControl implements Application.ActivityLifecycleCallbacks {
      * in either surface. The reply is applied like a poll, so a write the manager did not store
      * is reported instead of leaving a cell selected that the modder will never use.
      */
+    private void onNamingForceRefresh() {
+        if (namingBusy.get() || namingForceRefreshSwitch == null) return;
+        boolean next = !naming.forceRefreshForJava;
+        OpponentNamingSettings.INSTANCE.save(active.get(), new OpponentNaming(naming.getMode(), naming.namesForJava, next));
+        naming = OpponentNaming.decode(OpponentNamingSettings.INSTANCE.read(active.get()).toJson().toString());
+        paintNaming();
+    }
+
     private void onNamingMode(OpponentNamingMode mode) {
         if (namingBusy.get() || mode == naming.getMode()) return;
         namingBusy.set(true);

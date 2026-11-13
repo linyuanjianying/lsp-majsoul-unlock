@@ -160,8 +160,9 @@ class AiEndpointProvider : ContentProvider() {
             // tell a lost write from a saved one.
             val mode = extras?.getString("mode")
             val names = extras?.getStringArray("names")?.toList()
-            if (mode == null && names == null) throw IllegalArgumentException("Missing naming patch")
-            OpponentNamingSettings.applyPatch(app, mode, names)
+            val forceRefresh = extras?.takeIf { it.containsKey("forceRefresh") }?.getBoolean("forceRefresh")
+            if (mode == null && names == null && forceRefresh == null) throw IllegalArgumentException("Missing naming patch")
+            OpponentNamingSettings.applyPatch(app, mode, names, forceRefresh)
             return AssistLaunch.withDisplayMode(app, AssistLaunch.status()).putUiLanguage(app)
         }
         if (method == "displayMode" || method == "runMode") {
