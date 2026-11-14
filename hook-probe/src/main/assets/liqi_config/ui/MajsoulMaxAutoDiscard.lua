@@ -326,36 +326,18 @@ function R.act(command, now)
         [70]=true,[80]=true,[90]=true,[91]=true,[100]=true }
     -- An unknown step is a page this build does not understand: stop, never press.
     if not known[step] then session.pending = nil; return true end
-    -- Reward (50) is the chest page. Btn_Next(50) hides Next and raises UI_MJReward;
-    -- step only becomes RewardClose (51) inside that page's close callback, so the whole
-    -- chest page lives on step 50. While it is up it owns the walk: its own animations
-    -- and its own popup, never the settlement's hidden Next.
     local box = g('UI_MJReward') and g('UI_MJReward').Inst
     local chest = (step == 50 or step == 51) and R.visible(box)
     local gotReward = g('UI_GetReward') and g('UI_GetReward').Inst
-    -- UI_MJReward:OnShow raises UI_GetReward with match_chest.rewards only for a graded
-    -- chest (Container_Box:DoAnim). A bonded-gift bar does not raise it.
     local gotVisible = chest and R.visible(gotReward)
-    -- Every other page belongs to someone else and is waited out, never clicked.
     if foreign(gotVisible and gotReward or nil) then session.pending = nil; return true end
     local again = ui.btn_again
     local reward = g('UI_MJReward_Activity') and g('UI_MJReward_Activity').Inst
     if R.visible(reward) and reward.locking then session.pending = nil; return true end
-    -- `again` is the ranked rematch opt-in: the result page offers it only when a
-    -- same-mode queue is still possible. Next pages the settlement forward.
     local action = R.visible(reward) and 'next'
         or (R.visible(again) and again.interactable ~= false and 'again' or 'next')
     local button = action == 'again' and again or ui.btn_next
     if gotVisible then
-        -- UI_MJReward raised UI_GetReward (match_chest.rewards) and is waiting for the
-        -- player. Its only close control is
-        --   self.btn_close:GetComponent(typeof(UnityEngine.UI.Button)).onClick ...
-        -- so btn_close is a Transform: read the Button component, never .onClick.
-        -- The listener its OnCreate bound returns immediately while the page is locked:
-        --   if self.locking then return end
-        -- and Show sets locking=true (also hiding btn_close) until its own 0.25+0.15*z
-        -- timer fires. Invoking during that window would be swallowed, so it must not be
-        -- counted as answered.
         if gotReward.locking then session.pending = nil; return true end
         local key = 'reward:' .. tostring(step) .. ':' .. tostring(ui._index or 0)
             .. ':' .. tostring(R.visible(reward) and reward.index or '-')
@@ -367,8 +349,6 @@ function R.act(command, now)
         end
         if now < pending.due then return true end
         local close, buttonComponent = gotReward.btn_close, nil
-        -- btn_close is a Transform in the shipped page. GetComponent can raise on a
-        -- partially destroyed object, so it is read defensively like every other bridge.
         local okComponent, component = pcall(function()
             if not close or type(close.GetComponent) ~= 'function' then return nil end
             if type(typeof) == 'function' and type(UnityEngine) == 'table'
@@ -391,11 +371,6 @@ function R.act(command, now)
         else R.emit('step', 'next_invoked') end
         return true
     end
-    -- A chest page still animating in owns both locks. OnShow runs Container_Box:DoAnim
-    -- (box_lock) and, when reward_info.character_gift.add is set, also
-    -- Container_Jibanliwu:DoAnim (jibanliwu_lock); each clears its own lock when done, and
-    -- only then does the page's LoopFrame invoke show_box_upgrade / show_jibanliwu_upgrade.
-    -- Next stays hidden until that finishes, so this is a wait, not an unanswerable page.
     if chest and (box.box_lock or box.jibanliwu_lock) then session.pending = nil; return true end
     if not R.visible(button) or button.interactable == false then session.pending = nil; return true end
     local key = action .. ':' .. tostring(step) .. ':' .. tostring(ui._index or 0)
