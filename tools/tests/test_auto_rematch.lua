@@ -17,18 +17,33 @@
 --                         sets enable=true and holds locking for 0.2 s.
 --   UI_MJReward_Activity  pages advance with index / TryClose() / ShowNext();
 --                         no reward UI has a current_index field.
+--   UI_MJReward           step 51: the chest page. Its reward popup is raised from
+--                         Container_Box:DoAnim (UI_GetReward.className) and the page
+--                         binds btn_next.onClick from native code only after that
+--                         popup's callback fires; until then btn_next is hidden.
+--   UI_GetReward          the popup itself. OnCreate binds btn_close (built by
+--                         UIMgr from the prefab) to its own CloseSelf; the class has
+--                         no Btn_Next and the popup has no canvas-wide Invoke.
 --
 local asset = 'hook-probe/src/main/assets/liqi_config/ui/MajsoulMaxAutoDiscard.lua'
 local count = 0
+-- Stands in for typeof(UnityEngine.UI.Button); identity is all GetComponent compares.
+local BUTTON_TYPE = { name = 'UnityEngine.UI.Button' }
 
 local function node(on)
     local n = { activeInHierarchy = on ~= false, interactable = true, clicks = 0 }
     n.gameObject = n
     n.transform = { gameObject = n }
+    -- Mirrors a UnityEvent: Invoke runs every listener the page actually bound, so a
+    -- fixture that clicks the event cannot pass for a page whose real binding is absent.
     n.onClick = {
-        Invoke = function(self) n.clicks = n.clicks + 1 end,
-        RemoveAll = function(self) end,
-        AddListener = function(self, fn) n.listener = fn end,
+        listeners = {},
+        Invoke = function(self)
+            n.clicks = n.clicks + 1
+            for _, fn in ipairs(self.listeners) do fn() end
+        end,
+        RemoveAll = function(self) self.listeners = {}; n.listener = nil end,
+        AddListener = function(self, fn) self.listeners[#self.listeners + 1] = fn; n.listener = fn end,
     }
     return n
 end
@@ -59,9 +74,13 @@ local function fixture()
         Time = { realtimeSinceStartup = 0 },
         Screen = { width = 1920, height = 1080 },
         Camera = { main = nil, allCameras = {} },
+        UI = { Button = BUTTON_TYPE },
     }
+    -- ToLua's typeof() is what the page passes to GetComponent.
+    typeof = function(value) return value end
     UI_Win = nil; UI_HuleShow = nil; UI_ScoreChange = nil
     UI_ConfirmNewRound = nil; UI_HangUpWarn = nil; UI_GetReward = nil
+    UI_MJReward = nil
 
     GameUtility = { EMJ_Mode = { play = 1, paipu = 2 }, E_PlayerOperation = {} }
     DesktopMgr = {
@@ -93,11 +112,27 @@ local function fixture()
     local gameEnd = { Inst = inst, className = 'UI_GameEnd' }
     setmetatable(inst, { __index = gameEnd })
 
+    -- The dumped Btn_Next, step by step. Reward (50) has two branches: with a chest
+    -- reward it hides Next and raises UI_MJReward whose close callback is the only thing
+    -- that calls setStep(RewardClose=51); without one it goes straight to Task (60).
+    local order = { [0] = 30, [30] = 50, [60] = 70, [70] = 80, [80] = 90, [90] = 100 }
     gameEnd.Btn_Next = function(self)
         s.nextPushed[#s.nextPushed + 1] = self.step
-        local order = { [0] = 30, [30] = 50, [50] = 60, [60] = 70, [70] = 80, [80] = 90, [90] = 100 }
+        if self.step == 50 then
+            if s.chestReward then
+                self.btn_next.activeInHierarchy = false          -- SetActive(false)
+                s.boxCallback = function()                        -- the ShowUI callback
+                    self:setStep(51)
+                    self.btn_next.activeInHierarchy = true
+                end
+            else
+                self:setStep(60); self:Btn_Next()
+            end
+            return
+        end
+        if self.step == 51 then self:setStep(60); self:Btn_Next() return end
         local nxt = order[self.step]
-        if nxt then self.step = nxt end
+        if nxt then self:setStep(nxt) end
     end
     gameEnd.Btn_Again = function(self)
         if self.locking then return end
@@ -161,22 +196,124 @@ local function fixture()
     _G.UI_MJReward_Activity = { Inst = reward, className = 'UI_MJReward_Activity' }
 
     s.rewardClass = { Inst = reward, className = 'UI_MJReward_Activity' }
+
+    -- UI_MJReward (step 51, the chest page). Container_Box:DoAnim raises the reward
+    -- popup through UIMgr and, inside its completion callback only, flips
+    -- box_lock, closes the popup and re-enables btn_next. This fixture keeps that
+    -- order: the popup exists while box_lock is held, btn_next is hidden, and the
+    -- callback runs later on a game timer, exactly like the shipped page.
+    local boxInst = node(false)
+    boxInst.box_lock = false
+    boxInst.jibanliwu_lock = false
+    s.box = boxInst
+    _G.UI_MJReward = { Inst = boxInst, className = 'UI_MJReward' }
+
+    -- UI_GetReward: the class exposes no Btn_Next and no canvas-wide action. Its only
+    -- close control is btn_close, bound in OnCreate, which pops the popup through
+    -- CloseSelf and then runs the box page's completion callback.
+    -- btn_close is a Transform in the dumped page:
+    --   self.btn_close = self.transform:Find('btn_close')
+    --   self.btn_close:GetComponent(typeof(UnityEngine.UI.Button)).onClick:AddListener(...)
+    -- so the fixture exposes exactly that shape: a Transform whose Button component owns
+    -- the listener. A walk that reads btn_close.onClick directly cannot work here.
+    local closeTransform = node(false)
+    local closeButton = { onClick = {
+        listeners = {},
+        Invoke = function(self) for _, fn in ipairs(self.listeners) do fn() end end,
+        AddListener = function(self, fn) self.listeners[#self.listeners + 1] = fn end,
+        RemoveAll = function(self) self.listeners = {} end,
+    } }
+    closeTransform.GetComponent = function(_, componentType)
+        if componentType == BUTTON_TYPE then return closeButton end
+        return nil
+    end
+    local gotInst = node(false)
+    gotInst.btn_close = closeTransform
+    gotInst.Class = { Inst = gotInst, className = 'UI_GetReward' }
+    _G.UI_GetReward = gotInst.Class
+    closeButton.onClick:AddListener(function()
+        if gotInst.locking then return end -- the dumped listener's own guard
+        gotInst:CloseSelf()
+    end)
+    gotInst.CloseSelf = function(self)
+        if self.closing then return end
+        self.closing = true
+        s.gotClose = (s.gotClose or 0) + 1
+        -- OnClose waits 0.21 s before it deactivates the page and answers `f`; the test
+        -- clock advances 0.1 s per tick, so two ticks stand in for that delay.
+        s.gotClosesAt = (UnityEngine.Time.realtimeSinceStartup or 0) + 0.2
+    end
+    -- UI_GetReward:OnShow, as dumped:
+    --   self.btn_close.gameObject:SetActive(false) ... self.locking = true
+    --   TimeMgr.Delay(0.25 + 0.15*min(#items,10), function()
+    --       self.locking = false; f() self.btn_close.gameObject:SetActive(true) end)
+    -- so the page is locked (and its close control hidden) for the whole entry
+    -- animation, and the OnCreate listener returns immediately while locked.
+    gotInst.OnShow = function(self, callback, args)
+        self.activeInHierarchy = true
+        self.transform.gameObject.activeInHierarchy = true
+        self.locking = true
+        closeTransform.activeInHierarchy = false
+        closeTransform.gameObject.activeInHierarchy = false
+        if args then
+            self.args = args
+            s.gotUnlocksAt = (UnityEngine.Time.realtimeSinceStartup or 0)
+                + 0.25 + 0.15 * math.min(#(args.itemInfos or {}), 10)
+        end
+        self.onShown = callback
+    end
+    gotInst.closeTransform = closeTransform
+
     dofile(asset)
     s.gameEnd, s.popup, s.reward = inst, popupInst, reward
+    s.gotInst = gotInst
     s.R = __majmax_auto.rematch
     return s
+end
+
+-- Game timers the fixtures schedule (the popup unlock, UI_GetReward.OnClose and the
+-- box page's completion callback) run on the same clock the walk reads.
+local function timers(s, now)
+    local popup = s.popup
+    if popup and popup.locking and s.popupUnlocksAt and now >= s.popupUnlocksAt then
+        popup.locking = false
+        s.popupUnlocksAt = nil
+    end
+    local got = s.gotInst
+    if got and got.locking and not got.closing and s.gotUnlocksAt
+            and now >= s.gotUnlocksAt then
+        got.locking = false
+        s.gotUnlocksAt = nil
+        got.closeTransform.activeInHierarchy = true
+        got.closeTransform.gameObject.activeInHierarchy = true
+        local shown = got.onShown
+        got.onShown = nil
+        if shown then shown() end -- f(): the DoAnim callback passed to ShowUI
+    end
+    if got and got.closing and s.gotClosesAt and now >= s.gotClosesAt then
+        got.closing = false
+        got.activeInHierarchy = false
+        got.transform.gameObject.activeInHierarchy = false
+        s.gotClosesAt = nil
+        s.gotAnswered = (s.gotAnswered or 0) + 1
+        local args = got.args
+        if args and args.callback then args.callback() end
+    end
+    -- Container_Box:DoAnim's answer (the callback passed to ShowUI): it unlocks the page
+    -- and only there re-enables btn_next, which is what makes the settlement page walkable.
+    if s.answerAt and now >= s.answerAt then
+        s.answerAt = nil
+        s.box.box_lock = false
+        s.box.activeInHierarchy = false
+        s.box.transform.gameObject.activeInHierarchy = false
+        s.gameEnd.btn_next.activeInHierarchy = true
+    end
 end
 
 local function tick(s, at)
     if at then UnityEngine.Time.realtimeSinceStartup = at end
     __majmax_auto_tick()
-    -- The popup clears its own 0.2 s lock on a game timer.
-    local popup = s.popup
-    if popup and popup.locking and s.popupUnlocksAt
-            and UnityEngine.Time.realtimeSinceStartup >= s.popupUnlocksAt then
-        popup.locking = false
-        s.popupUnlocksAt = nil
-    end
+    timers(s, UnityEngine.Time.realtimeSinceStartup or 0)
 end
 
 local function raise(s)
@@ -761,6 +898,307 @@ test('ranking intro leaves isDoAnimation true after native buttons unlock', func
     MJNetMgr.Inst.IsOK = function() return false end
     tick(s, 0.1)
     assert(#s.nextPushed == 1, 'native unlocked ranking must confirm despite stale animation flag')
+end)
+
+-- ---------------------------------------------------------------------------
+-- 0.15.10 regressions. The report is "when the settlement grants a bond (羁绊) gift
+-- the auto-rematch hangs". The dumped pages order that part of the walk as
+--   Btn_Next(50) -> chest reward -> _closeRankList(ShowUI UI_MJReward) -> step 51
+--   Container_Box:DoAnim -> ShowUI UI_GetReward(match_chest.rewards, callback)
+--   ... callback -> box_lock=false, close popup, btn_next.onClick bound to Btn_Next
+-- and UI_MJReward:OnShow only fills the 羁绊 gift bar (Container_Jibanlwu) when
+-- DesktopMgr.Inst.reward_info.character_gift.add is non-zero. The old walk sat on
+-- foreign() the moment UI_GetReward went up and read the hidden Next as a step it had
+-- already answered, which pauses the walk and leaves the rematch unqueued.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- The chest page, driven the way the dumped page drives it.
+--
+-- UI_GameEnd:Btn_Next() step 50 (Reward) with a chest reward:
+--   self.btn_next.gameObject:SetActive(false)
+--   self:_closeRankList(function() UIMgr.Inst:ShowUI(UI_MJReward, nil, function()
+--       self:setStep(a.RewardClose) self.btn_next.gameObject:SetActive(true) end) end)
+-- so the settlement stays on step 50 for the whole page; step 51 only appears inside
+-- that close callback. UI_MJReward:OnShow then raises UI_GetReward from
+-- Container_Box:DoAnim (graded chest) and runs Container_Jibanliwu:DoAnim when
+-- reward_info.character_gift.add is set. Nothing here presses Again first.
+-- ---------------------------------------------------------------------------
+local function chestRewardInfo(gift, graded)
+    return {
+        match_chest = { chest_id = 1, origin = 10, final = 20,
+            -- Container_Box:DoAnim only raises UI_GetReward when is_graded:
+            --   local function k(b) if self.match_chest.is_graded then ShowUI(...) else b() end
+            is_graded = graded ~= false,
+            rewards = { { id = 1, count = 1 }, { id = 2, count = 3 } } },
+        character_gift = { add = gift, origin = 10, final = 10 + (gift or 0) },
+    }
+end
+
+-- The player taps Next on the Reward (50) page: the game hides Next and raises the page.
+local function openChestPage(s, gift, graded)
+    DesktopMgr.Inst.reward_info = chestRewardInfo(gift, graded)
+    s.chestReward = DesktopMgr.Inst.reward_info.match_chest
+    s.gameEnd.setStep(s.gameEnd, 50)
+    -- setStep hides Again from step 50 on; the ranking offered it before this.
+    s.gameEnd.btn_again.activeInHierarchy = false
+    s.gameEnd.btn_next.activeInHierarchy = true
+    s.gameEnd.Btn_Next(s.gameEnd)                 -- dumped step-50 branch
+    s.gameEnd.btn_next.activeInHierarchy = false  -- SetActive(false)
+    s.box.activeInHierarchy = true
+    s.box.transform.gameObject.activeInHierarchy = true
+    -- UI_MJReward:OnShow raises the page and starts both DoAnims.
+    s.box.box_lock = true
+    s.box.jibanliwu_lock = gift ~= nil and gift ~= 0
+end
+
+-- Container_Box:DoAnim's own timer: it clears box_lock and, for a graded chest, raises
+-- UI_GetReward with match_chest.rewards. Its callback (the one passed to ShowUI) is what
+-- eventually re-binds Next and moves the settlement to RewardClose.
+local function boxAnimDone(s)
+    -- Container_Box:DoAnim: it clears box_lock and, for a graded chest, raises the popup
+    -- while UI_MJReward itself stays up (it is only closed by the settlement's callback).
+    s.box.box_lock = false
+    if s.chestReward and s.chestReward.is_graded == false then
+        s.boxGraded = false -- k(b) takes the else branch: no popup, answer straight away
+        return
+    end
+    s.boxGraded = true
+    s.gotInst:OnShow(nil, {
+        itemInfos = s.chestReward.rewards,
+        callback = function() s.chestAnswer = true end,
+    })
+end
+
+-- The page's LoopFrame only leaves the wait once neither lock is held.
+local function jibanliwuAnimDone(s)
+    s.box.jibanliwu_lock = false
+end
+
+-- The game's own close callback: UI_MJReward is closed, its ShowUI callback runs and
+-- that callback is the only place that calls setStep(RewardClose=51) and re-enables Next.
+local function chestCloseCallback(s)
+    s.box.activeInHierarchy = false
+    s.box.transform.gameObject.activeInHierarchy = false
+    local callback = s.boxCallback
+    s.chestReward = nil
+    s.boxCallback = nil
+    if callback then callback() end
+end
+
+local function stepIs(s, want)
+    assert(s.gameEnd.step == want,
+        'expected settlement step ' .. want .. ', got ' .. tostring(s.gameEnd.step))
+end
+
+-- The chest page is reached by pressing Next, not by an answered confirmation: a result
+-- page the user already answered (Again -> Confirm) is final and stays final, exactly as
+-- the dumped page ends the settlement there. So these fixtures drive Next from the
+-- ranking step and never open the confirmation window.
+local function primeChest(s)
+    prime(s)
+    command(s)
+    -- Again is a separate decision (the rematch opt-in) and opens its own confirmation
+    -- window; hide it so this walk only ever pages the settlement.
+    s.gameEnd.btn_again.activeInHierarchy = false
+    tick(s, 0.1)
+    assert(s.again == 0, 'the fixture must not press Again before the chest page')
+end
+
+test('a graded chest raises its reward popup and the walk closes it once', function(s)
+    primeChest(s)
+    openChestPage(s, nil)
+    stepIs(s, 50)
+    drive(s, 0.4, 1.2)
+    assert(s.box.box_lock, 'DoAnim holds box_lock while it animates')
+    assert(s.gotClose == nil, 'nothing may be closed while the box still animates')
+
+    -- DoAnim finishes and raises UI_GetReward with the chest rewards. The walk answers
+    -- it on its next tick (delay 0 in this fixture).
+    boxAnimDone(s)
+    tick(s, 1.5)
+    assert(s.gotInst.activeInHierarchy, 'the chest reward popup must be up')
+    -- Its entry animation locks the page (0.25 + 0.15*2 items = 0.55 s): the walk must
+    -- wait, not burn its one press on a listener that returns while locked.
+    assert(s.gotInst.locking, 'the popup must report its entry lock')
+    -- Stay inside the lock window (it lifts at 2.15 s here): the walk must not press.
+    drive(s, 1.6, 0.5)
+    assert((s.gotClose or 0) == 0, 'a locked popup must not be pressed')
+    -- The lock lifts at 2.15 s; the walk answers it on the next tick.
+    drive(s, 2.2, 0.2)
+    assert(s.gotClose == 1, 'the popup must be closed exactly once, got '
+        .. tostring(s.gotClose))
+    stepIs(s, 50) -- still 50: the close callback has not run yet
+    -- It is answered once, not once per tick: further ticks keep it at one close.
+    drive(s, 2.2, 1.2)
+    assert(s.gotClose == 1, 'the popup must not be closed again, got '
+        .. tostring(s.gotClose))
+
+    -- OnClose answers its callback, then the game calls setStep(51) and re-enables Next.
+    assert(s.gotAnswered, 'the popup callback must run')
+    chestCloseCallback(s)
+    drive(s, 4.6, 3)
+    assert(s.gameEnd.step > 51, 'the walk must page past RewardClose, got '
+        .. tostring(s.gameEnd.step))
+    assert(s.gotClose == 1, 'the popped reward must not be closed twice')
+    assert(countState(s, 'rematch_paused') == 0, 'the chest path must never pause the walk')
+end)
+
+test('a bonded gift rides the same page and its lock is respected', function(s)
+    primeChest(s)
+    openChestPage(s, 12)
+    stepIs(s, 50)
+    assert(s.box.jibanliwu_lock, 'Container_Jibanliwu:DoAnim holds its own lock')
+    local pushed = s.nextPushed and #s.nextPushed or 0
+    -- The gift animation is still running: Next is hidden and the page is a wait.
+    drive(s, 0.6, 2)
+    assert(#s.nextPushed == pushed, 'a gifting chest page must not be paged through')
+    assert(countState(s, 'rematch_paused') == 0, 'a gift animation is not a cancellation')
+    -- The gift bar finishes; the chest animation finished earlier. Only then does the
+    -- page's LoopFrame run show_box_upgrade, which is what raises UI_GetReward.
+    jibanliwuAnimDone(s)
+    boxAnimDone(s)
+    tick(s, 2.7)
+    assert(s.gotInst.activeInHierarchy, 'a graded chest and a gift both raise the popup')
+    -- The popup's own entry lock runs first; the walk answers it once that lifts.
+    drive(s, 2.8, 1.0)
+    assert(s.gotClose == 1, 'the reward popup must still be closed once, got '
+        .. tostring(s.gotClose))
+end)
+
+test('a popup locked past the walk delay is still closed once after it unlocks', function(s)
+    primeChest(s)
+    openChestPage(s, nil)
+    boxAnimDone(s)
+    -- The page is raised now, so its entry lock covers now .. now+0.55 s. Take the
+    -- snapshot before any tick so the fixture's own unlock timer cannot hide it.
+    local unlockedAt = s.gotUnlocksAt
+    assert(unlockedAt and unlockedAt > UnityEngine.Time.realtimeSinceStartup,
+        'the popup must be locked after OnShow')
+    -- Inside the lock the walk is already willing (fixture delay 0) but must not spend
+    -- its one press on a listener that would return: nothing is closed, no key is used.
+    drive(s, UnityEngine.Time.realtimeSinceStartup, (unlockedAt - UnityEngine.Time.realtimeSinceStartup) - 0.1)
+    assert(UnityEngine.Time.realtimeSinceStartup < unlockedAt, 'the lock must still hold')
+    assert((s.gotClose or 0) == 0, 'a locked popup must never be pressed')
+    assert(s.R.session.seen['reward:50:0:-'] == nil,
+        'a locked popup must not consume the one press')
+    -- Once the lock lifts the same pending page is still answerable: exactly one close.
+    drive(s, unlockedAt, 0.3)
+    assert(s.gotClose == 1, 'the unlocked popup must be closed exactly once, got '
+        .. tostring(s.gotClose))
+    assert(s.R.session.seen['reward:50:0:-'] == true, 'the press must be recorded once')
+    drive(s, unlockedAt + 0.5, 1.0)
+    assert(s.gotClose == 1, 'it must never be closed a second time, got '
+        .. tostring(s.gotClose))
+end)
+
+test('a gift with an ungraded chest raises no popup and still waits for its lock', function(s)
+    primeChest(s)
+    openChestPage(s, 12, false) -- character_gift.add set, match_chest.is_graded = false
+    stepIs(s, 50)
+    assert(s.box.jibanliwu_lock, 'the gift bar holds its own lock')
+    -- Only the gift animation matters here: Container_Box:DoAnim takes k(b)'s else
+    -- branch (is_graded false), so no UI_GetReward is ever raised.
+    boxAnimDone(s)
+    tick(s, 1.2)
+    assert(s.boxGraded == false, 'an ungraded chest must not raise the reward popup')
+    assert(not s.gotInst.activeInHierarchy, 'no reward popup on this path')
+    -- The gift lock is still held, so Next stays hidden and nothing is paged.
+    local pushed = #s.nextPushed
+    drive(s, 1.3, 2)
+    assert(#s.nextPushed == pushed, 'the gift animation still owns the page')
+    assert(countState(s, 'rematch_paused') == 0, 'a gift animation is not a cancellation')
+    -- The gift bar finishes: the page's LoopFrame answers all_anim_complete, which is the
+    -- settlement's own close callback -- it moves the page on to RewardClose (51).
+    jibanliwuAnimDone(s)
+    tick(s, 3.6)
+    assert(s.boxCallback and type(s.boxCallback) == 'function',
+        'the settlement callback is bound and waiting')
+    chestCloseCallback(s)
+    drive(s, 4.0, 2)
+    assert(s.gameEnd.step > 51, 'the walk must page past RewardClose, got '
+        .. tostring(s.gameEnd.step))
+    assert((s.gotClose or 0) == 0, 'this path never touches a reward popup')
+end)
+
+test('an animating chest page is never cancelled as an unanswerable step', function(s)
+    primeChest(s)
+    openChestPage(s, nil)
+    -- Well past the walk's own step timeout while the page animates.
+    drive(s, 0.6, 18)
+    assert(countState(s, 'rematch_paused') == 0,
+        'an animating chest page must wait, not trip step_timeout')
+    assert(countState(s, 'step_timeout') == 0)
+end)
+
+test('an unrelated reward popup is waited out and never clicked', function(s)
+    prime(s)
+    command(s)
+    -- The player opened a page of their own while the ranking page is up: the chest page
+    -- is not up, so this is not the settlement's popup.
+    s.gameEnd.btn_again.activeInHierarchy = false
+    s.gotInst:OnShow(nil, { itemInfos = { { id = 1, count = 1 } },
+        callback = function() s.foreignCallback = true end })
+    local before = #s.nextPushed
+    drive(s, 0.1, 10)
+    assert((s.gotClose or 0) == 0, 'a foreign reward popup must never be closed')
+    assert(s.foreignCallback == nil, 'its callback belongs to whoever opened it')
+    assert(#s.nextPushed == before, 'the settlement must not page under the popup')
+    assert(countState(s, 'rematch_paused') == 0, 'waiting for a popup is not a cancellation')
+    -- Once the player closes it, the settlement resumes on its own.
+    s.gotInst:CloseSelf()
+    s.gameEnd.btn_again.activeInHierarchy = true
+    drive(s, 12, 3)
+    assert(s.again >= 1, 'the walk must resume after the player closes the popup')
+end)
+
+test('an error dialog stops the walk even on the chest page', function(s)
+    primeChest(s)
+    openChestPage(s, nil)
+    boxAnimDone(s)
+    _G.UI_ErrorInfo = { Inst = node(true) }
+    local closed = s.gotClose or 0
+    drive(s, 0.6, 4)
+    assert((s.gotClose or 0) == closed, 'an error dialog must not be clicked through')
+    assert(countState(s, 'rematch_paused') == 0, 'waiting for an error dialog is not a cancel')
+    _G.UI_ErrorInfo = nil
+end)
+
+test('turning the switch off still stops a waiting chest page', function(s)
+    primeChest(s)
+    openChestPage(s, nil)
+    s.command.autoRematch = false
+    drive(s, 1, 3)
+    assert(s.R.session and s.R.session.stopped, 'autoRematch=false must stop the walk')
+    local closed = s.gotClose or 0
+    drive(s, 5, 3)
+    assert((s.gotClose or 0) == closed, 'a stopped walk must not close the popup')
+end)
+
+test('a manual cancel still refuses the settlement', function(s)
+    prime(s)
+    command(s)
+    tick(s, 0.1)
+    assert(s.popup.activeInHierarchy, 'the confirmation window must be open')
+    s.popup.locking = false
+    UI_AnotherGameConfirm.Cancel(s.popup)
+    local agains, confirms = s.again, s.confirmAttempts
+    drive(s, 1, 3)
+    assert(s.again == agains, 'a cancelled settlement must not be re-armed')
+    assert(s.confirmAttempts == confirms, 'a cancelled settlement must not be confirmed')
+end)
+
+test('a chest page whose close control lost its Button stops the walk safely', function(s)
+    primeChest(s)
+    openChestPage(s, nil)
+    boxAnimDone(s)
+    -- btn_close exists as a Transform but no Button component resolves.
+    s.gotInst.btn_close.GetComponent = function() return nil end
+    local ok, err = pcall(drive, s, 0.6, 5)
+    assert(ok, 'a missing Button component raised: ' .. tostring(err))
+    assert(countState(s, 'rematch_failed:adapter_exception') == 0,
+        'a missing Button component is a refusal, not a tick crash')
+    assert(s.R.session and s.R.session.stopped == true, 'the walk must stop itself')
 end)
 
 print(string.format('%d auto rematch checks passed', count))
