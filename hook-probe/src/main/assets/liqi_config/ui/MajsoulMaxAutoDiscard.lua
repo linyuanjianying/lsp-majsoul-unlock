@@ -127,14 +127,16 @@ end
 -- stays out of the way instead of pressing through it. Activity rewards are the one
 -- exception: they are part of the settlement's own Task/ActivityReward steps and are
 -- closed through the page's currently bound listener (see act()), not through them.
-local function foreign()
+-- `own` is the one page this walk may answer on the current step: the chest page's own
+-- UI_GetReward. Anything else is someone else's window and is never pressed.
+local function foreign(own)
     local pages = {
         { 'UI_GetReward', 'Inst' }, { 'UI_ErrorInfo', 'Inst' },
     }
     for _, page in ipairs(pages) do
         local class = g(page[1])
         local ui = class and class[page[2]]
-        if R.visible(ui) then return true end
+        if R.visible(ui) and ui ~= own then return true end
     end
     return false
 end
@@ -319,20 +321,57 @@ function R.act(command, now)
     -- UI_GameEnd keeps isDoAnimation=true after its ranking intro. Its native
     -- handlers guard locking, and buttons become visible when the intro completes.
     if ui.locking then session.pending = nil; return true end
-    if foreign() then session.pending = nil; return true end
     local step = ui.step
     local known = { [0]=true,[30]=true,[31]=true,[50]=true,[51]=true,[60]=true,
         [70]=true,[80]=true,[90]=true,[91]=true,[100]=true }
     -- An unknown step is a page this build does not understand: stop, never press.
     if not known[step] then session.pending = nil; return true end
+    local box = g('UI_MJReward') and g('UI_MJReward').Inst
+    local chest = (step == 50 or step == 51) and R.visible(box)
+    local gotReward = g('UI_GetReward') and g('UI_GetReward').Inst
+    local gotVisible = chest and R.visible(gotReward)
+    if foreign(gotVisible and gotReward or nil) then session.pending = nil; return true end
     local again = ui.btn_again
     local reward = g('UI_MJReward_Activity') and g('UI_MJReward_Activity').Inst
     if R.visible(reward) and reward.locking then session.pending = nil; return true end
-    -- `again` is the ranked rematch opt-in: the result page offers it only when a
-    -- same-mode queue is still possible. Next pages the settlement forward.
     local action = R.visible(reward) and 'next'
         or (R.visible(again) and again.interactable ~= false and 'again' or 'next')
     local button = action == 'again' and again or ui.btn_next
+    if gotVisible then
+        if gotReward.locking then session.pending = nil; return true end
+        local key = 'reward:' .. tostring(step) .. ':' .. tostring(ui._index or 0)
+            .. ':' .. tostring(R.visible(reward) and reward.index or '-')
+        if session.seen[key] then return true end -- invoked once; its callback pops it
+        local pending = session.pending
+        if not pending or pending.key ~= key then
+            pending = { key = key, due = now + R.delay(command) }
+            session.pending = pending
+        end
+        if now < pending.due then return true end
+        local close, buttonComponent = gotReward.btn_close, nil
+        local okComponent, component = pcall(function()
+            if not close or type(close.GetComponent) ~= 'function' then return nil end
+            if type(typeof) == 'function' and type(UnityEngine) == 'table'
+                    and type(UnityEngine.UI) == 'table' then
+                return close:GetComponent(typeof(UnityEngine.UI.Button))
+            end
+            return nil
+        end)
+        if okComponent then buttonComponent = component end
+        local onClick = buttonComponent and buttonComponent.onClick or nil
+        if not onClick or type(onClick.Invoke) ~= 'function' then
+            session.seen[key] = true; session.pending = nil
+            R.cancel('listener_unavailable'); return true
+        end
+        session.seen[key] = true
+        session.pending = nil
+        session.clickedAt = now
+        local okClose = pcall(onClick.Invoke, onClick)
+        if not okClose then R.cancel(); R.emit('failed', 'next_exception')
+        else R.emit('step', 'next_invoked') end
+        return true
+    end
+    if chest and (box.box_lock or box.jibanliwu_lock) then session.pending = nil; return true end
     if not R.visible(button) or button.interactable == false then session.pending = nil; return true end
     local key = action .. ':' .. tostring(step) .. ':' .. tostring(ui._index or 0)
         .. ':' .. tostring(R.visible(reward) and reward.index or '-')
